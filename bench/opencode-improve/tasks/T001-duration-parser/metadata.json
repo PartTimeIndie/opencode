@@ -1,0 +1,7 @@
+{
+  "id": "T001-duration-parser",
+  "name": "Duration parser composite values",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Fix parse_duration so composite h/m/s durations return seconds."
+}

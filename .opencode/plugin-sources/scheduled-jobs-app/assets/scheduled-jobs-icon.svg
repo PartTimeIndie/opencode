@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" color="white" role="img" aria-label="Scheduled Jobs">
+  <rect x="7" y="8" width="50" height="49" rx="12" fill="none" stroke="currentColor" stroke-width="3"/>
+  <path d="M20 5v10M44 5v10M16 24h32" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+  <path d="M32 31v9l7 4" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="40" r="14" fill="none" stroke="currentColor" stroke-width="3"/>
+</svg>

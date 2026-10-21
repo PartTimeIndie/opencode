@@ -1,0 +1,19 @@
+.model-chain-editor .scroll-view__viewport {
+  overscroll-behavior: contain;
+}
+
+/* Overflow must be discoverable without hover, including on touch screens.
+   ScrollView only mounts the thumb when the content actually overflows. */
+.model-chain-editor .scroll-view__thumb {
+  opacity: 1;
+}
+
+.model-chain-editor .scroll-view__thumb::after {
+  width: 6px;
+  background-color: var(--text-weak);
+}
+
+.model-chain-editor .scroll-view__thumb:hover::after,
+.model-chain-editor .scroll-view__thumb[data-dragging="true"]::after {
+  background-color: var(--text-base);
+}

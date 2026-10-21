@@ -1,0 +1,37 @@
+{
+  "name": "@opencode-ai/tui-plugin-sidebar-context",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./tui": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "opencode": {
+    "api": {
+      "tui": 2
+    }
+  },
+  "scripts": {
+    "build": "bun run script/build.ts",
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test",
+    "prepack": "bun run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.17.7",
+    "solid-js": "1.9.10",
+    "@opentui/core": "0.3.4",
+    "@opentui/keymap": "0.3.4",
+    "@opentui/solid": "0.3.4",
+    "@opencode-ai/sdk": "^1.17.7"
+  },
+  "devDependencies": {
+    "@opencode-ai/sdk": "1.17.7",
+    "@tsconfig/bun": "1.0.11",
+    "@types/bun": "1.4.0",
+    "@typescript/native-preview": "7.0.0-dev.20251207.1"
+  }
+}

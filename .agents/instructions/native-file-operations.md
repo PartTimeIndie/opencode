@@ -1,0 +1,31 @@
+# Native file operations and crash recovery
+
+## Scope
+
+OpenCode's native `read`, `write`, `edit` and `apply_patch` share the Core file-knowledge and mutation boundaries. Existing files require this Session's delivered, version-bound read evidence. An edit needs its affected lines; replacement/deletion needs full coverage. Confirmed own writes extend knowledge without an extra read and without granting unread remainder. Permission approval and model-supplied hashes do not establish knowledge. There is no user-content shortcut in v1.
+
+The host freezes a request receipt cutoff; missing host identity/cutoff fails closed, including creates. Read outputs count only when the exact final post-bounds/post-plugin text reached a provider that produced content, a tool call or a successful finish. An output shortened or replaced by a plugin/bounding grants no evidence; request a smaller page. Provider failure before delivery grants nothing. Persisted receipts survive compaction/restart in the same Session; new Sessions inherit none. Missing evidence requires a new read, not a fabricated receipt.
+
+File operations use short per-target locks, not reservations during model thinking. Different targets can proceed independently. Multi-target preflight rejects a conflict before any mutation. A later I/O failure attempts a hash-guarded rollback; an unconfirmed effect remains target-scoped and requires inspection. Never retry, merge, replay or restore automatically.
+
+The guarantee covers cooperating native operations, not shell commands, plugins, generators, external editors, other AI hosts, network filesystems or arbitrary hostile filesystem activity. Never bypass a native conflict with these routes. Symlinks/junctions resolve through existing ancestors; on Windows native handle-based realpath preserves actual casing without conflating case-sensitive directories. Tests cover an existing file's case alias and junction aliases, including a missing leaf under a junction. Do not claim universal 8.3/UNC/hardlink or future-path identity guarantees from those cases. Coordinate such aliases explicitly.
+
+## Manual crash-lock recovery
+
+Native file locks are NEVER stolen based on age or heartbeat. A hard crash can leave an owner directory and target uncertainty. A timeout is not proof that its owner died. The administrator-only recovery script is not a model tool, is not part of acquisition/retry, and never stops a process.
+
+1. Identify the exact affected canonical target from the failed operation, plus its Session/call and pending operation ID. Preserve the current file and relevant journal/pending metadata. Do not scan/delete every lock. Investigate every target listed by an unconfirmed multi-file rollback.
+2. From `packages/core`, inspect without changing anything:
+   `bun run script/recover-file-lock.ts --target "<absolute canonical target>"`
+   This reports the exact owner token, PID, hostname and owner-evidence SHA-256. The lock root comes from the normal Core Global state for this environment. Keep that same environment on apply. A missing/extra/invalid owner record, foreign host, symlink, or unknown evidence blocks the script; do not work around it with recursive removal.
+3. Confirm the owner process actually exited. A paused/live owner, permission-denied process check or reused live PID blocks recovery. Do not kill/restart the installed app without separate current human approval. If there is no owner record (e.g. crash just after mkdir), recovery needs a separate maintenance window with all possible writers confirmed stopped; preserve the unknown directory until explicitly resolved.
+4. After the human approves removal of this exact abandoned generation, run:
+   `bun run script/recover-file-lock.ts --target "<same target>" --apply --owner-token "<inspected token>" --owner-sha256 "<inspected hash>"`
+   It rechecks the generation and dead local PID, removes only that random owner's file and then the EMPTY directory. It does not restore a file, replay a tool, or clear DB uncertainty. Concurrent recovery operators must coordinate. An error requires fresh inspection, not an unchanged retry.
+5. If the current file exists, perform a fresh native full read delivered to this Session, inspect its content and propose a NEW guarded operation. This may resolve a prior target marker from any Session: no knowledge is inherited; the new Session must independently observe the current full version. The old operation is never resumed. A new confirmed operation clears its own pending marker; if it fails, inspect again.
+6. If the target is missing/deleted, a full read is impossible. Keep its pending marker blocked. A human maintenance decision must choose whether the deletion is accepted or a preserved before-image should be restored. Do not recreate the target or delete its DB row as an implicit retry. Any maintenance change needs exact target/operation binding and a fresh inspection; the recovery script deliberately does not automate this destructive choice.
+7. A crash can also leave `<target>.opencode-stage-<uuid>` siblings. Preserve them as recovery evidence until ownership and original/final hashes are resolved. Delete only explicitly identified abandoned staging files after approval, never glob-delete siblings that another writer may own. A staged file is not evidence that the target commit succeeded.
+
+## Verification
+
+Run the focused contracts from `packages/core`: `bun test test/file-knowledge.test.ts test/tool-read-receipts.test.ts test/known-file-tools.test.ts test/file-mutation.test.ts test/file-race.test.ts test/file-lock-recovery.test.ts test/location-mutation.test.ts test/tool-write.test.ts test/tool-edit.test.ts test/tool-apply-patch.test.ts`, the relevant runner parity tests and migration repair tests, `bun run script/migration.ts --check`, and `bun typecheck`. Storage errors must be tool failures with uncertainty retained, not false success. Source tests do not establish installed desktop enforcement; deployment/restart retain their own approvals.

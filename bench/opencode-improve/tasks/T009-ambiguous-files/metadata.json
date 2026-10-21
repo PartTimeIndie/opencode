@@ -1,0 +1,7 @@
+{
+  "id": "T009-ambiguous-files",
+  "name": "Ambiguous similar files",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Fix only the active payments tax calculator among similarly named files."
+}

@@ -1,0 +1,14 @@
+---
+description: Keep native OpenCode on-demand UI presentation and expectations consistent
+alwaysApply: true
+---
+
+For native OpenCode on-demand UIs and Control Panels:
+
+- Open every on-demand surface as a popup by default.
+- For `control_panel`, omit `dock` entirely. Use top-level `dock: true` only when the user explicitly asks for that specific surface to be docked; never infer docking from size, persistence, informational content, or the current layout.
+- Never use the removed `form.dockable` field.
+- If a surface opens as a dock tab without an explicit request, treat that as a presentation bug and correct it before calling the UI finished.
+- Show an always-expanded expectation line near the top of every surface.
+- For read-only information, display `Erwartet: Keine Aktion nötig`.
+- For interactive surfaces, display `Erwartet: <concrete action>` with the exact decision or input required.

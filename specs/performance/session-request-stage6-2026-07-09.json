@@ -1,0 +1,95 @@
+{
+  "schema": "opencode.session_request_baseline.v1",
+  "recorded_at": "2026-07-09T22:00:03.721Z",
+  "stage": "Stage 6 completion gate",
+  "baseline_file": "specs/performance/session-request-baseline-2026-07-08.json",
+  "source_commands": [
+    {
+      "working_directory": "packages/core",
+      "command": "bun test --timeout 60000 test/system-context/builtins.test.ts test/session-runner.test.ts -t \"StructuredOutput|builtIns|loads location-scoped|reconciles the date|composes ambient\"",
+      "result": "5 pass, 102 filtered out, 0 fail"
+    },
+    {
+      "working_directory": "packages/core",
+      "command": "bun typecheck",
+      "result": "pass"
+    },
+    {
+      "working_directory": "packages/core",
+      "command": "bun test --timeout 60000 test/parity/session-v2-runner-parity.test.ts",
+      "result": "31 pass, 0 fail"
+    },
+    {
+      "working_directory": "packages/core",
+      "command": "bun test --timeout 60000 test/session-runner.test.ts -t \"records request assembly and provider turn perf events\"",
+      "result": "1 pass, 102 filtered out, 0 fail"
+    }
+  ],
+  "scenario": {
+    "name": "Stage 6 V2 request-path optimization closeout",
+    "optimization_profile": "safe",
+    "estimator": "Token.estimate: round(chars / 4)",
+    "notes": [
+      "Stage 6.1-6.4 optimized request assembly, context producers, tool materialization, and startup loading with focused tests recorded in the plan.",
+      "Stage 6.5 optimized app timeline row projection and verified the long-session paging checklist with desktop and mobile evidence.",
+      "Stage 6.6 records deterministic prompt-size reductions for always-on built-ins and structured-output prompts. Existing persisted SystemContext epochs keep their immutable old baseline until replacement or source update; new epochs receive the shorter baseline."
+    ]
+  },
+  "events": [
+    {
+      "kind": "prompt_component_size",
+      "source": "core-system-context-builtins",
+      "component": "builtins baseline",
+      "before": {
+        "chars": 242,
+        "estimate_tokens": 61
+      },
+      "after": {
+        "chars": 122,
+        "estimate_tokens": 31
+      },
+      "delta": {
+        "chars": -120,
+        "estimate_tokens": -30
+      }
+    },
+    {
+      "kind": "prompt_component_size",
+      "source": "core-session-runner",
+      "component": "structured output tool description",
+      "before": {
+        "chars": 379,
+        "estimate_tokens": 95
+      },
+      "after": {
+        "chars": 122,
+        "estimate_tokens": 31
+      },
+      "delta": {
+        "chars": -257,
+        "estimate_tokens": -64
+      }
+    },
+    {
+      "kind": "prompt_component_size",
+      "source": "core-session-runner",
+      "component": "structured output system prompt",
+      "before": {
+        "chars": 248,
+        "estimate_tokens": 62
+      },
+      "after": {
+        "chars": 85,
+        "estimate_tokens": 21
+      },
+      "delta": {
+        "chars": -163,
+        "estimate_tokens": -41
+      }
+    }
+  ],
+  "verification": {
+    "test_assertion": "Focused tests assert the shortened built-in baseline/update strings and structured-output tool/system behavior. Runner parity remains green after the prompt diet. The request-metrics test still verifies request_assembly and provider_turn perf events are emitted.",
+    "test_result": "focused prompt diet tests: 5 pass; core typecheck: pass; runner parity: 31 pass; request metrics test: 1 pass"
+  }
+}

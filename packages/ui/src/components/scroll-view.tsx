@@ -1,0 +1,266 @@
+import { onCleanup, onMount, splitProps, type ComponentProps, Show, mergeProps } from "solid-js"
+import { createResizeObserver } from "@solid-primitives/resize-observer"
+import { createStore } from "solid-js/store"
+import { useI18n } from "../context/i18n"
+
+export interface ScrollViewProps extends ComponentProps<"div"> {
+  viewportRef?: (el: HTMLDivElement) => void
+  // Thumb drags never produce wheel/touch/keydown gestures, so consumers that
+  // suppress auto-follow on user scroll intent need this explicit signal.
+  onThumbDragChange?: (dragging: boolean) => void
+  orientation?: "vertical" | "horizontal" // currently only vertical is fully implemented for thumb
+}
+
+export const scrollKey = (event: Pick<KeyboardEvent, "key" | "altKey" | "ctrlKey" | "metaKey" | "shiftKey">) => {
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+
+  switch (event.key) {
+    case "PageDown":
+      return "page-down"
+    case "PageUp":
+      return "page-up"
+    case "Home":
+      return "home"
+    case "End":
+      return "end"
+    case "ArrowUp":
+      return "up"
+    case "ArrowDown":
+      return "down"
+  }
+}
+
+export function scrollTopFromThumbPointer(input: {
+  pointer: number
+  viewportTop: number
+  grabOffset: number
+  clientHeight: number
+  scrollHeight: number
+  thumbHeight: number
+}) {
+  const padding = 8
+  const maxThumbTop = input.clientHeight - padding * 2 - input.thumbHeight
+  if (maxThumbTop <= 0) return 0
+  const thumbTop = Math.max(0, Math.min(input.pointer - input.viewportTop - padding - input.grabOffset, maxThumbTop))
+  return (thumbTop / maxThumbTop) * Math.max(0, input.scrollHeight - input.clientHeight)
+}
+
+export function ScrollView(props: ScrollViewProps) {
+  const i18n = useI18n()
+  const merged = mergeProps({ orientation: "vertical" }, props)
+  const [local, events, rest] = splitProps(
+    merged,
+    ["class", "children", "viewportRef", "onThumbDragChange", "orientation", "style"],
+    [
+      "onScroll",
+      "onWheel",
+      "onTouchStart",
+      "onTouchMove",
+      "onTouchEnd",
+      "onTouchCancel",
+      "onPointerDown",
+      "onClick",
+      "onKeyDown",
+    ],
+  )
+
+  let rootRef!: HTMLDivElement
+  let viewportRef!: HTMLDivElement
+  let thumbRef!: HTMLDivElement
+
+  const [state, setState] = createStore({
+    isHovered: false,
+    isDragging: false,
+    thumbHeight: 0,
+    thumbTop: 0,
+    showThumb: false,
+  })
+  const isHovered = () => state.isHovered
+  const isDragging = () => state.isDragging
+  const thumbHeight = () => state.thumbHeight
+  const thumbTop = () => state.thumbTop
+  const showThumb = () => state.showThumb
+
+  const updateThumb = () => {
+    if (!viewportRef) return
+    const { scrollTop, scrollHeight, clientHeight } = viewportRef
+
+    if (scrollHeight <= clientHeight || scrollHeight === 0) {
+      setState("showThumb", false)
+      return
+    }
+
+    setState("showThumb", true)
+    const trackPadding = 8
+    const trackHeight = clientHeight - trackPadding * 2
+
+    const minThumbHeight = 32
+    // Calculate raw thumb height based on ratio
+    let height = (clientHeight / scrollHeight) * trackHeight
+    height = Math.max(height, minThumbHeight)
+
+    const maxScrollTop = scrollHeight - clientHeight
+    const maxThumbTop = trackHeight - height
+
+    const top = maxScrollTop > 0 ? (scrollTop / maxScrollTop) * maxThumbTop : 0
+
+    // Ensure thumb stays within bounds (shouldn't be necessary due to math above, but good for safety)
+    const boundedTop = trackPadding + Math.max(0, Math.min(top, maxThumbTop))
+
+    setState("thumbHeight", height)
+    setState("thumbTop", boundedTop)
+  }
+
+  onMount(() => {
+    if (local.viewportRef) {
+      local.viewportRef(viewportRef)
+    }
+
+    createResizeObserver([viewportRef, viewportRef.firstElementChild], updateThumb)
+
+    updateThumb()
+  })
+
+  let stopThumbDrag: (() => void) | undefined
+  onCleanup(() => stopThumbDrag?.())
+
+  const onThumbPointerDown = (e: PointerEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setState("isDragging", true)
+    local.onThumbDragChange?.(true)
+    const thumb = thumbRef
+    const pointerID = e.pointerId
+    const grabOffset = e.clientY - thumb.getBoundingClientRect().top
+    let active = true
+
+    const onPointerMove = (e: PointerEvent) => {
+      const { scrollHeight, clientHeight } = viewportRef
+      viewportRef.scrollTop = scrollTopFromThumbPointer({
+        pointer: e.clientY,
+        viewportTop: viewportRef.getBoundingClientRect().top,
+        grabOffset,
+        clientHeight,
+        scrollHeight,
+        thumbHeight: thumbHeight(),
+      })
+    }
+    const stop = () => {
+      if (!active) return
+      active = false
+      setState("isDragging", false)
+      local.onThumbDragChange?.(false)
+      thumb.removeEventListener("pointermove", onPointerMove)
+      thumb.removeEventListener("pointerup", stop)
+      thumb.removeEventListener("pointercancel", stop)
+      thumb.removeEventListener("lostpointercapture", stop)
+      if (thumb.hasPointerCapture(pointerID)) thumb.releasePointerCapture(pointerID)
+      if (stopThumbDrag === stop) stopThumbDrag = undefined
+    }
+
+    stopThumbDrag?.()
+    stopThumbDrag = stop
+    thumb.addEventListener("pointermove", onPointerMove)
+    thumb.addEventListener("pointerup", stop)
+    thumb.addEventListener("pointercancel", stop)
+    thumb.addEventListener("lostpointercapture", stop)
+    thumb.setPointerCapture(pointerID)
+  }
+
+  // Keybinds implementation
+  // We ensure the viewport has a tabindex so it can receive focus
+  // We can also explicitly catch PageUp/Down if we want smooth scroll or specific behavior,
+  // but native usually handles this perfectly. Let's explicitly ensure it behaves well.
+  const onKeyDown = (e: KeyboardEvent) => {
+    // If user is focused on an input inside the scroll view, don't hijack keys
+    if (document.activeElement && ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) {
+      return
+    }
+
+    const next = scrollKey(e)
+    if (!next) return
+
+    const scrollAmount = viewportRef.clientHeight * 0.8
+    const lineAmount = 40
+
+    switch (next) {
+      case "page-down":
+        e.preventDefault()
+        viewportRef.scrollBy({ top: scrollAmount, behavior: "smooth" })
+        break
+      case "page-up":
+        e.preventDefault()
+        viewportRef.scrollBy({ top: -scrollAmount, behavior: "smooth" })
+        break
+      case "home":
+        e.preventDefault()
+        viewportRef.scrollTo({ top: 0, behavior: "smooth" })
+        break
+      case "end":
+        e.preventDefault()
+        viewportRef.scrollTo({ top: viewportRef.scrollHeight, behavior: "smooth" })
+        break
+      case "up":
+        e.preventDefault()
+        viewportRef.scrollBy({ top: -lineAmount, behavior: "smooth" })
+        break
+      case "down":
+        e.preventDefault()
+        viewportRef.scrollBy({ top: lineAmount, behavior: "smooth" })
+        break
+    }
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      class={`scroll-view ${local.class || ""}`}
+      style={local.style}
+      onPointerEnter={() => setState("isHovered", true)}
+      onPointerLeave={() => setState("isHovered", false)}
+      {...rest}
+    >
+      {/* Viewport */}
+      <div
+        ref={viewportRef}
+        class="scroll-view__viewport"
+        onScroll={(e) => {
+          updateThumb()
+          if (typeof events.onScroll === "function") events.onScroll(e)
+        }}
+        onWheel={events.onWheel}
+        onTouchStart={events.onTouchStart}
+        onTouchMove={events.onTouchMove}
+        onTouchEnd={events.onTouchEnd}
+        onTouchCancel={events.onTouchCancel}
+        onPointerDown={events.onPointerDown}
+        onClick={events.onClick}
+        tabIndex={0}
+        role="region"
+        aria-label={i18n.t("ui.scrollView.ariaLabel")}
+        onKeyDown={(e) => {
+          onKeyDown(e)
+          if (typeof events.onKeyDown === "function") events.onKeyDown(e)
+        }}
+      >
+        {local.children}
+      </div>
+
+      {/* Thumb Overlay */}
+      <Show when={showThumb()}>
+        <div
+          ref={thumbRef}
+          onPointerDown={onThumbPointerDown}
+          class="scroll-view__thumb"
+          data-visible={isHovered() || isDragging()}
+          data-dragging={isDragging()}
+          style={{
+            height: `${thumbHeight()}px`,
+            transform: `translateY(${thumbTop()}px)`,
+            "z-index": 100, // ensure it displays over content
+          }}
+        />
+      </Show>
+    </div>
+  )
+}

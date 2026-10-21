@@ -1,0 +1,22 @@
+{
+  "name": "session-navigator-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  },
+  "opencode": {
+    "app": {
+      "capabilities": [
+        "ui:dock",
+        "kv",
+        "client",
+        "events",
+        "host:projects",
+        "host:navigation",
+        "host:sessions",
+        "host:http"
+      ]
+    }
+  }
+}

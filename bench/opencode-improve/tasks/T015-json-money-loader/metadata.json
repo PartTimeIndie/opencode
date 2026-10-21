@@ -1,0 +1,7 @@
+{
+  "id": "T015-json-money-loader",
+  "name": "JSON money loader hidden precision checks",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus hidden JSON Decimal checks",
+  "goal": "Load monetary JSON rules with Decimal precision and strict JSON safety."
+}

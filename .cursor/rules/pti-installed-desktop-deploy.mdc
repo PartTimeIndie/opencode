@@ -1,0 +1,41 @@
+---
+description: Deploy OpenCode app UI fixes into the installed desktop app for local testing
+alwaysApply: true
+---
+
+For this repo, when app UI changes are meant to be tested through the installed desktop executable, finish by deploying the built renderer change into `C:\Users\crisc\AppData\Local\Programs\@opencode-aidesktop\resources\app.asar` so `C:\Users\crisc\AppData\Local\Programs\@opencode-aidesktop\OpenCode.exe` picks it up on the next launch.
+
+## Standard: always a full ASAR redeploy with a **prod** desktop build
+
+Always perform a **complete** redeploy — never partial same-length in-place string patches, and **never** copy `packages/app/dist` directly into the ASAR.
+
+A dev-channel build (`OPENCODE_CHANNEL` unset or `dev`) bakes `VITE_OPENCODE_CHANNEL !== "prod"` into the renderer, which enables `newLayoutDesigns` by default and routes through different layout/storage paths. Deploying that into the installed production app makes existing sessions and project state appear to vanish.
+
+### Build + deploy workflow
+
+```powershell
+# 1. Production desktop build (renderer + main + preload)
+cd packages/desktop
+$env:OPENCODE_CHANNEL = "prod"
+bun run build
+
+# 2. Full ASAR redeploy (script refuses to run without OPENCODE_CHANNEL=prod|latest)
+cd ../opencode
+$env:OPENCODE_CHANNEL = "prod"
+bun run deploy-asar.ts
+```
+
+`deploy-asar.ts`:
+
+1. Refuses to run unless `OPENCODE_CHANNEL` is `prod` or `latest`.
+2. Makes a timestamped `app.asar.bak-*` backup of the current archive.
+3. Extracts the live ASAR via `@electron/asar`.
+4. Replaces `out/{main,preload,renderer}` inside the ASAR with `packages/desktop/out/{main,preload,renderer}`.
+5. Repacks the ASAR so integrity hashes are recomputed.
+6. Verifies marker strings (including prod channel) in the new archive; on failure restores the backup.
+
+Hard constraints:
+
+- Create the timestamped `app.asar.bak-*` backup before touching the archive.
+- Do NOT restart the app or the server process — the next launch of `OpenCode.exe` picks up the new ASAR.
+- If sessions disappear after a deploy, the most likely cause is a dev-channel build; rebuild with `OPENCODE_CHANNEL=prod` and redeploy.

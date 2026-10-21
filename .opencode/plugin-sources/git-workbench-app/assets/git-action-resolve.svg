@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 40" fill="none" role="img" aria-label="Resolve conflict">
+  <path d="M10 20H12M52 20H54" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+  <rect x="12" y="8" width="40" height="24" rx="12" stroke="currentColor" stroke-width="3.5"/>
+  <circle cx="6.5" cy="20" r="3.5" stroke="currentColor" stroke-width="3.5"/>
+  <circle cx="57.5" cy="20" r="3.5" stroke="currentColor" stroke-width="3.5"/>
+  <path d="m25.5 20 5 5L42 13" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

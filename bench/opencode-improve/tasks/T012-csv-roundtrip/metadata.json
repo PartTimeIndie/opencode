@@ -1,0 +1,7 @@
+{
+  "id": "T012-csv-roundtrip",
+  "name": "CSV roundtrip with hidden dialect cases",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus hidden CSV roundtrip invariants",
+  "goal": "Use stdlib csv semantics for exact import/export roundtrips."
+}

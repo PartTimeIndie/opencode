@@ -1,0 +1,7 @@
+{
+  "id": "T013-safe-path-join",
+  "name": "Safe path join hidden traversal variants",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus hidden path traversal checks",
+  "goal": "Resolve user paths under a sandbox root without string-prefix vulnerabilities."
+}

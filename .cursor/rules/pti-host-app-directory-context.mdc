@@ -1,0 +1,21 @@
+---
+description: Require explicit directory context for host app routes and plugin LLM endpoints
+globs: ".opencode/plugins/*-app/**,.opencode/plugin-sources/*-app/**,packages/opencode/src/server/routes/**,packages/opencode/test/server/**"
+alwaysApply: false
+---
+
+For host app routes and `.opencode/plugins/*-app` / `.opencode/plugin-sources/*-app` code paths that call LLM-like behavior, require the caller to pass an explicit `directory`.
+
+Requirements:
+
+- Do not infer the target project from process-global state, the active UI tab, a cached instance, or another implicit fallback for LLM-adjacent endpoints.
+- Treat missing, empty, or invalid `directory` as a request error and return HTTP 400 before provider/model resolution or prompt construction starts.
+- Keep `directory` part of the public request contract for host routes that can create prompts, improve prompts, summarize, generate plans, invoke model/provider logic, or otherwise assemble LLM context.
+- Thread the validated directory into the instance/session context used by the endpoint so generated context is scoped to the intended project.
+- For plugin assets and UI-only routes, keep the rule scoped to endpoints that can affect LLM context; do not add noisy `directory` requirements to static asset fetches.
+
+Acceptance:
+
+- New or changed LLM-adjacent host/app endpoints include focused tests for missing `directory` returning 400 and a valid `directory` taking the normal path.
+- LLM endpoint tests use a fake provider or deterministic provider seam; do not hit live providers.
+- Plugin app changes under `.opencode/plugins/*-app` and `.opencode/plugin-sources/*-app` preserve the explicit `directory` in requests to host endpoints instead of relying on host fallback behavior.

@@ -1,0 +1,41 @@
+{
+  "name": "@opencode-ai/provider-openai",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./provider": "./dist/index.js",
+    "./server": "./dist/server.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "opencode": {
+    "api": {
+      "provider": 1,
+      "server": 2
+    }
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts ./src/server.ts --outdir ./dist --target node --splitting",
+    "typecheck": "tsgo --noEmit",
+    "prepack": "bun run build"
+  },
+  "dependencies": {
+    "effect": "4.0.0-beta.74",
+    "@ai-sdk/openai": "3.0.53",
+    "@ai-sdk/provider": "3.0.8",
+    "ai": "6.0.168",
+    "ws": "8.21.0",
+    "@opencode-ai/llm": "workspace:*"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.17.7"
+  },
+  "devDependencies": {
+    "@tsconfig/bun": "1.0.11",
+    "@types/bun": "1.4.0",
+    "@typescript/native-preview": "7.0.0-dev.20251207.1",
+    "@types/ws": "8.18.1"
+  }
+}

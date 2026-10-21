@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'" />
+    <title>Desktop service</title>
+    <link rel="stylesheet" href="./speech-overlay.css" />
+  </head>
+  <body>
+    <main id="overlay" data-phase="active">
+      <div class="loader-shell" aria-hidden="true">
+        <svg class="loader" viewBox="0 0 15 15" fill="currentColor">
+          <rect x="4" y="0" width="3" height="3" rx="1" />
+          <rect x="8" y="0" width="3" height="3" rx="1" />
+          <rect x="0" y="4" width="3" height="3" rx="1" />
+          <rect x="4" y="4" width="3" height="3" rx="1" />
+          <rect x="8" y="4" width="3" height="3" rx="1" />
+          <rect x="12" y="4" width="3" height="3" rx="1" />
+          <rect x="0" y="8" width="3" height="3" rx="1" />
+          <rect x="4" y="8" width="3" height="3" rx="1" />
+          <rect x="8" y="8" width="3" height="3" rx="1" />
+          <rect x="12" y="8" width="3" height="3" rx="1" />
+          <rect x="4" y="12" width="3" height="3" rx="1" />
+          <rect x="8" y="12" width="3" height="3" rx="1" />
+        </svg>
+      </div>
+      <section class="content">
+        <strong id="status" role="status" aria-live="polite" aria-atomic="true">OpenCode is getting ready</strong>
+        <div class="meta">
+          <span id="application">Application</span><span id="detail-separator" aria-hidden="true" hidden>·</span><span id="detail" hidden></span>
+        </div>
+      </section>
+      <section class="telemetry">
+        <time id="elapsed" hidden>00:00</time>
+        <div id="shortcut" class="shortcut" hidden><span id="hint"></span><kbd id="accelerator">Ctrl+Shift+Space</kbd></div>
+      </section>
+    </main>
+    <script type="module" src="./speech-overlay.ts"></script>
+  </body>
+</html>

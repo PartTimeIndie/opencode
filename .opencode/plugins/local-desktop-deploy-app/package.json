@@ -1,0 +1,8 @@
+{
+  "name": "local-desktop-deploy-app",
+  "version": "1.0.1",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  }
+}

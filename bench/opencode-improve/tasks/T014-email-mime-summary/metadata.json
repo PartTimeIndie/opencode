@@ -1,0 +1,7 @@
+{
+  "id": "T014-email-mime-summary",
+  "name": "Email MIME summary hidden parser cases",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus hidden MIME checks",
+  "goal": "Summarize RFC822 email using stdlib email parser semantics."
+}

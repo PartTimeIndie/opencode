@@ -1,0 +1,7 @@
+{
+  "id": "T007-multi-file-api-rename",
+  "name": "Multi-file API rename",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Rename the public API from send_mesage to send_message across call sites."
+}

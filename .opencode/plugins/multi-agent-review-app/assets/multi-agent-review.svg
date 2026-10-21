@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <path d="M7.4 6.25V4.35M16.6 6.25V4.35" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+  <circle cx="7.4" cy="3.65" r=".9" fill="currentColor"/>
+  <circle cx="16.6" cy="3.65" r=".9" fill="currentColor"/>
+  <rect x="3.35" y="6.35" width="7.9" height="7.65" rx="2.35" stroke="currentColor" stroke-width="1.45"/>
+  <rect x="12.75" y="6.35" width="7.9" height="7.65" rx="2.35" stroke="currentColor" stroke-width="1.45"/>
+  <path d="M8.1 14V16M15.9 14V16M7.25 16H16.75" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+  <rect x="5.75" y="16" width="12.5" height="4.75" rx="2.1" stroke="currentColor" stroke-width="1.45"/>
+  <path d="M9 18.4H15" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+  <circle cx="6.55" cy="9.75" r=".85" fill="currentColor"/>
+  <circle cx="8.25" cy="9.75" r=".85" fill="currentColor"/>
+  <circle cx="15.75" cy="9.75" r=".85" fill="currentColor"/>
+  <circle cx="17.45" cy="9.75" r=".85" fill="currentColor"/>
+  <path d="M6.9 12H8M16 12H17.1" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+</svg>

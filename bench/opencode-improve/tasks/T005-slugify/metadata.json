@@ -1,0 +1,7 @@
+{
+  "id": "T005-slugify",
+  "name": "Slugify cleanup",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Fix slugify so separators collapse, edges trim, underscores remain, and simple unicode transliterates."
+}

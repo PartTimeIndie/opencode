@@ -1,0 +1,25 @@
+{
+  "name": "scheduled-jobs-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  },
+  "opencode": {
+    "app": {
+      "capabilities": [
+        "ui:dock",
+        "commands",
+        "kv",
+        "ui:settings",
+        "ui:models",
+        "host:http",
+        "host:navigation",
+        "host:session-policy",
+        "host:projects",
+        "automation",
+        "services:opencode-scheduler:jobs"
+      ]
+    }
+  }
+}

@@ -1,0 +1,273 @@
+{
+  "version": 1,
+  "kind": "opencode.question-payload",
+  "binding": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "keys": [
+    "daily-agent-review-2026-10-04:0635ba7437569b4a",
+    "daily-agent-review-2026-10-04:1504d5b75229e81f",
+    "daily-agent-review-2026-10-04:ec35a316d37613f2",
+    "daily-agent-review-2026-10-04:229b327b1d62bdf3",
+    "daily-agent-review-2026-10-04:da4c1d1002e400ae",
+    "daily-agent-review-2026-10-04:b18ae64be8bb5c05"
+  ],
+  "questions": [
+    {
+      "type": "review_section",
+      "question": "Soll der Spieltest vor dem Aufräumen warten, bis sein Speichern fertig ist?",
+      "header": "2.39",
+      "body": [
+        {
+          "id": "daily-agent-review-2026-10-04:0635ba7437569b4a",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** Ein automatischer Spieltest speichert gerade einen Test-Spielstand. Der Test wird beendet, obwohl das Speichern noch läuft. Trotzdem stellt er schon die normalen Einstellungen wieder her und meldet das Aufräumen als erledigt.\n\n**Das kann passieren:** Der Testlauf kann dadurch als fehlgeschlagen gelten, obwohl das Spiel funktioniert. Eine noch laufende Speicheraktion kann außerdem nach dem Zurückstellen der Einstellungen weiterschreiben.\n\n**Antwort auf deine Rückfrage:** Es geht um das Aufräumen nach automatischen Spieltests, nicht um normales Beenden durch einen Spieler. Der Fehler ist die Reihenfolge: erst fertig speichern, dann die Test-Einstellungen zurückstellen.\n\n**So testest du es selber:** Lass dir von mir einen Test mit absichtlich verzögertem Speichern zeigen. Die Einstellungen müssen unverändert bleiben, solange noch gespeichert wird. Danach muss der Test sauber abschließen.\n\n**So wird es behoben:** Der Test bleibt beim Aufräumen, bis alle von ihm gestarteten Speicheraktionen fertig sind. Erst danach stellt er die Einstellungen zurück. Dauert das zu lange, meldet er den offenen Vorgang statt einen fertigen Abschluss vorzutäuschen.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: Isolation End never enforces join-before-restore; draining state unreachable and recovery killed by DiscardLease.\nStabile Frage-ID: daily-agent-review-2026-10-04:0635ba7437569b4a.\nEvidenz-Hash: .\nMaterial-Digest: 0635ba7437569b4ade94c39f221fa1029d6f51a23b5166881d0472fe3d197aec.\nEnd() calls TryCloseAndDrain non-blocking, samples IsDrained once, then unconditionally advances restoring-&gt;released and calls DiscardLease(). A re-issued End hits the released early-return. The regression runner fails closed on pendingOperationsDrained!==true.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Persist draining and return without restoring the environment until every owned operation has settled; then restore, release and discard the lease.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Der Testlauf kann dadurch als fehlgeschlagen gelten, obwohl das Spiel funktioniert. Eine noch laufende Speicheraktion kann außerdem nach dem Zurückstellen der Einstellungen weiterschreiben.\nSo wird es geprueft: Track a pending TaskCompletionSource, call End, assert draining without restore; complete it and call End again, assert released.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Erkläre mir das in einfachen Worten mit einem echten Beispiel. Kein Code und keine Zeilen im sichtbaren Text.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    },
+    {
+      "type": "review_section",
+      "question": "Soll der Test auch bei gleichzeitigem Speichern zuverlässig auf alle Vorgänge warten?",
+      "header": "2.40",
+      "body": [
+        {
+          "id": "daily-agent-review-2026-10-04:1504d5b75229e81f",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** Während ein Spieltest speichert, beginnt eine zweite Speicherung. Gleichzeitig wird der erste fertige Vorgang aus der Liste der offenen Arbeiten entfernt. Diese Änderungen passieren gerade ohne gemeinsamen Schutz.\n\n**Das kann passieren:** Ein noch laufender Vorgang kann aus dem Blick geraten. Der Test hält dann alle Speicherarbeiten für fertig, obwohl noch eine läuft. Auch eine Fehlermeldung ist möglich.\n\n**Antwort auf deine Rückfrage:** Dieser Punkt betrifft die Übersicht über offene Speicherungen. Der vorige Punkt betrifft den Zeitpunkt des Aufräumens. Beide können zu frühes Aufräumen verursachen, haben aber unterschiedliche Ursachen.\n\n**So testest du es selber:** Frag mich nach dem Test mit mehreren gleichzeitig gestarteten Speicherungen. Er muss warten, bis wirklich jede fertig ist, und darf dabei keine Fehlermeldung erzeugen.\n\n**So wird es behoben:** Alle Stellen bearbeiten dieselbe Liste nach einer gemeinsamen Regel: Eine Änderung wird abgeschlossen, bevor die nächste daran arbeitet. So bleibt jede offene Speicherung erfasst.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: PendingPersisterOperations mutates the same Owned list under three unsynchronized lock regimes.\nStabile Frage-ID: daily-agent-review-2026-10-04:1504d5b75229e81f.\nEvidenz-Hash: .\nMaterial-Digest: 1504d5b75229e81ff46c7c6a1f2cc0cf70256ca3193f0a5926165dcab4d81f97.\nTrack adds to Owned without a lock; ContinueWith removes under Gate; DrainAsync prunes under lock(lease). IsDrained and DrainedCount read under Gate. Concurrent Add and RemoveAll can drop entries or throw.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Use the same Gate lock for every access to Owned and DrainedCount, awaiting outside the lock.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Ein noch laufender Vorgang kann aus dem Blick geraten. Der Test hält dann alle Speicherarbeiten für fertig, obwohl noch eine läuft. Auch eine Fehlermeldung ist möglich.\nSo wird es geprueft: Concurrent Track while DrainAsync runs must only complete when all operations settle, without exceptions.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Bitte nochmal neu und einfacher erklären.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    },
+    {
+      "type": "review_section",
+      "question": "Soll das Zuordnen vorhandener Videos zur Fähigkeiten-Übersicht wieder funktionieren?",
+      "header": "2.41",
+      "body": [
+        {
+          "id": "daily-agent-review-2026-10-04:ec35a316d37613f2",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** Du hast eine Videoaufnahme für eine Fähigkeit und gibst den Ordner mit dieser Aufnahme an. Der neue Zuordnungsbefehl prüft den Ordner aber so, als müsste er selbst eine Videodatei sein. Deshalb lehnt er auch einen richtigen Ordner ab.\n\n**Das kann passieren:** Du kannst vorhandene Aufnahmen mit diesem Befehl nicht den Fähigkeiten zuordnen. Er bricht schon ab, bevor er die Videos im Ordner prüft.\n\n**Antwort auf deine Rückfrage:** Das Video selbst ist nicht das Problem. Die Prüfung verwechselt einen Ordner mit einer Datei. Der Fix ändert diese Prüfung, nicht deine Aufnahme.\n\n**So testest du es selber:** Lass mich einen Ordner mit einer passenden Testaufnahme zuordnen. Die Zuordnung muss gelingen. Ein fehlender Ordner muss weiterhin eine klare Fehlermeldung liefern.\n\n**So wird es behoben:** Zuerst wird geprüft, ob der gewählte Ordner gültig ist. Danach werden die einzelnen Videos darin gesucht und zugeordnet. Die Schutzprüfungen gegen unerlaubte Ordner bleiben erhalten.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: pu_progression_carousel_link_clips can never succeed: ResolveFilePath(root, '.') always returns null.\nStabile Frage-ID: daily-agent-review-2026-10-04:ec35a316d37613f2.\nEvidenz-Hash: .\nMaterial-Digest: ec35a316d37613f29ec9b0598dbf578042417a43f890eb65f9714d1383655076.\nLinkClips uses ResolveFilePath(root, '.') to check its root directory. The file resolver rejects directories, so valid roots also fail before individual MP4 files can be linked.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Validate the root as an existing safe directory, then resolve individual files beneath it.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Du kannst vorhandene Aufnahmen mit diesem Befehl nicht den Fähigkeiten zuordnen. Er bricht schon ab, bevor er die Videos im Ordner prüft.\nSo wird es geprueft: A directory containing one canonical MP4 links successfully; missing roots, file-as-root and junction cases fail safely.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Bitte nochmal neu und einfacher erklären.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    },
+    {
+      "type": "review_section",
+      "question": "Sollen Platzhalter-Videos in der veröffentlichten Spielversion ausgeschaltet bleiben?",
+      "header": "2.42",
+      "body": [
+        {
+          "id": "daily-agent-review-2026-10-04:229b327b1d62bdf3",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** In der Fähigkeiten-Übersicht fehlt die echte Aufnahme. Das Spiel zeigt stattdessen ein als Testmaterial gekennzeichnetes Platzhalter-Video. Es gibt schon einen Schalter dagegen, aber die Anzeige beachtet ihn bisher nicht.\n\n**Das kann passieren:** Spieler könnten Testmaterial sehen, obwohl du die Platzhalter ausgeschaltet hast. Besonders betroffen sind Versionen, in denen deine lokalen Videoaufnahmen fehlen.\n\n**Antwort auf deine Rückfrage:** Die Änderung liefert keine fehlenden echten Videos nach. Sie verhindert nur, dass ausgeschaltetes Testmaterial trotzdem gezeigt wird.\n\n**So testest du es selber:** Lass dir dieselbe Fähigkeit ohne echte Aufnahme mit ausgeschaltetem und eingeschaltetem Platzhalter zeigen. Ausgeschaltet darf kein Testvideo erscheinen; eingeschaltet darf der gekennzeichnete Platzhalter erscheinen.\n\n**So wird es behoben:** Die Anzeige beachtet den Schalter. In der veröffentlichten Konfiguration sind Platzhalter standardmäßig aus. Fehlt dort ein echtes Video, bleibt nur das Vorschaubild; in einer Test-Konfiguration können Platzhalter weiter eingeschaltet werden.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: MockFallbackEnabled kill-switch is never read; badged MOCK clip can play in player builds.\nStabile Frage-ID: daily-agent-review-2026-10-04:229b327b1d62bdf3.\nEvidenz-Hash: .\nMaterial-Digest: 229b327b1d62bdf379e80d56081a630db15a95477d11c18c8bea0fede6ae45ac.\nShow falls back to the mock video and badge without reading MockFallbackEnabled. External recording paths do not exist in player builds. The committed configuration enables mock fallback.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Respect MockFallbackEnabled, default it off in the shipped configuration, and retain poster-only fallback when disabled.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Spieler könnten Testmaterial sehen, obwohl du die Platzhalter ausgeschaltet hast. Besonders betroffen sind Versionen, in denen deine lokalen Videoaufnahmen fehlen.\nSo wird es geprueft: With fallback disabled and missing media, no mock video URL or mock badge is set; enabling it retains the intended QA behavior.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Bitte nochmal neu und einfacher erklären.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    },
+    {
+      "type": "review_section",
+      "question": "Sollen Aufnahmen auch dann am gewählten Ort landen, wenn du ein ganzes Laufwerk auswählst?",
+      "header": "2.43",
+      "body": [
+        {
+          "id": "daily-agent-review-2026-10-04:da4c1d1002e400ae",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** Du wählst für Aufnahmen ein ganzes Laufwerk statt eines Unterordners. Beim Zusammensetzen des Speicherorts geht ein wichtiger Teil dieser Ortsangabe verloren. Die Aufnahme landet deshalb im aktuellen Arbeitsordner auf diesem Laufwerk.\n\n**Das kann passieren:** Du suchst die Aufnahme am gewählten Ort, findest sie aber nicht. Die bisherige Prüfung meldet den abweichenden Speicherort trotzdem als gültig.\n\n**Antwort auf deine Rückfrage:** Der Fehler betrifft die Auswahl eines ganzen Laufwerks. Ein gewöhnlicher Unterordner als Aufnahmeziel ist nicht das hier beschriebene Problem.\n\n**So testest du es selber:** Frag mich nach dem Test, der ein ganzes Laufwerk als Ziel verwendet. Der ermittelte Aufnahmeort muss direkt darunter liegen, nicht unter dem Arbeitsordner des Editors.\n\n**So wird es behoben:** Die vollständige Laufwerksangabe bleibt erhalten. Der Aufnahmeordner entsteht direkt am gewählten Ort. Ein Unterordner, der heimlich auf einen anderen Ort umleitet, wird weiterhin abgewiesen.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: ResolveRecordingOutput turns a drive root into a drive-relative path.\nStabile Frage-ID: daily-agent-review-2026-10-04:da4c1d1002e400ae.\nEvidenz-Hash: .\nMaterial-Digest: da4c1d1002e400ae2a33f76584332ab730e6d28dc1f4b5ee7a8f99b9643e3250.\nTrimming the separator from a drive root makes Path.Combine resolve Sessions relative to that drive's current directory. The containment check compares against the same wrong root and passes.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Preserve drive-root separators and reject junctions in the Sessions subdirectory.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Du suchst die Aufnahme am gewählten Ort, findest sie aber nicht. Die bisherige Prüfung meldet den abweichenden Speicherort trotzdem als gültig.\nSo wird es geprueft: A drive root resolves recordings beneath its Sessions folder, and a Sessions junction is rejected.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Bitte nochmal neu und einfacher erklären.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    },
+    {
+      "type": "review_section",
+      "question": "Soll das vorbereitete Pfeilzeichen in der Ersatzschrift wiederhergestellt werden?",
+      "header": "2.44",
+      "body": [
+        {
+          "id": "daily-agent-review-2026-10-04:b18ae64be8bb5c05",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** Ein Text in der Oberfläche braucht das Pfeilzeichen →. Dafür enthält eine Ersatzschrift vorbereitete Zeichendaten. Diese Daten wurden beim Bearbeiten geleert. Die Schrift kann das Zeichen zwar oft neu erzeugen, muss es nun aber erst wieder aufbauen.\n\n**Das kann passieren:** Wenn dieses automatische Nachladen nicht funktioniert, kann der Pfeil fehlen. Außerdem geraten unbeabsichtigte Änderungen an der mitgelieferten Schrift in den Projektverlauf. Ein sichtbarer Ausfall im Spiel ist hier noch nicht belegt.\n\n**Antwort auf deine Rückfrage:** Das ist ein möglicher Darstellungsfehler, kein nachgewiesener Absturz. Der Vorschlag sichert ein bereits vorbereitetes Zeichen ab und verhindert unbeabsichtigte Änderungen an der Schrift.\n\n**So testest du es selber:** Lass dir einen Text mit dem Pfeilzeichen → nach dem Laden der Ersatzschrift zeigen. Der Pfeil muss sichtbar sein. Ich prüfe zusätzlich, ob die Schriftdatei nur absichtlich verändert wurde.\n\n**So wird es behoben:** Die vorbereiteten Zeichendaten werden wiederhergestellt oder bewusst neu erzeugt. Unbeabsichtigtes Leeren dieser mitgelieferten Schrift wird bei künftigen Änderungen geprüft.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: Third-party TMP fallback font asset stripped: glyph tables emptied, atlas reduced to 1x1.\nStabile Frage-ID: daily-agent-review-2026-10-04:b18ae64be8bb5c05.\nEvidenz-Hash: .\nMaterial-Digest: b18ae64be8bb5c057439a2429afdb4d05a925027938264f0d11243af1bf188c9.\nThe font's baked arrow glyph and character tables were emptied and its atlas shrank from 512x512 to 1x1. Dynamic population remains on and may rebuild it, but the prepared glyph is no longer stored.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Restore or deliberately regenerate the prepared glyph data and keep incidental clears out of third-party asset commits.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Wenn dieses automatische Nachladen nicht funktioniert, kann der Pfeil fehlen. Außerdem geraten unbeabsichtigte Änderungen an der mitgelieferten Schrift in den Projektverlauf. Ein sichtbarer Ausfall im Spiel ist hier noch nicht belegt.\nSo wird es geprueft: After the font loads, text containing the arrow resolves a glyph; check unintended third-party font churn.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Bitte nochmal neu und einfacher erklären.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    }
+  ]
+}

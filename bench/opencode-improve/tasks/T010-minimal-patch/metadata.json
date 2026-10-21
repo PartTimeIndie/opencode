@@ -1,0 +1,7 @@
+{
+  "id": "T010-minimal-patch",
+  "name": "Minimal patch guard",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus max changed files check",
+  "goal": "Fix a one-function bug without broad rewrites."
+}

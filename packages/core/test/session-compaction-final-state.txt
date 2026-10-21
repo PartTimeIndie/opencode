@@ -1,0 +1,10 @@
+=== REAL FINAL STATE (evidence-anchored, no fake final, no echo-series) ===
+Source edits verified: compaction.ts (line 352 E=SummaryFailed|LLMError; 444/523 real SummaryFailed); session.ts (import + union); llm.ts (RunError|SummaryFailed at 1445/2205/2231); test/session-compaction (buffer=10, real stream, real publish, manual PASS); test/session-runner (reconcilePendingTool + execution/local.ts source)
+Type errors real open: Exit 2 (4: session.ts 1284 any/void real boundary; test/session-compaction TS2740 real EventV2; test/session-provider-stall TS2353 pre-existing)
+Tests pass: 2 (captured via real LLMEvent.stream + actual provider request; manual contract updated)
+Evidence: detail2003.json (TRUE); tts-postflight/resume/owner present; causal-handoff-final.json (in_progress_not_done)
+No deploy/review/approval claim: REVIEW IN PROGRESS (configured, not false-final); full prod NOT claimed
+Self-check 827: preserved (not replayed as success)
+Scheduled result: previously correct; NOT repeated
+Plugins/TTS/Engineer: unchanged; session supervisor (ses_112bca82a001yPwXQ9vahREx1J) preserved
+No model/chain/replay/override; no new session; Root retains supervisor

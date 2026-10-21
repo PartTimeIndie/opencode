@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "kind": "opencode.question-payload",
+  "binding": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "keys": [
+    "qa-only:option-buttons"
+  ],
+  "questions": [
+    {
+      "type": "review_section",
+      "question": "Welche Testoption soll das isolierte Frage-Popup zurueckgeben?",
+      "header": "QA.1",
+      "body": [
+        {
+          "id": "qa-only:option-buttons",
+          "type": "markdown",
+          "content": "**Project:** PU.\n\n**Beispiel:** Ein automatischer Spieltest speichert gerade einen Test-Spielstand. Der Test wird beendet, obwohl das Speichern noch läuft. Trotzdem stellt er schon die normalen Einstellungen wieder her und meldet das Aufräumen als erledigt.\n\n**Das kann passieren:** Der Testlauf kann dadurch als fehlgeschlagen gelten, obwohl das Spiel funktioniert. Eine noch laufende Speicheraktion kann außerdem nach dem Zurückstellen der Einstellungen weiterschreiben.\n\n**Antwort auf deine Rückfrage:** Es geht um das Aufräumen nach automatischen Spieltests, nicht um normales Beenden durch einen Spieler. Der Fehler ist die Reihenfolge: erst fertig speichern, dann die Test-Einstellungen zurückstellen.\n\n**So testest du es selber:** Lass dir von mir einen Test mit absichtlich verzögertem Speichern zeigen. Die Einstellungen müssen unverändert bleiben, solange noch gespeichert wird. Danach muss der Test sauber abschließen.\n\n**Optionen:**\n\nOption 1: Im isolierten Test warten alle Speicheraktionen vor dem Aufraeumen.\n\nOption 2: Im isolierten Test werden offene Speicheraktionen kontrolliert abgebrochen.\n\nOption 3: Im isolierten Test wird die offene Speicherung gemeldet, ohne schon aufzuraeumen.\n\n<details><summary>Mehr zu Evidenz und Quelle</summary>\nQuelle: Daily-Agent-Review.\nPunkt: Code-Review PU: Isolation End never enforces join-before-restore; draining state unreachable and recovery killed by DiscardLease.\nStabile Frage-ID: qa-only:option-buttons.\nEvidenz-Hash: .\nMaterial-Digest: 0635ba7437569b4ade94c39f221fa1029d6f51a23b5166881d0472fe3d197aec.\nEnd() calls TryCloseAndDrain non-blocking, samples IsDrained once, then unconditionally advances restoring-&gt;released and calls DiscardLease(). A re-issued End hits the released early-return. The regression runner fails closed on pendingOperationsDrained!==true.\n</details>\n\n<details><summary>Mehr zu Auswirkung und Umsetzung</summary>\nProjekt: PU.\nPfad: .\nTyp: code.\nSo wird es behoben: Persist draining and return without restoring the environment until every owned operation has settled; then restore, release and discard the lease.\nOption 1: Im isolierten Test warten alle Speicheraktionen vor dem Aufraeumen.\nOption 2: Im isolierten Test werden offene Speicheraktionen kontrolliert abgebrochen.\nOption 3: Im isolierten Test wird die offene Speicherung gemeldet, ohne schon aufzuraeumen.\n</details>\n\n<details><summary>Mehr zu Risiko und Akzeptanz</summary>\nRisiko: nicht angegeben. Der Testlauf kann dadurch als fehlgeschlagen gelten, obwohl das Spiel funktioniert. Eine noch laufende Speicheraktion kann außerdem nach dem Zurückstellen der Einstellungen weiterschreiben.\nSo wird es geprueft: Track a pending TaskCompletionSource, call End, assert draining without restore; complete it and call End again, assert released.\n</details>\n\n<details><summary>Deine Rueckfragen</summary>\n- Erkläre mir das in einfachen Worten mit einem echten Beispiel. Kein Code und keine Zeilen im sichtbaren Text.\n</details>"
+        }
+      ],
+      "options": [
+        {
+          "id": "yes",
+          "label": "Ja",
+          "description": "In den gemeinsamen Umsetzungsplan aufnehmen und nach allen Antworten bearbeiten."
+        },
+        {
+          "id": "option:1",
+          "label": "Option 1",
+          "description": "Im isolierten Test warten alle Speicheraktionen vor dem Aufraeumen."
+        },
+        {
+          "id": "option:2",
+          "label": "Option 2",
+          "description": "Im isolierten Test werden offene Speicheraktionen kontrolliert abgebrochen."
+        },
+        {
+          "id": "option:3",
+          "label": "Option 3",
+          "description": "Im isolierten Test wird die offene Speicherung gemeldet, ohne schon aufzuraeumen."
+        },
+        {
+          "id": "no",
+          "label": "Nein",
+          "description": "Bis zu neuer Evidenz fuer diesen Plan unterdruecken."
+        },
+        {
+          "id": "later",
+          "label": "Spaeter",
+          "description": "Konfiguriert snoozen und spaeter erneut vorlegen."
+        },
+        {
+          "id": "question",
+          "label": "Mehr Details",
+          "description": "Kommentar speichern; dieselbe stabile Frage bleibt offen."
+        },
+        {
+          "id": "done_for_today",
+          "label": "Genug fuer heute",
+          "description": "Lauf beenden und alle noch offenen Punkte nur bis morgen zurueckstellen."
+        }
+      ],
+      "multiple": false,
+      "custom": false,
+      "allowOther": false,
+      "allowFeedback": true
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" color="white" role="img" aria-label="Git Workbench">
+  <rect x="13" y="13" width="102" height="102" rx="22" fill="none" stroke="currentColor" stroke-width="6" opacity=".32"/>
+  <path d="M41 35h36c16 0 26 10 26 26v20" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round" opacity=".95"/>
+  <path d="M41 93h22c13 0 22-9 22-22V51" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round" opacity=".72"/>
+  <circle cx="41" cy="35" r="10" fill="none" stroke="currentColor" stroke-width="6"/>
+  <circle cx="85" cy="51" r="10" fill="none" stroke="currentColor" stroke-width="6"/>
+  <circle cx="41" cy="93" r="10" fill="none" stroke="currentColor" stroke-width="6"/>
+  <path d="M79 85l8 8 18-21" fill="none" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

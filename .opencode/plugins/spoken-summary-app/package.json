@@ -1,0 +1,14 @@
+{
+  "name": "spoken-summary-app",
+  "displayName": "Kurz anhören",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": { "./app": "./index.js" },
+  "opencode": {
+    "api": { "app": 2 },
+    "app": {
+      "capabilities": ["ui:toolbar", "ui:settings", "ui:models", "ui:overlay", "commands", "host:navigation", "host:session-context", "host:ai", "host:tts"],
+      "ai": { "tools": [] }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "T006-large-log-noise",
+  "name": "Large noisy log failure",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Fix the real settings bug after noisy test output."
+}

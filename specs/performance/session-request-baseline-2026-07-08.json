@@ -1,0 +1,158 @@
+{
+  "schema": "opencode.session_request_baseline.v1",
+  "recorded_at": "2026-07-08T02:53:24.786Z",
+  "stage": "0.1 Request-Assembly Profiling",
+  "source_command": "bun test --timeout 30000 test/session/prompt.test.ts -t \"records request assembly and provider turn perf events\"",
+  "working_directory": "packages/opencode",
+  "evidence_file": "packages/opencode/test-results/stage0-1-perf-baseline.jsonl",
+  "scenario": {
+    "name": "prompt loop through TestLLMServer plus structural no-content turn",
+    "provider_id": "test",
+    "model_id": "test-model",
+    "agent": "build",
+    "optimization_profile": "safe",
+    "optimization_features": [
+      "core_search_limits",
+      "stable_tool_output_preview",
+      "runner_request_metrics",
+      "read_deduplication",
+      "compact_tool_schemas",
+      "patch_verify_tool"
+    ]
+  },
+  "events": [
+    {
+      "kind": "request_assembly",
+      "source": "opencode-session-prompt",
+      "history_load_ms": 1,
+      "model_messages_ms": 1,
+      "request_assembly_ms": 106,
+      "message_count": 1,
+      "system_prompt_chars": 66217,
+      "system_prompt_estimate_tokens": 16554,
+      "tool_count": 13,
+      "tool_schema_bytes": 38792,
+      "context_estimate_tokens": 26493
+    },
+    {
+      "kind": "request_assembly",
+      "source": "opencode",
+      "request_assembly_ms": 6,
+      "message_count": 2,
+      "system_prompt_chars": 66217,
+      "system_prompt_estimate_tokens": 16554,
+      "tool_count": 13,
+      "tool_schema_bytes": 27562,
+      "context_estimate_tokens": 40464
+    },
+    {
+      "kind": "provider_turn",
+      "source": "opencode-session-processor",
+      "first_event_ms": 366,
+      "ttfb_ms": 379,
+      "stream_ms": 390,
+      "events_count": 6,
+      "success": true,
+      "interrupted": false
+    },
+    {
+      "kind": "request_assembly",
+      "source": "opencode-session-prompt",
+      "history_load_ms": 0,
+      "model_messages_ms": 0,
+      "request_assembly_ms": 22,
+      "message_count": 1,
+      "system_prompt_chars": 66217,
+      "system_prompt_estimate_tokens": 16554,
+      "tool_count": 13,
+      "tool_schema_bytes": 38792,
+      "context_estimate_tokens": 26494
+    },
+    {
+      "kind": "request_assembly",
+      "source": "opencode",
+      "request_assembly_ms": 2,
+      "message_count": 2,
+      "system_prompt_chars": 66217,
+      "system_prompt_estimate_tokens": 16554,
+      "tool_count": 13,
+      "tool_schema_bytes": 27562,
+      "context_estimate_tokens": 40466
+    },
+    {
+      "kind": "provider_turn",
+      "source": "opencode-session-processor",
+      "first_event_ms": 15,
+      "stream_ms": 21,
+      "events_count": 3,
+      "success": true,
+      "interrupted": false,
+      "note": "structural event-only provider turn; ttfb_ms omitted because no content-bearing token/tool output was emitted"
+    }
+  ],
+  "core_runner": {
+    "source_command": "bun test --timeout 30000 test/session-runner.test.ts -t \"records request assembly and provider turn perf events\"",
+    "working_directory": "packages/core",
+    "evidence_file": "packages/core/test-results/stage0-1-core-perf-baseline.jsonl",
+    "scenario": {
+      "name": "SessionRunnerLLM through in-memory LLMClient plus structural no-content turn",
+      "provider_id": "fake",
+      "model_id": "fake-model",
+      "agent": "build"
+    },
+    "events": [
+      {
+        "kind": "request_assembly",
+        "source": "core-session-runner",
+        "history_load_ms": 1,
+        "model_messages_ms": 1,
+        "request_assembly_ms": 12,
+        "message_count": 1,
+        "system_prompt_chars": 15,
+        "system_prompt_estimate_tokens": 4,
+        "tool_count": 2,
+        "tool_schema_bytes": 461,
+        "context_estimate_tokens": 164
+      },
+      {
+        "kind": "provider_turn",
+        "source": "core-session-runner",
+        "first_event_ms": 2,
+        "ttfb_ms": 9,
+        "stream_ms": 13,
+        "events_count": 6,
+        "tool_calls_count": 0,
+        "success": true,
+        "interrupted": false
+      },
+      {
+        "kind": "request_assembly",
+        "source": "core-session-runner",
+        "history_load_ms": 1,
+        "model_messages_ms": 0,
+        "request_assembly_ms": 4,
+        "message_count": 1,
+        "system_prompt_chars": 15,
+        "system_prompt_estimate_tokens": 4,
+        "tool_count": 2,
+        "tool_schema_bytes": 461,
+        "context_estimate_tokens": 165
+      },
+      {
+        "kind": "provider_turn",
+        "source": "core-session-runner",
+        "first_event_ms": 0,
+        "stream_ms": 6,
+        "events_count": 3,
+        "tool_calls_count": 0,
+        "success": true,
+        "interrupted": false,
+        "note": "structural event-only provider turn; ttfb_ms omitted because no content-bearing token/tool output was emitted"
+      }
+    ]
+  },
+  "verification": {
+    "test_assertion": "test/session/prompt.test.ts records request_assembly events from opencode-session-prompt and opencode plus provider_turn first_event_ms and content-bearing ttfb_ms; a structural-only provider turn records first_event_ms and omits ttfb_ms. packages/core/test/session-runner.test.ts records the same core-session-runner timing semantics.",
+    "test_result": "opencode prompt metrics: 1 pass, 61 filtered out, 0 fail, 5 expect() calls; core runner metrics: 1 pass, 92 filtered out, 0 fail, 4 expect() calls"
+  }
+}

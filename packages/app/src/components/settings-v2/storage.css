@@ -1,0 +1,433 @@
+.storage-v2-header .settings-v2-tab-header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.storage-v2-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.storage-v2-header p,
+.storage-v2-help,
+.storage-v2-result,
+.storage-v2-error {
+  margin-top: 8px;
+  color: var(--v2-text-text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.storage-v2-body {
+  gap: 28px;
+}
+
+.storage-v2-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.storage-v2-state {
+  display: flex;
+  min-height: 160px;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  border-radius: 8px;
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-muted);
+}
+
+.storage-v2-state--error {
+  flex-direction: column;
+  color: var(--v2-state-fg-danger);
+}
+
+.storage-v2-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.storage-v2-section h3 {
+  color: var(--v2-text-text-base);
+  font-size: 15px;
+  font-weight: 640;
+}
+
+.storage-v2-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-grid {
+  grid-template-columns: 1fr;
+}
+
+.storage-v2-card {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+  background: var(--v2-background-bg-layer-01);
+}
+
+.storage-v2-card > span,
+.storage-v2-card > small,
+.storage-v2-backup span,
+.storage-v2-backup small {
+  overflow: hidden;
+  color: var(--v2-text-text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-v2-card > strong {
+  color: var(--v2-text-text-base);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-v2-card > small[data-wrap="true"] {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.storage-v2-card[data-state="attention"] > strong,
+.storage-v2-error {
+  color: var(--v2-state-fg-warning);
+}
+
+.storage-v2-card[data-state="error"] > strong {
+  color: var(--v2-state-fg-danger);
+}
+
+.storage-v2-error--banner {
+  margin: 0;
+  padding: 10px 12px;
+  border: 0.5px solid var(--v2-state-border-danger);
+  border-radius: 8px;
+  background: var(--v2-state-bg-danger);
+  color: var(--v2-state-fg-danger);
+}
+
+.storage-v2-safety {
+  margin: 0;
+  padding: 10px 12px;
+  border: 0.5px solid var(--v2-state-border-warning);
+  border-radius: 8px;
+  background: var(--v2-state-bg-warning);
+  color: var(--v2-state-fg-warning);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.storage-v2-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+  background: var(--v2-background-bg-layer-01);
+}
+
+.storage-v2-paths div {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.25fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.storage-v2-paths dt,
+.storage-v2-paths dd,
+.storage-v2-migration-controls label,
+.storage-v2-migration-controls small,
+.storage-v2-migration-database label,
+.storage-v2-migration-database small {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.storage-v2-paths dt,
+.storage-v2-migration-controls small,
+.storage-v2-migration-database small {
+  color: var(--v2-text-text-muted);
+}
+
+.storage-v2-paths dd {
+  overflow-wrap: anywhere;
+  color: var(--v2-text-text-base);
+}
+
+.storage-v2-migration-controls {
+  display: flex;
+  max-width: 720px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.storage-v2-migration-database {
+  display: grid;
+  width: 100%;
+  max-width: 720px;
+  grid-template-columns: minmax(150px, 0.4fr) minmax(220px, 0.6fr);
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.storage-v2-migration-database select {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 4px 28px 4px 10px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 6px;
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-base);
+}
+
+.storage-v2-migration-database small {
+  grid-column: 1 / -1;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-migration-database {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.storage-v2-migration-controls label {
+  color: var(--v2-text-text-base);
+}
+
+.storage-v2-migration-controls [data-component="text-input-v2"] {
+  width: 100%;
+}
+
+.storage-v2-actions,
+.storage-v2-retirement-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.storage-v2-retention-control,
+.storage-v2-cleanup-enable,
+.storage-v2-retention-days {
+  box-sizing: border-box;
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  max-width: 720px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+  background: var(--v2-background-bg-layer-01);
+}
+
+.storage-v2-retention-control > div,
+.storage-v2-cleanup-enable > div,
+.storage-v2-retention-days {
+  min-width: 0;
+}
+
+.storage-v2-retention-control strong,
+.storage-v2-cleanup-enable strong,
+.storage-v2-retention-days label {
+  display: block;
+  color: var(--v2-text-text-base);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.storage-v2-retention-control small,
+.storage-v2-cleanup-enable small,
+.storage-v2-retention-days small {
+  display: block;
+  margin-top: 4px;
+  color: var(--v2-text-text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.storage-v2-retention-days [data-component="text-input-v2"] {
+  width: 100%;
+  min-width: 0;
+}
+
+.storage-v2-retention-days {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 96px;
+}
+
+.storage-v2-cleanup-config {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  max-width: 720px;
+}
+
+.storage-v2-cleanup-field {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 112px;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 14px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-base);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.storage-v2-cleanup-field small {
+  grid-column: 1 / -1;
+  color: var(--v2-text-text-muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.storage-v2-cleanup-field [data-component="text-input-v2"] {
+  width: 100%;
+  min-width: 0;
+}
+
+.storage-v2-cleanup-save {
+  grid-column: 1 / -1;
+}
+
+.storage-v2-retention-days small {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-retention-control {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-cleanup-enable {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-cleanup-enable [data-component="switch-v2"] {
+  align-self: flex-end;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-cleanup-config {
+  grid-template-columns: 1fr;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-retention-control [data-component="switch-v2"] {
+  align-self: flex-end;
+}
+
+[data-component="storage-settings"][data-layout="stacked"] .storage-v2-retention-days {
+  grid-template-columns: 1fr;
+}
+
+.storage-v2-backups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.storage-v2-backup {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-base);
+  text-align: left;
+}
+
+.storage-v2-backup > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.storage-v2-backup > small {
+  grid-column: 1 / -1;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.storage-v2-backup:hover,
+.storage-v2-backup[data-selected] {
+  border-color: var(--v2-border-border-focus);
+  background: var(--v2-background-bg-layer-02);
+}
+
+.storage-v2-retirement {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.storage-v2-retirement label {
+  color: var(--v2-text-text-base);
+  font-size: 13px;
+}
+
+.storage-v2-retirement code {
+  overflow-wrap: anywhere;
+  color: var(--v2-state-fg-warning);
+}
+
+.storage-v2-retirement-controls [data-component="text-input-v2"] {
+  min-width: min(100%, 420px);
+  flex: 1;
+}
+
+@media (max-width: 639px) {
+  .storage-v2-header .settings-v2-tab-header-row,
+  .storage-v2-header-actions,
+  .storage-v2-retirement-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .storage-v2-backup {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .storage-v2-cleanup-field {
+    grid-template-columns: 1fr;
+  }
+
+  .storage-v2-paths div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}

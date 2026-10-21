@@ -1,0 +1,31 @@
+{
+  "name": "@opencode-ai/provider-llmgateway",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./provider": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "opencode": {
+    "api": {
+      "provider": 1
+    }
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node --splitting",
+    "typecheck": "tsgo --noEmit",
+    "prepack": "bun run build"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.17.7"
+  },
+  "devDependencies": {
+    "@tsconfig/bun": "1.0.11",
+    "@types/bun": "1.4.0",
+    "@typescript/native-preview": "7.0.0-dev.20251207.1"
+  }
+}

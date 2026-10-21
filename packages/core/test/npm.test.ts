@@ -1,0 +1,174 @@
+import fs from "fs/promises"
+import path from "path"
+import { describe, expect, test } from "bun:test"
+import { NodeFileSystem } from "@effect/platform-node"
+import { Effect, Layer, Option } from "effect"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
+import { Npm } from "@opencode-ai/core/npm"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { tmpdir } from "./fixture/tmpdir"
+
+const win = process.platform === "win32"
+
+const writePackage = (dir: string, pkg: Record<string, unknown>) =>
+  Bun.write(
+    path.join(dir, "package.json"),
+    JSON.stringify({
+      version: "1.0.0",
+      ...pkg,
+    }),
+  )
+
+const npmLayer = (cache: string) =>
+  Npm.layer.pipe(
+    Layer.provide(EffectFlock.layer),
+    Layer.provide(FSUtil.layer),
+    Layer.provide(Global.layerWith({ cache, state: path.join(cache, "state") })),
+    Layer.provide(NodeFileSystem.layer),
+  )
+
+describe("Npm.sanitize", () => {
+  test("keeps normal scoped package specs unchanged", () => {
+    expect(Npm.sanitize("@opencode/acme")).toBe("@opencode/acme")
+    expect(Npm.sanitize("@opencode/acme@1.0.0")).toBe("@opencode/acme@1.0.0")
+    expect(Npm.sanitize("prettier")).toBe("prettier")
+  })
+
+  test("handles git https specs", () => {
+    const spec = "acme@git+https://github.com/opencode/acme.git"
+    const expected = win ? "acme@git+https_//github.com/opencode/acme.git" : spec
+    expect(Npm.sanitize(spec)).toBe(expected)
+  })
+})
+
+describe("Npm.add", () => {
+  test(
+    "reifies when package cache directory exists without the package installed",
+    async () => {
+      await using tmp = await tmpdir()
+      await fs.mkdir(path.join(tmp.path, "fixture-provider"))
+      await writePackage(path.join(tmp.path, "fixture-provider"), {
+        name: "fixture-provider",
+        main: "index.js",
+      })
+      await Bun.write(path.join(tmp.path, "fixture-provider", "index.js"), "export const fixture = true\n")
+
+      const spec = `fixture-provider@file:${path.join(tmp.path, "fixture-provider")}`
+      await fs.mkdir(path.join(tmp.path, "cache", "packages", Npm.sanitize(spec)), { recursive: true })
+
+      const entry = await Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        return yield* npm.add(spec)
+      }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
+
+      expect(Option.isSome(entry.entrypoint)).toBe(true)
+    },
+    15_000,
+  )
+})
+
+describe("Npm.install", () => {
+  test("respects omit from project .npmrc", async () => {
+    await using tmp = await tmpdir()
+
+    await writePackage(tmp.path, {
+      name: "fixture",
+      dependencies: {
+        "prod-pkg": "file:./prod-pkg",
+      },
+      devDependencies: {
+        "dev-pkg": "file:./dev-pkg",
+      },
+    })
+    await Bun.write(path.join(tmp.path, ".npmrc"), "omit=dev\n")
+    await fs.mkdir(path.join(tmp.path, "prod-pkg"))
+    await fs.mkdir(path.join(tmp.path, "dev-pkg"))
+    await writePackage(path.join(tmp.path, "prod-pkg"), { name: "prod-pkg" })
+    await writePackage(path.join(tmp.path, "dev-pkg"), { name: "dev-pkg" })
+
+    await Npm.install(tmp.path)
+
+    await expect(fs.stat(path.join(tmp.path, "node_modules", "prod-pkg"))).resolves.toBeDefined()
+    await expect(fs.stat(path.join(tmp.path, "node_modules", "dev-pkg"))).rejects.toThrow()
+  })
+
+  test("replaces a stale requested dependency version", async () => {
+    await using tmp = await tmpdir()
+    await fs.mkdir(path.join(tmp.path, "prod-v1"))
+    await fs.mkdir(path.join(tmp.path, "prod-v2"))
+    await fs.mkdir(path.join(tmp.path, "node_modules"))
+    await writePackage(path.join(tmp.path, "prod-v1"), { name: "prod-pkg", version: "1.0.0" })
+    await writePackage(path.join(tmp.path, "prod-v2"), { name: "prod-pkg", version: "2.0.0" })
+    await writePackage(tmp.path, {
+      name: "fixture",
+      dependencies: {
+        "prod-pkg": "file:./prod-v1",
+      },
+    })
+    await Bun.write(
+      path.join(tmp.path, "package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3, packages: { "": { dependencies: { "prod-pkg": "file:./prod-v1" } } } }),
+    )
+
+    await Npm.install(tmp.path, { add: [{ name: "prod-pkg", version: "file:./prod-v2" }] })
+
+    expect((await Bun.file(path.join(tmp.path, "package.json")).json()).dependencies["prod-pkg"]).toBe("file:prod-v2")
+    expect((await Bun.file(path.join(tmp.path, "node_modules", "prod-pkg", "package.json")).json()).version).toBe("2.0.0")
+  })
+
+  test("removes a provided package while installing other declared dependencies", async () => {
+    await using tmp = await tmpdir()
+    await fs.mkdir(path.join(tmp.path, "real-dependency"))
+    await writePackage(path.join(tmp.path, "real-dependency"), { name: "real-dependency" })
+    await writePackage(tmp.path, {
+      name: "fixture",
+      dependencies: {
+        "@opencode-ai/plugin": "0.0.0-prod-202608301043",
+        "real-dependency": "file:./real-dependency",
+      },
+    })
+
+    await Npm.install(tmp.path, { add: [], provided: ["@opencode-ai/plugin"] })
+
+    expect((await Bun.file(path.join(tmp.path, "package.json")).json()).dependencies).toEqual({
+      "@opencode-ai/plugin": "0.0.0-prod-202608301043",
+      "real-dependency": "file:./real-dependency",
+    })
+    await expect(fs.stat(path.join(tmp.path, "node_modules", "real-dependency"))).resolves.toBeDefined()
+    await expect(fs.stat(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin"))).rejects.toThrow()
+  })
+
+  test("restores provided dependencies when another dependency fails to install", async () => {
+    await using tmp = await tmpdir()
+    await writePackage(tmp.path, {
+      name: "fixture",
+      dependencies: {
+        "@opencode-ai/plugin": "0.0.0-prod-202608301043",
+        broken: "file:./missing-dependency.tgz",
+      },
+    })
+
+    await expect(Npm.install(tmp.path, { add: [], provided: ["@opencode-ai/plugin"] })).rejects.toThrow()
+    expect((await Bun.file(path.join(tmp.path, "package.json")).json()).dependencies).toEqual({
+      "@opencode-ai/plugin": "0.0.0-prod-202608301043",
+      broken: "file:./missing-dependency.tgz",
+    })
+  })
+})
+
+describe("Npm.packageImportFile", () => {
+  test("resolves package exports.import to the JS entry file", async () => {
+    await using tmp = await tmpdir()
+    await writePackage(tmp.path, {
+      name: "cursor-opencode-provider",
+      exports: {
+        ".": {
+          types: "./dist/index.d.ts",
+          import: "./dist/index.js",
+        },
+      },
+    })
+    expect(Npm.packageImportFile(tmp.path)).toBe(path.join(tmp.path, "dist", "index.js"))
+  })
+})

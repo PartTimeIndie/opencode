@@ -1,0 +1,8 @@
+{
+  "name": "git-workbench-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  }
+}

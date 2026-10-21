@@ -1,0 +1,14 @@
+{
+  "name": "@opencode-ai/chat-chain-manager",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "workspace:*",
+    "zod": "catalog:"
+  }
+}

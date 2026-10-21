@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "version": "1.17.7",
+  "name": "@opencode-ai/llm",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && bun ./script/fix-dist-imports.ts",
+    "setup:recording-env": "bun run script/setup-recording-env.ts",
+    "test": "bun test --timeout 30000 --only-failures",
+    "typecheck": "tsgo --noEmit"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./src/index.ts"
+    },
+    "./route": {
+      "types": "./dist/route/index.d.ts",
+      "default": "./src/route/index.ts"
+    },
+    "./provider": {
+      "types": "./dist/provider.d.ts",
+      "default": "./src/provider.ts"
+    },
+    "./provider-quota": {
+      "types": "./dist/provider-quota.d.ts",
+      "default": "./src/provider-quota.ts"
+    },
+    "./providers": {
+      "types": "./dist/providers/index.d.ts",
+      "default": "./src/providers/index.ts"
+    },
+    "./providers/amazon-bedrock": {
+      "types": "./dist/providers/amazon-bedrock.d.ts",
+      "default": "./src/providers/amazon-bedrock.ts"
+    },
+    "./providers/anthropic": {
+      "types": "./dist/providers/anthropic.d.ts",
+      "default": "./src/providers/anthropic.ts"
+    },
+    "./providers/azure": {
+      "types": "./dist/providers/azure.d.ts",
+      "default": "./src/providers/azure.ts"
+    },
+    "./providers/cloudflare": {
+      "types": "./dist/providers/cloudflare.d.ts",
+      "default": "./src/providers/cloudflare.ts"
+    },
+    "./providers/github-copilot": {
+      "types": "./dist/providers/github-copilot.d.ts",
+      "default": "./src/providers/github-copilot.ts"
+    },
+    "./providers/google": {
+      "types": "./dist/providers/google.d.ts",
+      "default": "./src/providers/google.ts"
+    },
+    "./providers/openai": {
+      "types": "./dist/providers/openai.d.ts",
+      "default": "./src/providers/openai.ts"
+    },
+    "./providers/openai-compatible": {
+      "types": "./dist/providers/openai-compatible.d.ts",
+      "default": "./src/providers/openai-compatible.ts"
+    },
+    "./providers/openai-compatible-profile": {
+      "types": "./dist/providers/openai-compatible-profile.d.ts",
+      "default": "./src/providers/openai-compatible-profile.ts"
+    },
+    "./providers/openrouter": {
+      "types": "./dist/providers/openrouter.d.ts",
+      "default": "./src/providers/openrouter.ts"
+    },
+    "./providers/xai": {
+      "types": "./dist/providers/xai.d.ts",
+      "default": "./src/providers/xai.ts"
+    },
+    "./protocols": {
+      "types": "./dist/protocols/index.d.ts",
+      "default": "./src/protocols/index.ts"
+    },
+    "./protocols/anthropic-messages": {
+      "types": "./dist/protocols/anthropic-messages.d.ts",
+      "default": "./src/protocols/anthropic-messages.ts"
+    },
+    "./protocols/bedrock-converse": {
+      "types": "./dist/protocols/bedrock-converse.d.ts",
+      "default": "./src/protocols/bedrock-converse.ts"
+    },
+    "./protocols/gemini": {
+      "types": "./dist/protocols/gemini.d.ts",
+      "default": "./src/protocols/gemini.ts"
+    },
+    "./protocols/openai-chat": {
+      "types": "./dist/protocols/openai-chat.d.ts",
+      "default": "./src/protocols/openai-chat.ts"
+    },
+    "./protocols/openai-compatible-chat": {
+      "types": "./dist/protocols/openai-compatible-chat.d.ts",
+      "default": "./src/protocols/openai-compatible-chat.ts"
+    },
+    "./protocols/openai-responses": {
+      "types": "./dist/protocols/openai-responses.d.ts",
+      "default": "./src/protocols/openai-responses.ts"
+    }
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@clack/prompts": "1.0.0-alpha.1",
+    "@effect/platform-node": "catalog:",
+    "@opencode-ai/http-recorder": "workspace:*",
+    "@tsconfig/bun": "catalog:",
+    "@types/bun": "catalog:",
+    "@typescript/native-preview": "catalog:"
+  },
+  "dependencies": {
+    "@smithy/eventstream-codec": "4.2.14",
+    "@smithy/util-utf8": "4.2.2",
+    "aws4fetch": "1.0.20",
+    "effect": "catalog:"
+  }
+}

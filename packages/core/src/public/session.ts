@@ -1,0 +1,183 @@
+export * as Session from "./session"
+
+import { Effect, Schema, Stream } from "effect"
+import { EventV2 } from "../event"
+import { ModelV2 } from "../model"
+import { SessionV2 } from "../session"
+import { SummaryFailed } from "../session/compaction"
+import { MessageDecodeError } from "../session/error"
+import { SessionEvent } from "../session/event"
+import { SessionInput } from "../session/input"
+import { SessionMessage } from "../session/message"
+import { Prompt } from "../session/prompt"
+import { ContentStore } from "../content-store"
+import { Agent } from "./agent"
+import { Location } from "./location"
+import { Model } from "./model"
+
+export const ID = SessionV2.ID
+export type ID = SessionV2.ID
+
+export const Info = SessionV2.Info
+export type Info = SessionV2.Info
+
+export const Share = SessionV2.Share
+export type Share = SessionV2.Share
+
+export const Summary = SessionV2.Summary
+export type Summary = SessionV2.Summary
+
+export const MessageID = SessionMessage.ID
+export type MessageID = SessionMessage.ID
+
+export const Message = SessionMessage.Message
+export type Message = SessionMessage.Message
+
+export const Admission = SessionInput.Admitted
+export type Admission = SessionInput.Admitted
+
+export const Delivery = SessionInput.Delivery
+export type Delivery = SessionInput.Delivery
+
+export const ListInput = SessionV2.ListInput
+export type ListInput = SessionV2.ListInput
+
+export const EventCursor = EventV2.Cursor
+export type EventCursor = EventV2.Cursor
+export type Event = EventV2.CursorEvent<SessionEvent.DurableEvent>
+
+export const NotFoundError = SessionV2.NotFoundError
+export type NotFoundError = SessionV2.NotFoundError
+
+export const PromptConflictError = SessionV2.PromptConflictError
+export type PromptConflictError = SessionV2.PromptConflictError
+
+export const RollbackBlockedError = SessionV2.RollbackBlockedError
+export type RollbackBlockedError = SessionV2.RollbackBlockedError
+
+export const BusyError = SessionV2.BusyError
+export type BusyError = SessionV2.BusyError
+export const AgentTransitionError = SessionV2.AgentTransitionError
+export type AgentTransitionError = SessionV2.AgentTransitionError
+
+export const AttachmentStorageError = ContentStore.StorageError
+export type AttachmentStorageError = ContentStore.StorageError
+
+export class ModelUnavailableError extends Schema.TaggedErrorClass<ModelUnavailableError>()(
+  "Session.ModelUnavailableError",
+  {
+    providerID: Model.Ref.fields.providerID,
+    modelID: Model.Ref.fields.id,
+  },
+) {}
+
+export class VariantUnavailableError extends Schema.TaggedErrorClass<VariantUnavailableError>()(
+  "Session.VariantUnavailableError",
+  {
+    providerID: Model.Ref.fields.providerID,
+    modelID: Model.Ref.fields.id,
+    variant: ModelV2.VariantID,
+  },
+) {}
+
+export { MessageDecodeError, SummaryFailed }
+
+export interface CreateInput {
+  readonly id?: ID
+  readonly agent?: Agent.ID
+  readonly model?: Model.Ref
+  readonly location: Location.Ref
+}
+
+export interface PromptInput {
+  readonly id?: MessageID
+  readonly sessionID: ID
+  readonly prompt: Prompt
+  readonly agent?: Agent.ID
+  readonly model?: Model.Ref
+  readonly system?: string
+  readonly delivery?: Delivery
+}
+
+export interface SwitchModelInput {
+  readonly sessionID: ID
+  readonly model: Model.Ref
+}
+
+export interface SwitchAgentAndPromptInput {
+  readonly sessionID: ID
+  readonly agent: Agent.ID
+  readonly model?: Model.Ref
+  readonly prompt: Prompt
+}
+
+export interface SetTitleInput {
+  readonly sessionID: ID
+  readonly title: string
+}
+
+export interface SetShareInput {
+  readonly sessionID: ID
+  readonly share?: Share
+}
+
+export interface SetSummaryInput {
+  readonly sessionID: ID
+  readonly summary?: Summary
+}
+
+export interface MessagesInput {
+  readonly sessionID: ID
+  readonly limit?: number
+  readonly order?: "asc" | "desc"
+  readonly cursor?: {
+    readonly id: MessageID
+    readonly direction: "previous" | "next"
+  }
+}
+
+export interface MessageInput {
+  readonly sessionID: ID
+  readonly messageID: MessageID
+}
+
+export interface EventsInput {
+  readonly sessionID: ID
+  readonly after?: EventCursor
+}
+
+export interface Interface {
+  readonly create: (input: CreateInput) => Effect.Effect<Info>
+  readonly get: (sessionID: ID) => Effect.Effect<Info, NotFoundError>
+  readonly list: (input?: ListInput) => Effect.Effect<Info[]>
+  readonly prompt: (
+    input: PromptInput,
+  ) => Effect.Effect<Admission, NotFoundError | PromptConflictError | RollbackBlockedError | BusyError | AttachmentStorageError>
+  readonly switchModel: (
+    input: SwitchModelInput,
+  ) => Effect.Effect<
+    void,
+    NotFoundError | ModelUnavailableError | VariantUnavailableError | MessageDecodeError | SummaryFailed
+  >
+  readonly switchAgentAndPrompt: (
+    input: SwitchAgentAndPromptInput,
+  ) => Effect.Effect<
+    Admission,
+    | NotFoundError
+    | PromptConflictError
+    | RollbackBlockedError
+    | BusyError
+    | AttachmentStorageError
+    | AgentTransitionError
+    | SessionV2.OperationUnavailableError
+  >
+  readonly setTitle: (input: SetTitleInput) => Effect.Effect<void, NotFoundError>
+  readonly setShare: (input: SetShareInput) => Effect.Effect<void, NotFoundError>
+  readonly setSummary: (input: SetSummaryInput) => Effect.Effect<void, NotFoundError>
+  /** Interrupt the active V2 execution chain for one Session on this process. Interrupting an idle or missing Session is a no-op. */
+  readonly interrupt: (sessionID: ID) => Effect.Effect<void>
+  readonly messages: (input: MessagesInput) => Effect.Effect<Message[], NotFoundError | MessageDecodeError>
+  readonly message: (input: MessageInput) => Effect.Effect<Message | undefined>
+  readonly context: (sessionID: ID) => Effect.Effect<Message[], NotFoundError | MessageDecodeError>
+  readonly events: (input: EventsInput) => Stream.Stream<Event, NotFoundError>
+}

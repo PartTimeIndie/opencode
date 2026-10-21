@@ -1,0 +1,21 @@
+{
+  "name": "prompt-improve-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  },
+  "opencode": {
+    "app": {
+      "capabilities": [
+        "ui:toolbar",
+        "ui:settings",
+        "host:ai",
+        "host:composer"
+      ],
+      "ai": {
+        "tools": []
+      }
+    }
+  }
+}

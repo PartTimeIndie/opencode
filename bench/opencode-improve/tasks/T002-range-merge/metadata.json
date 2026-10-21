@@ -1,0 +1,7 @@
+{
+  "id": "T002-range-merge",
+  "name": "Merge touching ranges",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Fix merge_intervals so overlapping and directly touching intervals merge."
+}

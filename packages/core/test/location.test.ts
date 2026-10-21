@@ -1,0 +1,58 @@
+import { describe, expect, test } from "bun:test"
+import { Effect, Layer } from "effect"
+import { Location } from "@opencode-ai/core/location"
+import { Project } from "@opencode-ai/core/project"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { WorkspaceV2 } from "@opencode-ai/core/workspace"
+import { testEffect } from "./lib/effect"
+
+const workspaceID = WorkspaceV2.ID.make("wrk_test")
+const ref = { directory: AbsolutePath.make("/repo/packages/app"), workspaceID }
+const projectLayer = Layer.succeed(
+  Project.Service,
+  Project.Service.of({
+    directories: () => Effect.succeed([]),
+    resolve: () =>
+      Effect.succeed({
+        id: Project.ID.make("project"),
+        directory: AbsolutePath.make("/repo"),
+        vcs: { type: "git", store: AbsolutePath.make("/repo/.git") },
+      }),
+    commit: () => Effect.void,
+  }),
+)
+const it = testEffect(Location.layer(ref).pipe(Layer.provide(projectLayer)))
+
+describe("Location", () => {
+  test("matches equivalent Windows directory spellings", () => {
+    if (process.platform !== "win32") return
+
+    expect(
+      Location.same(
+        { directory: AbsolutePath.make("C:/GitRepros/opencode") },
+        { directory: AbsolutePath.make("c:\\gitrepros\\OPENCODE") },
+      ),
+    ).toBeTrue()
+    expect(
+      Location.same(
+        { directory: AbsolutePath.make("C:/GitRepros/opencode"), workspaceID },
+        { directory: AbsolutePath.make("c:\\gitrepros\\OPENCODE") },
+      ),
+    ).toBeFalse()
+  })
+
+  it.effect("resolves the current project and vcs information", () =>
+    Effect.gen(function* () {
+      const location = yield* Location.Service
+
+      expect(location.directory).toBe(AbsolutePath.make("/repo/packages/app"))
+      expect(location.workspaceID).toBe(workspaceID)
+      expect(location.project.id).toBe(Project.ID.make("project"))
+      expect(location.project.directory).toBe(AbsolutePath.make("/repo"))
+      expect(location.vcs).toEqual({
+        type: "git",
+        store: AbsolutePath.make("/repo/.git"),
+      })
+    }),
+  )
+})

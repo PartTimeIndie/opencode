@@ -1,0 +1,30 @@
+{
+  "name": "speech-to-text-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  },
+  "opencode": {
+    "api": { "app": 2 },
+    "app": {
+      "capabilities": [
+        "ui:toolbar",
+        "ui:settings",
+        "commands",
+        "host:navigation",
+        "host:ai",
+        "host:stt",
+        "host:audio",
+        "host:composer",
+        "host:skills",
+        "host:skill-content",
+        "host:text-input",
+        "host:desktop-services"
+      ],
+      "ai": {
+        "tools": []
+      }
+    }
+  }
+}

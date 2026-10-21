@@ -1,0 +1,14 @@
+{
+  "name": "runtime-services-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  },
+  "opencode": {
+    "api": { "app": 2 },
+    "app": {
+      "capabilities": ["ui:dock", "commands", "client", "host:navigation", "host:projects", "services:opencode-runtime-services:list", "services:opencode-runtime-services:operations", "services:opencode-runtime-services:operation", "services:opencode-runtime-services:cleanup", "services:opencode-runtime-services:detail", "services:opencode-runtime-services:patch", "services:opencode-runtime-services:action"]
+    }
+  }
+}

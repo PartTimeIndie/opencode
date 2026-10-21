@@ -1,0 +1,20 @@
+---
+description: Preserve dock app plugin UI state across remounts and host navigation
+globs: ".opencode/plugins/*-app/**,.opencode/plugin-sources/*-app/**,packages/app/e2e/regression/**"
+alwaysApply: false
+---
+
+For dock app plugins under `.opencode/plugins/*-app` and `.opencode/plugin-sources/*-app`, preserve user-visible list, pagination, and expand/collapse state across host-driven remounts.
+
+Requirements:
+
+- Cache list and expand state at module scope, keyed by stable plugin ID and the smallest necessary view key, so replacing pane objects, switching tabs, or switching sessions does not reset More/Less or expanded rows.
+- Subscribe to host events for tab, session, and data updates and reconcile state in place; do not force a full plugin reload for ordinary host navigation.
+- Treat full reloads as exceptional lifecycle boundaries only, such as plugin code replacement, explicit user reset, or incompatible state shape.
+- Avoid storing state only inside Solid component instances when users expect it to survive component disposal and remount.
+- Add or update a focused `packages/app/e2e/regression` test for new dock app plugins with More/Expand behavior. Prefer `bun run test:e2e:controlled -- e2e/regression/<test>.spec.ts` from `packages/app`.
+
+Acceptance:
+
+- A dock app plugin with More/Less or expanded list rows keeps that state after tab changes, session changes, and pane-object replacement.
+- The relevant controlled E2E regression is green before treating the plugin change as complete.

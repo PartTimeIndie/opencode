@@ -1,0 +1,7 @@
+{
+  "id": "T011-url-canonicalizer",
+  "name": "URL canonicalizer with hidden URL semantics",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus hidden URL invariants",
+  "goal": "Build API URLs without naive string concatenation or unsafe absolute target URLs."
+}

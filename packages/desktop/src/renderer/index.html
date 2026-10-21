@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en" style="background-color: var(--background-base)">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenCode</title>
+    <link rel="icon" type="image/png" href="./favicon-96x96-v3.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="./favicon-v3.svg" />
+    <link rel="shortcut icon" href="./favicon-v3.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon-v3.png" />
+    <meta name="theme-color" content="#F8F7F7" />
+    <meta property="og:image" content="./social-share.png" />
+    <meta property="twitter:image" content="./social-share.png" />
+    <script id="oc-theme-preload-script" src="./oc-theme-preload.js"></script>
+  </head>
+  <body class="antialiased overscroll-none text-12-regular overflow-hidden">
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="desktop-startup" role="status" style="position:fixed;inset:0;z-index:2147483647;display:grid;place-content:center;gap:16px;padding:32px;background:#101820;color:#f2f4f5;font:16px system-ui;text-align:center">
+      <strong>OpenCode</strong>
+      <span id="desktop-startup-message">Starting OpenCode…</span>
+      <button id="desktop-startup-retry" type="button" hidden style="padding:10px 20px;font:inherit;cursor:pointer">Reload</button>
+    </div>
+    <!-- Keep startup recovery independent of the application module graph. -->
+    <script>
+      (() => {
+        const startup = document.getElementById("desktop-startup")
+        const message = document.getElementById("desktop-startup-message")
+        const retry = document.getElementById("desktop-startup-retry")
+        const german = navigator.language.startsWith("de")
+        message.textContent = german ? "OpenCode wird gestartet…" : "Starting OpenCode…"
+        retry.textContent = german ? "Erneut laden" : "Reload"
+        retry.addEventListener("click", () => location.reload())
+        const failed = () => {
+          clearTimeout(timer)
+          message.textContent = german
+            ? "Die Oberfläche konnte nicht gestartet werden. Bitte erneut laden."
+            : "The interface could not start. Please reload."
+          retry.hidden = false
+        }
+        const onError = (event) => {
+          if (event.target instanceof HTMLScriptElement || event instanceof ErrorEvent) failed()
+        }
+        window.addEventListener("error", onError, true)
+        window.addEventListener("unhandledrejection", failed)
+        const timer = setTimeout(() => {
+          message.textContent = german ? "Der Start dauert länger als erwartet." : "Startup is taking longer than expected."
+          retry.hidden = false
+        }, 15000)
+        window.addEventListener("opencode:renderer-mounted", () => {
+          clearTimeout(timer)
+          window.removeEventListener("error", onError, true)
+          window.removeEventListener("unhandledrejection", failed)
+          startup.remove()
+        }, { once: true })
+      })()
+    </script>
+    <div id="root" class="flex flex-col h-dvh"></div>
+    <script src="./index.tsx" type="module"></script>
+  </body>
+</html>

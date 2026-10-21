@@ -1,0 +1,50 @@
+diff --git a/dist/internal/effect.js b/dist/internal/effect.js
+index 00000000..00000000 100644
+--- a/dist/internal/effect.js
++++ b/dist/internal/effect.js
+@@ -421,10 +421,16 @@
+     }
+     this._exit = exit;
+     this.runtimeMetrics?.recordFiberEnd(this.context, this._exit);
+-    for (let i = 0; i < this._observers.length; i++) {
+-      this._observers[i](exit);
+-    }
+-    this._observers.length = 0;
++    // Snapshot the observer list before notifying: an observer may remove
++    // itself, remove a sibling, or register a new observer while the loop
++    // runs. Iterating the live array with a forward index skips callbacks
++    // after a splice, so later observers (for example a scope-close await)
++    // never fire and the close hangs although the fiber settled. Splice takes
++    // the snapshot and clears the list atomically.
++    const observers = this._observers.splice(0, this._observers.length);
++    for (let i = 0; i < observers.length; i++) {
++      observers[i](exit);
++    }
+   }
+   runLoop(effect) {
+     const prevFiber = globalThis[currentFiberTypeId];
+diff --git a/src/internal/effect.ts b/src/internal/effect.ts
+index 00000000..00000000 100644
+--- a/src/internal/effect.ts
++++ b/src/internal/effect.ts
+@@ -604,10 +604,16 @@
+
+     this._exit = exit
+     this.runtimeMetrics?.recordFiberEnd(this.context, this._exit)
+-    for (let i = 0; i < this._observers.length; i++) {
+-      this._observers[i](exit)
+-    }
+-    this._observers.length = 0
++    // Snapshot the observer list before notifying: an observer may remove
++    // itself, remove a sibling, or register a new observer while the loop
++    // runs. Iterating the live array with a forward index skips callbacks
++    // after a splice, so later observers (for example a scope-close await)
++    // never fire and the close hangs although the fiber settled. Splice takes
++    // the snapshot and clears the list atomically.
++    const observers = this._observers.splice(0, this._observers.length)
++    for (let i = 0; i < observers.length; i++) {
++      observers[i](exit)
++    }
+   }
+   runLoop(effect: Primitive): Exit.Exit<A, E> | Yield {
+     const prevFiber = (globalThis as any)[currentFiberTypeId]

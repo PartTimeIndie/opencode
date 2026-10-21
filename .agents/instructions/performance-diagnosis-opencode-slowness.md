@@ -1,0 +1,39 @@
+## Performance Diagnosis (OpenCode Slowness)
+
+When diagnosing OpenCode slowness or high resource usage, choose the relevant read-only measurements below before proposing fixes:
+
+1. Check CPU: `Get-Process -Name OpenCode,bun,node -ErrorAction SilentlyContinue | Select Name,CPU,WorkingSet64,Id` (CPU is cumulative process time; sample its delta over an interval to measure load; exit code 0 only means the command succeeded).
+2. Check active sessions and runner requests: count active `SessionExecution` or background jobs via the local API or SQLite (`packages/opencode` DB path). Look for parallel long-context sessions.
+3. Check context pressure: estimate per-session token counts from the largest sessions; sessions above 100k tokens are a major slowdown factor.
+4. Check central DB size: `Get-Item "C:\Users\crisc\.local\share\opencode\opencode.db" | Select Length`. DBs above 5 GB can cause I/O pressure.
+5. Check for active migrations: look for migration journal entries or schema-repair activity in startup logs.
+6. Check large attachments or ZIPs: `Get-ChildItem -Path <session-data> -Recurse -File | Sort Length -Descending | Select -First 10` using `-LiteralPath` and `Where-Object { $_.Extension -in '.zip','.pdf','.png' }`.
+7. Check renderer event pressure: measure SSE/EventV2 bursts for the slow session, including event count per turn, active session count, V2 delta type mix, and whether inactive timelines are mounted. Streams with thousands of text/reasoning/tool deltas can be renderer-bound even when CPU, DB, and migrations look healthy.
+8. Classify the most likely bottleneck: CPU, I/O, DB history, parallel runners, single-session context pressure, or renderer event bursts. Report the winner with measured numbers and PowerShell exit codes.
+
+### Renderer memory exhaustion and blank windows
+
+- Check `render-process-gone` for `reason: 'oom'` before treating a black window as a GPU/presentation fault. Repainting a dead renderer cannot repair memory exhaustion.
+- Compare CDP heap/DOM counters with the connected DOM. Detached session views can dominate memory even when the visible document is small. Keep heap snapshots private and local; report object counts and retaining boundaries, not Session text or credentials.
+- Plugin teardown must use the stack-free `abortPluginWork` boundary. V8's default abort DOMException retains cleanup function closures, including detached views, when a plugin keeps the signal. Drain scope disposer lists as well. Cover this with unit contracts and `packages/app/e2e/regression/plugin-disposal-memory.spec.ts`, which checks collection in real Chromium with retained signals.
+- Source/browser regression evidence is separate from installed-app acceptance. Never force OOM, reload over drafts, or restart the installed app to reproduce this failure without approval.
+
+### Session loading outages and bootstrap recovery
+
+- Correlate the server log with the desktop run under `%APPDATA%\ai.opencode.desktop\logs\<UTC-run-stamp>`. Desktop timestamps are local time; server timestamps are UTC. Distinguish renderer crashes, sidecar exits, and directory-specific bootstrap deadlines/HTTP 503s; a plugin error alone is not proof of the whole-app outage cause.
+- A boot fiber and its `InstanceState` cache scopes have different lifetimes. Deadline recovery must invalidate the affected directory's scoped state before releasing its replacement boot; interrupting the boot or setting failure TTL to zero is insufficient when closing an expired scope can block the next cached lookup.
+- Keep recovery cleanup bounded and generation-safe. A late old boot or cleanup must not delete a replacement entry or change its circuit-breaker accounting. Reproduce with gated cache finalizers and release every test gate during teardown; do not weaken plugin registration collision protection as a workaround.
+- Report original-outage evidence separately from a reproduced recovery defect and source-only verification. Installed Desktop acceptance still requires the approved full prod deploy; never restart the app merely to diagnose it.
+- SDK `(empty response body)` wording is not wire-body or cancellation evidence: it also represents decoded `{}` and other empty values. Capture the raw response, decode result, error cause and request-specific AbortSignals separately. A 499 fixture analogy does not establish a real 503 cancellation chain; passing route contracts does not prove renderer/UI health or full outage recovery.
+- For E2E session-navigation failures, preserve screenshots and route/tab/dock/event ordering before rerunning. Never click an unanchored session-title button as a composer-loading fallback: it can match `Close <title>` and create the observed draft itself. Assert the intended session identity, reach the real composer/ResumeButton, and verify pending draft text after reload and explicit resume; do not substitute a draft composer or extend the readiness timeout to hide the failure.
+- Classify primary-process lifecycle causes as UNKNOWN unless direct evidence names the killer: sidecar exit 0, empty crash logs, missing log-keyword hits, or `ExecutionTimeLimit=PT0S` do not disprove primary crashes, night-job initiation, or cleanup/taskkill paths. A `Stop-ScheduledTask` is not a tree-kill guarantee (measured 2026-10-03: even direct CreateProcess descendants survive). Log the installed build identity from the deploy manifest next to the executable; never synthesize a fingerprint for a missing manifest.
+
+### Speech-to-text latency
+
+- Read the renderer's `[speech-to-text] timings` first. Separate preparation, transcription, improvement and insertion; automatic improvement runs before insertion and can dominate the wait even with fast ASR.
+- Compare the same authorized recording repeatedly in rotated model order. Reject truncated transcripts and unintended translations as speed winners. Report both direct-provider and real host/UI timings; they are not interchangeable.
+- Successful dictation audio is not archived by the Speech plugin. For an explicit diagnostic recording, run `bun run script/speech-recorder.ts` from `packages/opencode`; its loopback-only page saves a private fixture under `.agent-tmp/speech-benchmark`. Never commit audio, auth files or raw private transcripts.
+- Some OpenRouter ASR endpoints are absent from its text-model catalog. Declare explicit audio-input/transcription-output model capabilities and verify the live `/provider` catalog before accepting an `Unknown transcription model` fix. Check the exact endpoint ID, including suffixes such as `-stt`.
+- A server config reload does not guarantee that an already-running renderer refreshes its one-shot model-chain snapshot. For measured speech tuning without a desktop restart, use direct model targets through the normal plugin Settings API. `script/speech-speed-apply.ts` applies the tested profile and direct targets; it does not change general-purpose chains or restart OpenCode.
+- For global dictation hotkey failures, inspect `desktopServices.registrations` and the plugin's current phase. A registered accelerator is not proof that its handler works. When idle, the normal Desktop service setting can be toggled off/on to re-register it without stopping the app; verify an actual invocation and distinguish registration failure from downstream model errors.
+- Verify global dictation with `directory=global`, not only a project-scoped Composer upload. Host routes must use the resolved `hostDirectory` consistently for plugin initialization, adapter admission and dispatch. The raw `global` sentinel is not the registered media scope; a mismatched lookup can falsely report a valid model as unknown. Source fixes in these installed host routes require the full prod Desktop deploy before global dictation can be reported as fixed.

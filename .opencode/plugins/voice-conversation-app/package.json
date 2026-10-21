@@ -1,0 +1,30 @@
+{
+  "name": "voice-conversation-app",
+  "displayName": "Voice Conversation",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./app": "./index.js"
+  },
+  "opencode": {
+    "api": { "app": 2 },
+    "app": {
+      "capabilities": [
+        "ui:toolbar",
+        "ui:settings",
+        "ui:floating",
+        "commands",
+        "kv",
+        "host:navigation",
+        "host:sessions",
+        "services:voice-conversation-app:session-links",
+        "host:stt",
+        "host:audio",
+        "host:tts"
+      ],
+      "ai": {
+        "tools": []
+      }
+    }
+  }
+}

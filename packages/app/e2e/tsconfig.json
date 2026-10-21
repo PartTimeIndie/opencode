@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "..",
+    "types": ["node", "bun"]
+  },
+  "include": [
+    "./**/*.ts",
+    "./globals.d.ts",
+    "../src/context/session-message-request.ts",
+    "../src/utils/path-key.ts",
+    "../vite.js"
+  ]
+}

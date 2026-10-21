@@ -1,0 +1,7 @@
+{
+  "id": "T008-generated-guard",
+  "name": "Generated file guard",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v plus SHA256 generated file guard",
+  "goal": "Fix transform.py without editing generated/generated_table.py."
+}

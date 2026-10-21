@@ -1,0 +1,7 @@
+{
+  "id": "T003-config-loader",
+  "name": "Config loader environment overrides",
+  "language": "python",
+  "verify": "python -B -m unittest discover -s tests -v",
+  "goal": "Fix config loading so environment overrides win and are coerced to expected types."
+}
