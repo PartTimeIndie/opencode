@@ -52,7 +52,7 @@ const identity = {
 }
 const context = (lastUserText?: string) => ({ sessionID, agent, ...(lastUserText === undefined ? {} : { lastUserText }) })
 
-const names = (service: ToolRegistry.Interface, materializationContext?: { lastUserText?: string }) =>
+const names = (service: ToolRegistry.Interface, materializationContext?: { lastUserText?: string; openContractMarkers?: ReadonlyArray<string> }) =>
   service
     .materialize(undefined, undefined, { ...identity, sessionID, ...materializationContext })
     .pipe(Effect.map((materialized) => materialized.definitions.map((tool) => tool.name)))
@@ -174,6 +174,40 @@ describe("ToolRegistry contract-scoped tools", () => {
       yield* service.register({ read: make(), scheduled_job_result: contractTool() })
       const entries = yield* service.catalog()
       expect(entries.map((entry) => entry.id)).toEqual(["read"])
+      expect(yield* service.contractTools()).toEqual([{ name: "scheduled_job_result", marker: MARKER }])
+    }),
+  )
+
+  it.effect("keeps the result tool advertised for an open run past marker-less interjections", () =>
+    Effect.gen(function* () {
+      const service = yield* ToolRegistry.Service
+      yield* service.register({ read: make(), scheduled_job_result: contractTool() })
+
+      const interjected = yield* names(service, { lastUserText: "Zwischenfrage ohne Vertrag" })
+      expect(interjected).toEqual(["read"])
+
+      const openRun = yield* names(service, {
+        lastUserText: "Zwischenfrage ohne Vertrag",
+        openContractMarkers: [MARKER],
+      })
+      expect(openRun).toEqual(["read", "scheduled_job_result"])
+
+      const openOtherMarker = yield* names(service, {
+        lastUserText: "Zwischenfrage ohne Vertrag",
+        openContractMarkers: ["opencode.other-contract/v1"],
+      })
+      expect(openOtherMarker).toEqual(["read"])
+    }),
+  )
+
+  it.effect("keeps cached materializations independent per open-run state", () =>
+    Effect.gen(function* () {
+      const service = yield* ToolRegistry.Service
+      yield* service.register({ scheduled_job_result: contractTool() })
+
+      expect(yield* names(service, { openContractMarkers: [MARKER] })).toEqual(["scheduled_job_result"])
+      expect(yield* names(service, { openContractMarkers: [] })).toEqual([])
+      expect(yield* names(service, { openContractMarkers: [MARKER] })).toEqual(["scheduled_job_result"])
     }),
   )
 

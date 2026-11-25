@@ -2,19 +2,29 @@ import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import path from "path"
 import { describe, expect, spyOn, test } from "bun:test"
-import { Cause, Effect, Layer } from "effect"
+import { Cause, Deferred, Effect, Fiber, Layer } from "effect"
+import { ToolFailure } from "@opencode-ai/llm"
+import { adjust } from "effect/testing/TestClock"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@opencode-ai/core/config"
+import { ConfigExperimental } from "@opencode-ai/core/config/experimental"
+import { Database } from "@opencode-ai/core/database/database"
 import { Location } from "@opencode-ai/core/location"
 import { LocationMutation } from "@opencode-ai/core/location-mutation"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionOrchestratorTable } from "@opencode-ai/core/session/legacy-delegation/sql"
 import { Shell } from "@opencode-ai/core/shell"
+import { ShellEnvironment } from "@opencode-ai/core/shell-environment"
 import { BashTool } from "@opencode-ai/core/tool/bash"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
+import { Tool } from "@opencode-ai/core/tool/tool"
 import { ContentStore } from "@opencode-ai/core/content-store"
 import { FileAttachment, Prompt } from "@opencode-ai/core/session/prompt"
 import { location } from "./fixture/location"
@@ -35,14 +45,17 @@ const contentStore = Layer.succeed(
       Effect.succeed(new FileAttachment({ uri: `attachment://${input.name}`, mime: input.mime, name: input.name })),
     storeTextAttachment: (input) => {
       storedAttachments.push(input)
-      return Effect.succeed(new FileAttachment({ uri: "attachment://shell-capture", mime: input.mime, name: input.name }))
+      return Effect.succeed(
+        new FileAttachment({ uri: "attachment://shell-capture", mime: input.mime, name: input.name }),
+      )
     },
     normalizePrompt: (input) =>
       Effect.succeed(
         new Prompt({
           ...input.prompt,
           files: input.prompt.files?.map(
-            (file, index) => new FileAttachment({ ...file, uri: `${ContentStore.URI_PREFIX}${input.messageID}_${index}` }),
+            (file, index) =>
+              new FileAttachment({ ...file, uri: `${ContentStore.URI_PREFIX}${input.messageID}_${index}` }),
           ),
         }),
       ),
@@ -74,7 +87,10 @@ let result: AppProcess.RunResult = {
 }
 let runFailure: AppProcess.AppProcessError | undefined
 let spoolFeed: Uint8Array[] = []
-let afterPermission: (input: PermissionV2.AssertInput) => Effect.Effect<void, PermissionV2.Error | SessionV2.NotFoundError> = () => Effect.void
+let processWait: Effect.Effect<void> = Effect.void
+let afterPermission: (
+  input: PermissionV2.AssertInput,
+) => Effect.Effect<void, PermissionV2.Error | SessionV2.NotFoundError> = () => Effect.void
 
 const permission = Layer.succeed(
   PermissionV2.Service,
@@ -113,7 +129,7 @@ const appProcess = Layer.succeed(
           options?.spoolStdout?.(chunk)
           options?.spoolStderr?.(chunk)
         }
-        return runFailure ? Effect.fail(runFailure) : Effect.succeed(result)
+        return processWait.pipe(Effect.andThen(runFailure ? Effect.fail(runFailure) : Effect.succeed(result)))
       }),
   } as unknown as AppProcess.Interface),
 )
@@ -131,6 +147,7 @@ const reset = () => {
   configEntries = []
   runFailure = undefined
   spoolFeed = []
+  processWait = Effect.void
   storedAttachments.length = 0
   afterPermission = () => Effect.void
   result = {
@@ -155,19 +172,24 @@ const withTool = <A, E, R>(
     Location.Service.of(location({ directory: AbsolutePath.make(directory) })),
   )
   const mutation = LocationMutation.layer.pipe(Layer.provide(filesystem), Layer.provide(activeLocation))
-  const registry = ToolRegistry.defaultLayer.pipe(Layer.provide(permission))
+  const registry = ToolRegistry.defaultLayer.pipe(Layer.provide(permission), Layer.provide(config))
+  const database = Database.layerFromPath(":memory:")
   const bash = BashTool.layer.pipe(
+    Layer.provide(activeLocation),
     Layer.provide(registry),
     Layer.provide(permission),
     Layer.provide(mutation),
     Layer.provide(filesystem),
     Layer.provide(processLayer),
     Layer.provide(config),
+    Layer.provide(database),
   )
-  const withStore = contentStoreLayer ? bash.pipe(Layer.provideMerge(contentStoreLayer)) : bash
+  const withStore = (contentStoreLayer ? bash.pipe(Layer.provideMerge(contentStoreLayer)) : bash).pipe(
+    Layer.provideMerge(ShellEnvironment.layer),
+  )
   return Effect.gen(function* () {
     return yield* body(yield* ToolRegistry.Service)
-  }).pipe(Effect.provide(Layer.mergeAll(registry, withStore)))
+  }).pipe(Effect.provide(Layer.mergeAll(registry, withStore, database)))
 }
 
 const call = (input: typeof BashTool.Input.Type, id = "call-bash") => ({
@@ -178,7 +200,8 @@ const call = (input: typeof BashTool.Input.Type, id = "call-bash") => ({
 
 const it = testEffect(Layer.empty)
 
-const dieDefects = (cause: Cause.Cause<unknown>) => cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect)
+const dieDefects = (cause: Cause.Cause<unknown>) =>
+  cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect)
 
 test("inspects UNC command arguments without filesystem canonicalization", () => {
   if (process.platform !== "win32") return
@@ -187,15 +210,367 @@ test("inspects UNC command arguments without filesystem canonicalization", () =>
   })
   try {
     const directory = String.raw`\\BeeStation\home\PU_Recordings`
-    expect(BashTool.externalCommandDirectories(`Test-Path -LiteralPath '${directory}'`, "C:\\GitRepros\\opencode")).toEqual([
-      path.dirname(directory),
-    ])
+    expect(
+      BashTool.externalCommandDirectories(`Test-Path -LiteralPath '${directory}'`, "C:\\GitRepros\\opencode"),
+    ).toEqual([path.dirname(directory)])
   } finally {
     resolve.mockRestore()
   }
 })
 
 describe("BashTool", () => {
+  it.live("delivers invocation-local plugin environment to real concurrent shells without changing process.env", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const before = process.env.OPENCODE_TEST_BINDING
+        return withTool(tmp.path, (registry) => Effect.gen(function* () {
+          const environment = yield* ShellEnvironment.Service
+          const observed: ShellEnvironment.Request[] = []
+          yield* environment.register(tmp.path, (input) => Effect.sync(() => {
+            observed.push(input)
+            return { OPENCODE_TEST_BINDING: `${input.sessionID}:${input.callID}` }
+          }))
+          const command = process.platform === "win32" ? "Write-Output $env:OPENCODE_TEST_BINDING" : 'printf "%s" "$OPENCODE_TEST_BINDING"'
+          const outputs = yield* Effect.all(["ses_environment_parent", "ses_environment_child"].map((id) =>
+            settleTool(registry, { ...call({ command }, id), sessionID: SessionV2.ID.make(id) }),
+          ), { concurrency: 2 })
+          for (const [index, id] of ["ses_environment_parent", "ses_environment_child"].entries()) {
+            expect(outputs[index]?.output?.structured).toMatchObject({ exitCode: 0, output: expect.stringContaining(`${id}:${id}`) })
+          }
+          expect(observed.map((input) => String(input.sessionID)).sort()).toEqual(["ses_environment_child", "ses_environment_parent"])
+          expect(observed.every((input) => input.directory === tmp.path && input.cwd === realpathSync(tmp.path))).toBe(true)
+          expect(process.env.OPENCODE_TEST_BINDING).toBe(before)
+        }), AppProcess.defaultLayer)
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("lets a differently-cased hook path value replace the whole path variable in a real shell", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        if (process.platform !== "win32") return Effect.succeed(undefined as never)
+        reset()
+        return withTool(tmp.path, (registry) => Effect.gen(function* () {
+          const environment = yield* ShellEnvironment.Service
+          const marker = "C:\\__opencode_hook_path_case_marker__"
+          yield* environment.register(tmp.path, () => Effect.succeed({ path: marker }))
+          const output = yield* settleTool(registry, call({ command: "Write-Output $env:Path" }))
+          expect(output.output?.structured).toMatchObject({ exitCode: 0 })
+          // Exactly the hook value survives: neither the inherited PATH nor the
+          // executable-path fallback may leak into the real shell.
+          const structured = output.output?.structured as { output?: string } | undefined
+          expect(structured?.output?.trim()).toBe(marker)
+        }), AppProcess.defaultLayer)
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("replaces an inherited variable through a differently-cased hook value in parallel real shells", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        if (process.platform !== "win32") return Effect.succeed(undefined as never)
+        reset()
+        const inheritedName = "OPENCODE_CASE_INHERITED"
+        const before = process.env[inheritedName]
+        process.env[inheritedName] = "inherited-value"
+        return withTool(tmp.path, (registry) => Effect.gen(function* () {
+          const environment = yield* ShellEnvironment.Service
+          yield* environment.register(tmp.path, () => Effect.succeed({ opencode_case_inherited: "hook-value" }))
+          const command = "Write-Output $env:OPENCODE_CASE_INHERITED"
+          const outputs = yield* Effect.all(["ses_case_parent", "ses_case_child"].map((id) =>
+            settleTool(registry, { ...call({ command }, id), sessionID: SessionV2.ID.make(id) }),
+          ), { concurrency: 2 })
+          for (const output of outputs) {
+            expect(output.output?.structured).toMatchObject({ exitCode: 0 })
+            const structured = output.output?.structured as { output?: string } | undefined
+            expect(structured?.output?.trim()).toBe("hook-value")
+          }
+          // The tool must never touch the parent environment: the canonical key
+          // keeps its value and no differently-cased sibling key appears.
+          expect(process.env[inheritedName]).toBe("inherited-value")
+          expect(Object.keys(process.env).filter((key) => key.toLowerCase() === inheritedName.toLowerCase())).toEqual([inheritedName])
+        }), AppProcess.defaultLayer).pipe(
+          Effect.ensuring(Effect.sync(() => {
+            if (before === undefined) delete process.env[inheritedName]
+            else process.env[inheritedName] = before
+          })),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("does not invoke environment hooks after denied permission and fails closed on a hook failure", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withTool(tmp.path, (registry) => Effect.gen(function* () {
+          let calls = 0
+          yield* (yield* ShellEnvironment.Service).register(tmp.path, () => {
+            calls++
+            return Effect.fail(new Error("shell.env fixture failed"))
+          })
+          denyAction = "bash"
+          yield* settleTool(registry, call({ command: "must not run" })).pipe(Effect.exit)
+          expect(calls).toBe(0)
+          expect(runs).toHaveLength(0)
+          denyAction = undefined
+          const output = yield* settleTool(registry, call({ command: "must not run" }, "hook-failure"))
+          expect(output.result).toMatchObject({ type: "error" })
+          expect(calls).toBe(1)
+          expect(runs).toHaveLength(0)
+        }))
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("selects the host location's hook even when an approved workdir is external", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withTool(tmp.path, (registry) => Effect.gen(function* () {
+          const environment = yield* ShellEnvironment.Service
+          const external = path.dirname(tmp.path)
+          yield* environment.register(tmp.path, (input) => Effect.succeed({ HOST: input.directory, CWD: input.cwd }))
+          yield* environment.register(external, () => Effect.succeed({ WRONG_PROJECT: "true" }))
+          yield* settleTool(registry, call({ command: "probe", workdir: external }))
+          expect(runs[0]?.env).toMatchObject({ HOST: tmp.path, CWD: realpathSync(external) })
+          expect(runs[0]?.env?.WRONG_PROJECT).toBeUndefined()
+          if (process.platform === "win32") {
+            // Windows builds the whole effective child environment inside the tool
+            // (case-insensitive merge), so the spawner must not re-extend it.
+            expect(runs[0]?.extendEnv).toBe(false)
+            expect(runs[0]?.env?.Path).toBeString()
+          } else {
+            expect(runs[0]?.extendEnv).toBe(true)
+          }
+        }))
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  for (const interrupt of [false, true]) {
+    it.effect(`flushes an interrupted in-flight publication on ${interrupt ? "cancellation" : "completion"}`, () =>
+      Effect.acquireUseRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) =>
+          Effect.gen(function* () {
+            reset()
+            const started = yield* Deferred.make<void>()
+            const release = yield* Deferred.make<void>()
+            const publishing = yield* Deferred.make<void>()
+            const holdPublication = yield* Deferred.make<void>()
+            processWait = Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            spoolFeed = [Buffer.from("retained partial output")]
+            let intercepted = false
+            const delivered: unknown[] = []
+            const fiber = yield* withTool(tmp.path, (registry) =>
+              settleTool(registry, {
+                ...call({ command: "probe" }),
+                progress: (snapshot) =>
+                  Effect.gen(function* () {
+                    if (snapshot.structured.output && !intercepted) {
+                      intercepted = true
+                      yield* Deferred.succeed(publishing, undefined)
+                      yield* Deferred.await(holdPublication)
+                    }
+                    delivered.push(snapshot.structured.output)
+                  }),
+              }),
+            ).pipe(Effect.forkChild)
+            yield* Deferred.await(started)
+            yield* adjust("250 millis")
+            yield* Deferred.await(publishing)
+            if (interrupt) yield* Fiber.interrupt(fiber)
+            else {
+              yield* Deferred.succeed(release, undefined)
+              yield* Fiber.join(fiber)
+            }
+            expect(delivered.at(-1)).toContain("retained partial output")
+            expect(runs).toHaveLength(1)
+          }),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ),
+    )
+  }
+
+  it.live("retains the same timeout output and capture callback with live publication on or off", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const outputs: unknown[] = []
+          for (const enabled of [true, false]) {
+            reset()
+            configEntries = [
+              new Config.Document({
+                type: "document",
+                info: new Config.Info({
+                  experimental: new ConfigExperimental.Experimental({ tool_live_progress: enabled }),
+                }),
+              }),
+            ]
+            spoolFeed = [Buffer.from("stdout and stderr before timeout")]
+            runFailure = new AppProcess.AppProcessError({ command: "probe", cause: new Error("Timed out") })
+            let emitted = 0
+            const settled = yield* withTool(tmp.path, (registry) =>
+              settleTool(registry, {
+                ...call({ command: "probe", timeout: 10 }),
+                progress: () =>
+                  Effect.sync(() => {
+                    emitted++
+                  }),
+              }),
+            )
+            outputs.push(settled.output?.structured)
+            // Registry callbacks capture receipts even when UI emission is off.
+            // The publisher owns emission; session-runner-tool-events covers it.
+            expect(emitted).toBeGreaterThan(0)
+          }
+          expect(outputs[0]).toEqual(outputs[1])
+          expect(outputs[0]).toMatchObject({
+            output: expect.stringContaining("stdout and stderr before timeout"),
+            timedOut: true,
+          })
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+  it.effect("batches changed output at 250 ms, skips unchanged snapshots and flushes the final tail", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          reset()
+          const started = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          processWait = Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          spoolFeed = [Buffer.from("first")]
+          const outputs: unknown[] = []
+          const fiber = yield* withTool(tmp.path, (registry) =>
+            settleTool(registry, {
+              ...call({ command: "probe" }),
+              progress: (snapshot) =>
+                Effect.sync(() => {
+                  outputs.push(snapshot.structured.output)
+                }),
+            }),
+          ).pipe(Effect.forkChild)
+          yield* Deferred.await(started)
+          expect(outputs).toEqual([""])
+          yield* adjust("249 millis")
+          expect(outputs).toEqual([""])
+          yield* adjust("1 millis")
+          expect(outputs).toEqual(["", "first\n[stderr]\nfirst"])
+          yield* adjust("1 second")
+          expect(outputs).toHaveLength(2)
+          runs[0]?.options?.spoolStdout?.(Buffer.from("last"))
+          yield* Deferred.succeed(release, undefined)
+          yield* Fiber.join(fiber)
+          expect(outputs).toHaveLength(3)
+          expect(outputs.at(-1)).toContain("last")
+          expect(runs).toHaveLength(1)
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+  for (const enabled of [true, false]) {
+    it.live(`bounds the progress callback lifetime with live progress ${enabled}`, () =>
+      Effect.acquireUseRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => {
+          reset()
+          configEntries = [
+            new Config.Document({
+              type: "document",
+              info: new Config.Info({
+                experimental: new ConfigExperimental.Experimental({ tool_live_progress: enabled }),
+              }),
+            }),
+          ]
+          return withTool(tmp.path, (registry) =>
+            Effect.gen(function* () {
+              let escaped: Tool.Context["progress"]
+              let count = 0
+              yield* registry.register({
+                probe: Tool.make({
+                  description: "progress lifetime probe",
+                  input: BashTool.Input,
+                  output: BashTool.Output,
+                  execute: (input, context) =>
+                    Effect.gen(function* () {
+                      escaped = context.progress
+                      yield* context.progress?.({ structured: { output: "active" }, content: [] }) ?? Effect.void
+                      return { command: input.command, cwd: tmp.path, output: "done", truncated: false }
+                    }),
+                }),
+              })
+              yield* settleTool(registry, {
+                ...call({ command: "probe" }),
+                call: { type: "tool-call", id: "probe", name: "probe", input: { command: "probe" } },
+                progress: () =>
+                  Effect.sync(() => {
+                    count++
+                  }),
+              })
+              yield* escaped?.({ structured: { output: "after settlement" }, content: [] }) ?? Effect.void
+              expect(count).toBe(1)
+              expect(escaped).toBeFunction()
+            }),
+          )
+        },
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ),
+    )
+  }
+  it.live("publishes real stdout before process completion without re-executing the command", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const snapshots: Array<{ output?: unknown }> = []
+        return withTool(
+          tmp.path,
+          (registry) =>
+            Effect.gen(function* () {
+              const input = call({
+                command:
+                  process.platform === "win32"
+                    ? "Write-Output 'live-first'; Start-Sleep -Milliseconds 900; Write-Output 'live-last'"
+                    : "printf 'live-first\\n'; sleep 0.9; printf 'live-last\\n'",
+              })
+              const output = yield* settleTool(registry, {
+                ...input,
+                progress: (snapshot) =>
+                  Effect.sync(() => {
+                    snapshots.push(snapshot.structured)
+                  }),
+              })
+              expect(
+                snapshots.some(
+                  (snapshot) =>
+                    String(snapshot.output).includes("live-first") && !String(snapshot.output).includes("live-last"),
+                ),
+              ).toBe(true)
+              expect(snapshots.at(-1)?.output).toContain("live-last")
+              expect(output.output?.structured).toMatchObject({ exitCode: 0 })
+            }),
+          AppProcess.defaultLayer,
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
   it.live("registers and returns structured successful output from the active Location", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -230,7 +605,7 @@ describe("BashTool", () => {
             expect(runs[0]?.cwd).toBe(realpathSync(tmp.path))
             if (process.platform === "win32") {
               expect(runs[0]?.env?.Path).toContain(";")
-              expect(runs[0]?.extendEnv).toBe(true)
+              expect(runs[0]?.extendEnv).toBe(false)
             }
             expect(runs[0]?.options).toMatchObject({
               maxOutputBytes: BashTool.MAX_CAPTURE_BYTES,
@@ -398,13 +773,13 @@ describe("BashTool", () => {
     )
   }
 
-  it.live("approves an explicit external workdir before bash execution", () =>
+  it.live("approves an external relative workdir before bash execution", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
       ([active, outside]) => {
         reset()
         return withTool(active.path, (registry) =>
-          executeTool(registry, call({ command: "pwd", workdir: outside.path })),
+          executeTool(registry, call({ command: "pwd", workdir: path.relative(active.path, outside.path) })),
         ).pipe(
           Effect.andThen(
             Effect.sync(() => {
@@ -495,7 +870,9 @@ describe("BashTool", () => {
           reset()
           const target = path.join(outside.path, "secret.txt")
           const slashTarget = `/${target[0]}${target.slice(2).replaceAll("\\", "/")}`
-          return withTool(active.path, (registry) => settleTool(registry, call({ command: `cat ${slashTarget}` }))).pipe(
+          return withTool(active.path, (registry) =>
+            settleTool(registry, call({ command: `cat ${slashTarget}` })),
+          ).pipe(
             Effect.andThen((settled) =>
               Effect.sync(() => {
                 expect(settled.output?.structured).toMatchObject({
@@ -592,6 +969,39 @@ describe("BashTool", () => {
     ),
   )
 
+  test("retains workspace-guard refusals instead of disguising them as launch errors", () => {
+    const blocked = new ToolFailure({ message: "Target is outside this managed task's reserved resources" })
+    expect(BashTool.executionFailure("Get-Location", blocked)).toBe(blocked)
+    expect(BashTool.executionFailure("Get-Location", blocked).message).not.toContain("Unable to execute")
+  })
+
+  it.live("reports a real reservation guard refusal through the tool without spawning", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withTool(tmp.path, (registry) => Effect.gen(function* () {
+          const { db } = yield* Database.Service
+          yield* db.insert(ProjectTable).values({ id: ProjectV2.ID.global, worktree: AbsolutePath.make(tmp.path), sandboxes: [] }).run().pipe(Effect.orDie)
+          yield* db.insert(SessionTable).values({
+            id: sessionID, project_id: ProjectV2.ID.global, directory: tmp.path,
+            slug: "guard", title: "guard", version: "test",
+          }).run().pipe(Effect.orDie)
+          yield* db.insert(SessionOrchestratorTable).values({
+            main_session_id: sessionID, checkout_id: "unverified", workspace_mode: "shared",
+          }).run().pipe(Effect.orDie)
+          const settled = yield* settleTool(registry, call({ command: "Get-Location" }))
+          expect(settled.result).toEqual({
+            type: "error", value: "Historical delegation protection could not verify the required evidence",
+          })
+          expect(runs).toEqual([])
+          expect(assertions).toEqual([])
+        }))
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("reports the hidden execution cause on tool failure", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -613,7 +1023,10 @@ describe("BashTool", () => {
     ),
   )
 
-  const captureCauseCase = (patch: Partial<AppProcess.RunResult>, storeLayer: Layer.Layer<ContentStore.Service> = contentStore) =>
+  const captureCauseCase = (
+    patch: Partial<AppProcess.RunResult>,
+    storeLayer: Layer.Layer<ContentStore.Service> = contentStore,
+  ) =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => {
@@ -636,7 +1049,7 @@ describe("BashTool", () => {
           Effect.andThen((settled) =>
             Effect.succeed({
               text: settled.result,
-              output: settled.output?.structured as (typeof BashTool.Output.Type) | undefined,
+              output: settled.output?.structured as typeof BashTool.Output.Type | undefined,
             }),
           ),
         )
@@ -660,7 +1073,7 @@ describe("BashTool", () => {
           expect(output?.capture).toMatchObject({ complete: false })
         }),
       ),
-    )
+    ),
   )
 
   it.live("keeps the safety-limit wording and full-output retrieval for a pure byte limit", () =>
@@ -678,7 +1091,7 @@ describe("BashTool", () => {
           expect(output?.capture).toMatchObject({ complete: true })
         }),
       ),
-    )
+    ),
   )
 
   it.live("reports both causes separately when a byte limit and stream EOF coexist", () =>
@@ -696,7 +1109,7 @@ describe("BashTool", () => {
           expect(output?.capture).toMatchObject({ complete: false })
         }),
       ),
-    )
+    ),
   )
 
   it.live("stores the full spool capture through the real ContentStore", () =>
@@ -718,7 +1131,7 @@ describe("BashTool", () => {
           expect(output?.capture).toMatchObject({ complete: true })
         }),
       ),
-    )
+    ),
   )
 
   it.live("keeps a stderr-only truncation off the stdout flag", () =>
@@ -739,7 +1152,7 @@ describe("BashTool", () => {
           expect(output?.capture).toMatchObject({ complete: true })
         }),
       ),
-    )
+    ),
   )
 
   const permissionDecisionCase = (error: PermissionV2.Error, command: string) =>
@@ -748,12 +1161,8 @@ describe("BashTool", () => {
       (tmp) => {
         reset()
         afterPermission = () => Effect.fail(error)
-        return withTool(
-          tmp.path,
-          (registry) =>
-            settleTool(registry, call({ command })).pipe(
-              Effect.catchCause((cause) => Effect.succeed(dieDefects(cause))),
-            ),
+        return withTool(tmp.path, (registry) =>
+          settleTool(registry, call({ command })).pipe(Effect.catchCause((cause) => Effect.succeed(dieDefects(cause)))),
         ).pipe(
           Effect.andThen((defects) =>
             Effect.sync(() => {
@@ -800,8 +1209,6 @@ test("keeps locked deferred parity TODOs visible", async () => {
     "Port BashArity reusable command-prefix approvals.",
     "Replace token-based command-argument external-directory advisories with parser-based detection.",
     "Restore cmd-specific invocation/path handling on Windows.",
-    "Add plugin shell.env environment augmentation once V2 plugin hooks exist.",
-    "Add durable/live progress metadata streaming for long-running commands once V2 tool invocation progress context is wired.",
     "Persist background job status and define restart recovery before exposing remote observation.",
     "Revisit process-group cleanup and platform coverage with shell-specific tests if current AppProcess semantics do not fully cover it.",
     "Revisit binary output handling if stdout/stderr decoding is text-only.",

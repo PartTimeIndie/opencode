@@ -37,7 +37,7 @@ export function canNavigateHistoryAtCursor(direction: "up" | "down", text: strin
 export function clonePromptParts(prompt: Prompt): Prompt {
   return prompt.map((part) => {
     if (part.type === "text") return { ...part }
-    if (part.type === "image") return { ...part }
+    if (part.type === "image") return { ...part, ...(part.annotation ? { annotation: { ...part.annotation } } : {}) }
     if (part.type === "agent") return { ...part }
     return {
       ...part,
@@ -49,6 +49,7 @@ export function clonePromptParts(prompt: Prompt): Prompt {
 function clonePromptPartsForHistory(prompt: Prompt): Prompt {
   return prompt.flatMap((part): Prompt => {
     if (part.type === "image") {
+      if (part.annotation) return []
       if (!part.sourcePath) return []
       return [
         {
@@ -57,6 +58,7 @@ function clonePromptPartsForHistory(prompt: Prompt): Prompt {
           filename: part.filename,
           sourcePath: part.sourcePath,
           mime: part.mime,
+          ...(part.unpack ? { unpack: true } : {}),
         },
       ]
     }

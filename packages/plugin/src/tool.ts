@@ -17,6 +17,8 @@ export type ToolContext = {
    */
   worktree: string
   abort: AbortSignal
+  /** Host-confirmed, activity-bound activation; never model tool arguments. */
+  explicitInvocation?: { command: string; inputID: string; activityID: string }
   metadata(input: { title?: string; metadata?: { [key: string]: any } }): void
   ask(input: AskInput): Promise<void>
   customPart(input: CustomPartInput): Promise<void>
@@ -25,7 +27,53 @@ export type ToolContext = {
     planDocument(): Promise<SessionPlanDocument | undefined>
     actionInvocations(): Promise<SessionActionInvocation[]>
   }
+  /**
+   * Host bridge that runs one caller-bound assignment as a native task inside
+   * another physical checkout and reads its durable evidence. A "main" job
+   * still requires the user's single-use task_main_write consent there.
+   * Absent when the host provides no Location map.
+   */
+  nativeJob?: {
+    dispatch(input: { checkout: string; job: NativeJobInput }): Promise<{
+      checkout: string
+      binding: string
+      attempt: number
+      hostSessionID: string
+      inputID: string
+      created: boolean
+    }>
+    observe(input: { checkout: string; binding: string; attempt: number }): Promise<NativeJobObservation>
+  }
 }
+
+export type NativeJobInput = {
+  version: 1
+  /** Caller-owned SHA-256 binding; one durable host Session per binding. */
+  binding: string
+  /** Append-only attempt number; each attempt is one durable native input. */
+  attempt: number
+  title: string
+  prompt: string
+  agent: string
+}
+
+export type NativeJobChild = { sessionID: string; inputID: string; dispatchDigest: string; placementIdentity: string }
+
+export type NativeJobObservation =
+  | { state: "missing" }
+  | { state: "admitted"; hostSessionID: string; inputID: string }
+  | { state: "unsettled"; hostSessionID: string; inputID: string; reason: string }
+  | { state: "running"; hostSessionID: string; inputID: string; activityID: string; status: string; questions: ReadonlyArray<{ id: string; state: string }>; child?: NativeJobChild }
+  | {
+      state: "terminal"
+      hostSessionID: string
+      inputID: string
+      activityID: string
+      status: "completed" | "failed" | "interrupted"
+      child?: NativeJobChild
+      tool: { status: "completed"; report: string } | { status: "error"; error: string } | undefined
+      lastError: string | null
+    }
 
 export type SessionPlanDocument = {
   markdown: string
@@ -105,6 +153,8 @@ export function tool<Args extends z.ZodRawShape>(input: {
    * registered for scheduled runs but is hidden from ordinary chat turns.
    */
   contractMarker?: string
+  /** Hide the tool until a leading /command (or listed alias) receives single-use host activation consent. */
+  explicitInvocation?: string | ReadonlyArray<string>
   budgetCategory?: "read" | "poll" | "other"
   args: Args
   execute(args: z.infer<z.ZodObject<Args>>, context: ToolContext): Promise<ToolResult>

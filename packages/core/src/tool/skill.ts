@@ -3,17 +3,22 @@ export * as SkillTool from "./skill"
 import path from "path"
 import { pathToFileURL } from "url"
 import { ToolFailure } from "@opencode-ai/llm"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Deferred, Effect, Exit, Layer, Option, Schema } from "effect"
 import { AgentV2 } from "../agent"
 import { Config } from "../config"
+import { ConfigSkillInvocation } from "../config/skill-invocation"
 import { SkillCatalog } from "../skill/catalog"
+import { SkillPolicy } from "../skill/policy"
 import { CapabilityLease } from "../capability/lease"
 import { Database } from "../database/database"
+import { EventV2 } from "../event"
 import { FSUtil } from "../fs-util"
 import { PluginBoot } from "../plugin/boot"
 import { SkillV2 } from "../skill"
 import { PermissionV2 } from "../permission"
 import { SessionHistory } from "../session/history"
+import { SessionInput } from "../session/input"
+import { SessionSkillSelection } from "../session/skill-selection"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
 
@@ -91,6 +96,26 @@ export const loadFailureMessage = (name: string, error?: unknown) => {
 const unableToLoad = (name: string, error?: unknown) =>
   new ToolFailure({ message: loadFailureMessage(name, error), error })
 
+// Parallel loads of the same expired generation share one renewal question
+// through a short-lived in-process claim, never through long-running locks.
+const renewalClaims = new Map<string, Deferred.Deferred<boolean>>()
+
+export const sharedRenewal = (key: string, run: Effect.Effect<boolean, unknown>): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const existing = renewalClaims.get(key)
+    if (existing) return yield* Deferred.await(existing)
+    const deferred = yield* Deferred.make<boolean>()
+    renewalClaims.set(key, deferred)
+    return yield* run.pipe(
+      Effect.catch(() => Effect.succeed(false)),
+      // Interruption also completes and releases the claim so waiting loads
+      // re-check the ledger instead of hanging on a lost owner.
+      Effect.onExit((exit) => Deferred.done(deferred, Exit.succeed(exit._tag === "Success" && exit.value === true)).pipe(
+        Effect.andThen(Effect.sync(() => renewalClaims.delete(key))),
+      )),
+    )
+  })
+
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const tools = yield* Tools.Service
@@ -101,6 +126,7 @@ export const layer = Layer.effectDiscard(
     const config = Option.getOrUndefined(yield* Effect.serviceOption(Config.Service))
     const permission = yield* PermissionV2.Service
     const capabilityLeases = Option.getOrUndefined(yield* Effect.serviceOption(CapabilityLease.Service))
+    const events = Option.getOrUndefined(yield* Effect.serviceOption(EventV2.Service))
     const database = yield* Database.Service
     yield* boot.wait()
     yield* tools
@@ -114,12 +140,17 @@ export const layer = Layer.effectDiscard(
           execute: (input, context) =>
             Effect.gen(function* () {
               const current = yield* skills.list()
+              const agent = agents ? yield* agents.get(context.agent) : undefined
+              const entries = config ? yield* config.entries() : []
+              const invocation = Config.globalLatest(entries, "skill_invocation")
               if (input.group !== undefined) {
-                const agent = agents ? yield* agents.get(context.agent) : undefined
                 if (!agent) return yield* unableToLoad(input.group)
+                const permitted = SkillV2.available(current, agent, context.toolPolicy ?? agent.tools)
+                const policies = SkillPolicy.policiesFor(permitted, invocation, agent.skills)
                 const catalog = SkillCatalog.project(
-                  SkillV2.available(current, agent, context.toolPolicy ?? agent.tools),
-                  Config.latest(config ? yield* config.entries() : [], "skill_groups"),
+                  permitted,
+                  Config.latest(entries, "skill_groups"),
+                  policies,
                 )
                 const output = SkillCatalog.expand(catalog, input.group, context.skillGroupOutputs ?? [])
                 if (!output) return yield* unableToLoad(input.group)
@@ -129,9 +160,40 @@ export const layer = Layer.effectDiscard(
               if (skillName === undefined) return yield* unableToLoad("missing target")
               const skill = current.find((skill) => skill.name === skillName)
               if (!skill) return yield* unableToLoad(skillName)
-              if (skill.disableModelInvocation) {
-                // Use durable user intent anchored before this call, not model input,
-                // compacted summaries, or later prompts admitted to the Session.
+              const policyIssues = config?.issues ? yield* config.issues() : []
+              if (policyIssues.length > 0)
+                return yield* unableToLoad(
+                  skillName,
+                  new Error(
+                    `Skill policy configuration is unreadable (${policyIssues[0]!.path}: ${policyIssues[0]!.message}); fix or remove the file before loading skills`,
+                  ),
+                )
+              const policy = SkillPolicy.resolveForSkill({ skill, global: invocation, agentSkills: agent?.skills })
+              const memory = ConfigSkillInvocation.resolveSelectionMemory(invocation)
+              const invocationNow = config ? yield* config.entries() : []
+              const memoryNow = ConfigSkillInvocation.resolveSelectionMemory(Config.globalLatest(invocationNow, "skill_invocation"))
+              // Selection authority comes from the durable ledger against the
+              // call-bound fence, never from model input or later prompts.
+              const gateSelection = Effect.gen(function* () {
+                if (policy.invocation.value === "allow") return { selected: true }
+                if (!memory.enabled || events === undefined) return yield* legacySelected
+                const source = yield* SessionHistory.entryForMessage(database.db, context.sessionID, context.assistantMessageID).pipe(Effect.orDie)
+                const fenceSeq = source?.seq ?? 0
+                const result = yield* SessionSkillSelection.resolveForGate({
+                  db: database.db,
+                  events,
+                  sessionID: context.sessionID,
+                  skill,
+                  fenceSeq,
+                  assistantMessageID: context.assistantMessageID,
+                  limits: { minutes: memoryNow.minutes, messages: memoryNow.messages },
+                  now: Date.now(),
+                })
+                return result.selected ? { selected: true } : result
+              })
+              const legacySelected = Effect.gen(function* () {
+                // Disabled memory keeps the previous direct gate path exactly:
+                // last user message before this call, strictly attested.
                 const history = yield* SessionHistory.loadForPermission(
                   database.db,
                   context.sessionID,
@@ -139,18 +201,22 @@ export const layer = Layer.effectDiscard(
                   0,
                 ).pipe(Effect.orDie)
                 const user = history?.findLast((message) => message.type === "user")
-                if (!user || !SkillV2.invokedBySlash(skill, user.text))
-                  return yield* new ToolFailure({
-                    message: `Skill ${skill.name} requires an explicit /${skill.name} invocation`,
-                  })
-              }
-              return yield* Effect.gen(function* () {
+                const admitted = user ? yield* SessionInput.find(database.db, user.id) : undefined
+                const anchor = user
+                  ? yield* SessionHistory.entryForMessage(database.db, context.sessionID, user.id).pipe(Effect.orDie)
+                  : undefined
+                const selected = !!user && admitted?.sessionID === context.sessionID && admitted.origin === "interactive" &&
+                  admitted.promotedSeq === anchor?.seq && admitted.prompt.text === user.text && SkillV2.invokedBySlash(skill, admitted.prompt.text)
+                return { selected }
+              })
+              const proceed = Effect.gen(function* () {
                 yield* permission.assert({
                   action: name,
                   resources: [skill.name],
                   save: [skill.name],
                   sessionID: context.sessionID,
                   agent: context.agent,
+                  extraRules: SkillPolicy.askRules(policy, skill.name, { explicitlySelected: selection.selected }),
                   source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
                 })
                 const directory = path.dirname(skill.location)
@@ -184,6 +250,98 @@ export const layer = Layer.effectDiscard(
                     : undefined,
                 }
               }).pipe(Effect.mapError((error) => unableToLoad(skillName, error)))
+              const selection = yield* gateSelection
+              const gate = SkillPolicy.admissionGate(policy, { explicitlySelected: selection.selected })
+              if (gate === "deny")
+                return yield* new ToolFailure({
+                  message: `Skill ${skill.name} is blocked by configuration (invocation: deny)`,
+                })
+              if (gate === "manual") {
+                const renewable =
+                  events !== undefined &&
+                  !selection.selected &&
+                  (selection.reason === "expired_time" || selection.reason === "expired_messages") &&
+                  selection.row !== undefined &&
+                  permission.assertSingleUse !== undefined
+                if (renewable && memory.enabled) {
+                  const row = selection.row!
+                  const claim = `${context.sessionID}:${skill.name}:${row.generation}`
+                  const renewed = yield* sharedRenewal(
+                    claim,
+                    Effect.gen(function* () {
+                      // Exactly one host-bound, single-use question per claim.
+                      // An Allow shortcut or delegated automatic answer can
+                      // never mint a human selection receipt.
+                      const receipt = yield* permission.assertSingleUse!({
+                        action: "skill_selection_renew",
+                        resources: [skill.name],
+                        sessionID: context.sessionID,
+                        agent: context.agent,
+                        source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
+                        metadata: {
+                          skill: skill.name,
+                          generation: row.generation,
+                          reason: selection.reason,
+                          minutes: memoryNow.minutes,
+                          messages: memoryNow.messages,
+                        },
+                      })
+                      // Revalidate policy, freshness and the exact generation
+                      // after the awaited host answer before recording anything.
+                      const entriesAfter = config ? yield* config.entries() : []
+                      const invocationAfter = Config.globalLatest(entriesAfter, "skill_invocation")
+                      const policyAfter = SkillPolicy.resolveForSkill({ skill, global: invocationAfter, agentSkills: agent?.skills })
+                      if (policyAfter.invocation.value === "deny") return false
+                      const limitsAfter = ConfigSkillInvocation.resolveSelectionMemory(invocationAfter)
+                      if (!limitsAfter.enabled) return false
+                      const still = yield* SessionSkillSelection.row(database.db, context.sessionID, skill.name)
+                      if (still?.generation !== row.generation) return false
+                      return yield* SessionSkillSelection.recordReceipt(database.db, events!, {
+                        sessionID: context.sessionID,
+                        name: skill.name,
+                        kind: "renewal",
+                        receiptID: receipt,
+                        limits: { minutes: limitsAfter.minutes, messages: limitsAfter.messages },
+                        boundMessageID: context.assistantMessageID,
+                        expectedGeneration: row.generation,
+                      })
+                    }),
+                  )
+                  if (!renewed) {
+                    // Decline and dismissal grant nothing and stay suppressed
+                    // for this generation until a new genuine selection exists.
+                    if (events !== undefined)
+                      yield* SessionSkillSelection.recordRenewalDeclined(database.db, events, {
+                        sessionID: context.sessionID,
+                        name: skill.name,
+                        generation: row.generation,
+                      }).pipe(Effect.ignore)
+                    return yield* new ToolFailure({
+                      message: `Skill ${skill.name} requires an explicit /${skill.name} invocation (the previous selection expired and the renewal was declined)`,
+                    })
+                  }
+                  const fence = yield* SessionHistory.entryForMessage(database.db, context.sessionID, context.assistantMessageID).pipe(Effect.orDie)
+                  const again = yield* SessionSkillSelection.resolveForGate({
+                    db: database.db,
+                    events: events!,
+                    sessionID: context.sessionID,
+                    skill,
+                    fenceSeq: fence?.seq ?? 0,
+                    assistantMessageID: context.assistantMessageID,
+                    limits: { minutes: memoryNow.minutes, messages: memoryNow.messages },
+                    now: Date.now(),
+                  })
+                  if (!again.selected)
+                    return yield* new ToolFailure({
+                      message: `Skill ${skill.name} requires an explicit /${skill.name} invocation`,
+                    })
+                  return yield* proceed
+                }
+                return yield* new ToolFailure({
+                  message: `Skill ${skill.name} requires an explicit /${skill.name} invocation`,
+                })
+              }
+              return yield* proceed
             }),
         }),
       })

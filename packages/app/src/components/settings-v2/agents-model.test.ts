@@ -24,7 +24,41 @@ import {
   toolPolicy,
   normalizeToolCatalog,
   permissionMap,
+  agentSkills,
+  setAgentSkillEntry,
 } from "./agents-model"
+
+describe("agent skill policy model", () => {
+  test("stores sparse field overrides and drops emptied entries", () => {
+    const agent: ConfigurableAgent = { tools: { mode: "inherit", entries: {} } }
+    const first = setAgentSkillEntry(agent, "effect", { invocation: "ask" })
+    expect(agentSkills(first)).toEqual({ effect: { invocation: "ask" } })
+    const second = setAgentSkillEntry(first, "effect", { visible: false })
+    expect(agentSkills(second)).toEqual({ effect: { visible: false, invocation: "ask" } })
+    // Inherit removes exactly that field.
+    const third = setAgentSkillEntry(second, "effect", { visible: undefined })
+    expect(agentSkills(third)).toEqual({ effect: { invocation: "ask" } })
+    const cleared = setAgentSkillEntry(third, "effect", { invocation: undefined })
+    expect(agentSkills(cleared)).toEqual({})
+    expect(cleared.skills).toBeUndefined()
+  })
+
+  test("keeps other skills and unrelated fields untouched", () => {
+    const agent: ConfigurableAgent = {
+      description: "kept",
+      tools: { mode: "explicit", entries: { bash: { visible: true, permission: "allow" } } },
+      skills: { effect: { invocation: "deny" }, other: { visible: true } },
+    }
+    const changed = setAgentSkillEntry(agent, "effect", { invocation: "allow" })
+    expect(agentSkills(changed)).toEqual({ effect: { invocation: "allow" }, other: { visible: true } })
+    expect(changed.description).toBe("kept")
+    expect(changed.tools).toEqual({ mode: "explicit", entries: { bash: { visible: true, permission: "allow" } } })
+    // saveAgent carries sparse overrides through the stored agent shape.
+    const saved = saveAgent("reviewer", changed)
+    const stored = (saved.agent as Record<string, Record<string, unknown>>).reviewer
+    expect(stored.skills).toEqual({ effect: { invocation: "allow" }, other: { visible: true } })
+  })
+})
 
 describe("agent settings model", () => {
   test("keeps scoped tool metadata through permission changes and explicit materialization", () => {
@@ -106,9 +140,30 @@ describe("agent settings model", () => {
       prompt: "Evaluate",
     })
     expect(toolPolicy({ tools: { read: true, bash: false } })).toEqual({
-      mode: "explicit",
+      mode: "inherit",
       entries: { read: { visible: true }, bash: { visible: false } },
     })
+  })
+
+  test("defaults to inheritance even with permissions and keeps single-tool overrides sparse", () => {
+    expect(toolPolicy({})).toEqual({ mode: "inherit" })
+    expect(toolPolicy({ permission: { edit: "deny" } })).toEqual({ mode: "inherit" })
+    const changed = setAgentToolEntry({ permission: { edit: "deny" } }, "bash", { permission: "ask" })
+    expect(toolPolicy(changed)).toEqual({ mode: "inherit", entries: { bash: { permission: "ask" } } })
+    expect(toolEntry(changed, "edit")).toEqual({ visible: false, permission: "deny" })
+    expect(toolEntry(changed, "future_tool").visible).toBe(true)
+    const scoped = setAgentToolProjectPermission(changed, "bash", "C:/project", "deny")
+    expect(toolPolicy(scoped).mode).toBe("inherit")
+    expect(toolPolicy(scoped).entries).not.toHaveProperty("future_tool")
+  })
+
+  test("inherits a wildcard restriction while retaining named tool exceptions", () => {
+    const agent: ConfigurableAgent = { tools: { mode: "inherit", entries: {
+      "*": { visible: false, permission: "deny" }, read: { visible: true, permission: "allow" },
+    } } }
+    expect(toolEntry(agent, "bash")).toEqual({ visible: false, permission: "deny" })
+    expect(toolEntry(agent, "read")).toEqual({ visible: true, permission: "allow" })
+    expect(toolPolicy(setAgentToolEntry(agent, "read", { permission: "ask" })).mode).toBe("inherit")
   })
 
   test("preserves file-backed system and completion prompt sources", () => {
@@ -265,6 +320,9 @@ describe("agent settings model", () => {
         catalog[0]!,
       ),
     ).toBe(true)
+    const inherited = setAgentToolEntry({}, "computer_use_open", { visible: true, permission: "ask" })
+    expect(toolPolicy(inherited).mode).toBe("inherit")
+    expect(isCatalogToolVisible(inherited, catalog[0]!)).toBe(true)
 
     expect(toolEntry(materializeToolEntries({}, catalog), "computer_use_open")).toEqual({
       visible: false,

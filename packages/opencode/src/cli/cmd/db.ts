@@ -51,12 +51,41 @@ const PathCommand = effectCmd({
   }),
 })
 
+const LegacyRetireCommand = effectCmd({
+  command: "legacy-retire",
+  describe: "cancel stuck removed-orchestrator tasks and release their slots/reservations",
+  instance: false,
+  builder: (yargs: Argv) =>
+    yargs
+      .option("apply", {
+        type: "boolean",
+        default: false,
+        describe: "write the retirement (without this flag the command is a read-only dry-run)",
+      })
+      .option("min-age-hours", {
+        type: "number",
+        default: 24,
+        describe: "minimum hours since the task's last update before it may retire",
+      }),
+  handler: Effect.fn("Cli.db.legacyRetire")(function* (args: { apply: boolean; "min-age-hours": number }) {
+    const { LegacyDelegationRetire } = yield* Effect.promise(() => import("@opencode-ai/core/session/legacy-delegation/retire"))
+    const { db } = yield* Database.Service
+    const outcome = yield* LegacyDelegationRetire.retireStale(db, {
+      now: Date.now(),
+      minAgeMs: args["min-age-hours"] * 60 * 60 * 1000,
+      dryRun: !args.apply,
+    }).pipe(Effect.orDie)
+    if (!args.apply) console.log("dry-run: nothing written; pass --apply to retire these tasks")
+    console.log(JSON.stringify(outcome, null, 2))
+  }),
+})
+
 export const DbCommand = effectCmd({
   command: "db",
   describe: "database tools",
   instance: false,
   builder: (yargs: Argv) => {
-    return yargs.command(QueryCommand).command(PathCommand).demandCommand()
+    return yargs.command(QueryCommand).command(PathCommand).command(LegacyRetireCommand).demandCommand()
   },
   handler: Effect.fn("Cli.db")(function* () {}),
 })

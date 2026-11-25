@@ -1,7 +1,65 @@
 import { describe, expect, test } from "bun:test"
 import { createBrowserAutomation } from "./browser-control"
+import { createBrowserTransferGuard } from "./browser-transfer-guard"
 
 describe("browser control webContents seam", () => {
+  test("clears evidence at transfer and ignores callbacks from the old guest subscription", async () => {
+    const guard = createBrowserTransferGuard()
+    const listeners: ((kind: "console" | "network", value: string) => void)[] = []
+    let unsubscribed = 0
+    const automation = createBrowserAutomation({
+      transferGuard: guard,
+      status: async () => ({ browser: { mode: "webview", url: "https://example.com/", webContentsID: 42 } }),
+      webContentsForId: () => ({
+        id: 42, isDestroyed: () => false, getURL: () => "https://example.com/",
+        executeJavaScript: async (code: string) => code.includes("snapshotScript") ? { text: "", accessibility: "", elements: [] } : "title",
+        capturePage: async () => ({ toJPEG: () => Buffer.from("") }),
+        subscribeEvidence: (listener) => { listeners.push(listener); return () => { unsubscribed += 1 } },
+      }),
+    })
+    await automation.snapshot({})
+    listeners[0]!("console", "before")
+    const ticket = guard.reserve(42)!
+    expect(unsubscribed).toBe(1)
+    expect(guard.commit(42, ticket)).toBe(true)
+    listeners[0]!("console", "while docked")
+    expect(guard.returnToBrowser(42, ticket)).toBe(true)
+    const result = await automation.snapshot({})
+    expect(result.evidence.console).toEqual([])
+    listeners[0]!("console", "late")
+    listeners[1]!("console", "after")
+    expect(result.evidence.console).toEqual(["after"])
+  })
+
+  test("holds transfer exclusion while resolving and executing an action", async () => {
+    const guard = createBrowserTransferGuard()
+    let unblock!: () => void
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    const pause = new Promise<void>((resolve) => { unblock = resolve })
+    const automation = createBrowserAutomation({
+      transferGuard: guard,
+      status: async () => {
+        entered()
+        await pause
+        return { browser: { mode: "webview", url: "https://example.com/", webContentsID: 42 } }
+      },
+      webContentsForId: () => ({
+        id: 42, isDestroyed: () => false, getURL: () => "https://example.com/",
+        executeJavaScript: async () => ({ text: "", accessibility: "", elements: [] }),
+        capturePage: async () => ({ toJPEG: () => Buffer.from("") }), subscribeEvidence: () => () => undefined,
+      }),
+    })
+    const action = automation.snapshot({})
+    await started
+    expect(guard.reserve(42)).toBeUndefined()
+    unblock()
+    await action
+    const ticket = guard.reserve(42)!
+    expect(guard.commit(42, ticket)).toBe(true)
+    await expect(automation.snapshot({})).rejects.toThrow("dock")
+  })
+
   test("waits for a webContentsID after renderer status becomes webview", async () => {
     let statusCalls = 0
     const contents = {

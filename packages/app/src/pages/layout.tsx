@@ -117,6 +117,7 @@ import {
   effectiveWorkspaceOrder,
   errorMessage,
   latestRootSession,
+  resumedProjectDirectories,
   sortedRootSessions,
   visibleRootSessions,
 } from "./layout/helpers"
@@ -1830,9 +1831,10 @@ export default function Layout(props: ParentProps) {
     navigateWithSidebarReset(`/${base64Encode(session.directory)}/session/${session.id}`)
   }
 
-  function openProject(directory: string, navigate = true) {
-    layout.projects.open(directory)
-    if (navigate) return navigateToProject(directory)
+  async function openProject(directory: string, navigate = true) {
+    const key = server.key
+    const real = await layout.projects.register(directory)
+    if (navigate && real && server.key === key) return navigateToProject(real)
   }
 
   const pluginHandoffScope = createMemo(() => {
@@ -2810,15 +2812,15 @@ export default function Layout(props: ParentProps) {
   const projects = () => layout.projects.list()
   makeEventListener(document, "visibilitychange", () => {
     if (document.visibilityState !== "visible") return
-    const directories = [
-      ...projects().map((project) => project.worktree),
-      currentDir(),
-      ...Object.values(state.questionPopups).map((item) => item.directory),
-    ].filter((directory): directory is string => !!directory)
-    const unique = directories.filter(
-      (directory, index) => directories.findIndex((item) => directoryKey(item) === directoryKey(directory)) === index,
-    )
-    void Promise.allSettled(unique.map((directory) => serverSync().refresh(directory)))
+    // Restoring a window must not cold-boot every saved project. Keep active
+    // work and pending questions fresh without starting unrelated services.
+    const directories = resumedProjectDirectories({
+      current: currentDir(),
+      projects: projects().map((project) => project.worktree),
+      questions: Object.values(state.questionPopups).map((item) => item.directory),
+      loaded: (directory) => serverSync().existing(directory)?.[0].status === "complete",
+    })
+    void Promise.allSettled(directories.map((directory) => serverSync().refresh(directory)))
   })
   const isQuestionPopupPending = (directory: string, request: SurfaceBlockingRequest) => {
     const [dirStore] = serverSync().child(directory, { bootstrap: false })

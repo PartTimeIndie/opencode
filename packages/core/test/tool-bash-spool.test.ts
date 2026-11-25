@@ -14,6 +14,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { BashTool } from "@opencode-ai/core/tool/bash"
+import { ShellEnvironment } from "@opencode-ai/core/shell-environment"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { tmpdir } from "./fixture/tmpdir"
@@ -100,6 +101,9 @@ const harness = <A, E, R>(
       const mutation = LocationMutation.layer.pipe(Layer.provide(filesystem), Layer.provide(activeLocation))
       const registry = ToolRegistry.defaultLayer.pipe(Layer.provide(permission))
       const bash = BashTool.layer.pipe(
+        Layer.provide(ShellEnvironment.layer),
+        Layer.provide(activeLocation),
+        Layer.provide(database),
         Layer.provide(registry),
         Layer.provide(permission),
         Layer.provide(mutation),

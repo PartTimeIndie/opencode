@@ -22,7 +22,9 @@ test(`structured ${mode} fails the local admission drain without completion or r
       OPENCODE_DB: path.join(root, "test.db"),
       OPENCODE_CONFIG_DIR: path.join(root, "config"),
       OPENCODE_CONFIG: "",
-      OPENCODE_CONFIG_CONTENT: "{}",
+      // Pin this lifecycle fixture's headroom: the proportional default is
+      // tested separately and must not decide whether this probe compacts.
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({ compaction: { buffer: 20_000 } }),
       OPENCODE_DISABLE_PROJECT_CONFIG: "1",
       OPENCODE_DISABLE_MODELS_FETCH: "1",
       OPENCODE_DISABLE_SESSION_RECOVERY: "1",
@@ -76,6 +78,7 @@ async function probe(mode: "invalid-structured" | "empty-summary") {
   const { SessionAccess } = await import("@opencode-ai/core/session/access")
   const { SessionActivity } = await import("@opencode-ai/core/session/activity")
   const { SessionEvent } = await import("@opencode-ai/core/session/event")
+  const { SessionHistory } = await import("@opencode-ai/core/session/history")
   const { SessionExecution } = await import("@opencode-ai/core/session/execution")
   const { SessionExecutionLocal } = await import("@opencode-ai/core/session/execution/local")
   const { SessionProjector } = await import("@opencode-ai/core/session/projector")
@@ -346,10 +349,16 @@ async function probe(mode: "invalid-structured" | "empty-summary") {
       expect(failed).toHaveLength(1)
       expect(settled).toEqual([{ sessionID: id, status: "error" }])
       expect(completed).toHaveLength(0)
-      expect(requestKinds).toEqual(["generation"])
+      // The original schema error receives exactly one inert correction.
+      // Its second schema error fails the same Activity, not a new one.
+      expect(requestKinds).toEqual(["generation", "generation"])
+      const assistants = (yield* SessionHistory.load(db, id)).filter((message) => message.type === "assistant")
+      expect(assistants.map((message) => message.structuredOutputAttempt?.phase)).toEqual(["initial", "correction"])
+      expect(assistants[0]?.error).toBeUndefined()
+      expect(assistants[1]?.failure?.code).toBe("provider.invalid-response")
     }
     if (mode === "invalid-structured") {
-      expect(requests.length).toBe(1)
+      expect(requests.length).toBe(2)
     } else {
       // Seed completion + padded-turn failure: both settlements observed
       // (listener precedes both admissions). The failed drain's error

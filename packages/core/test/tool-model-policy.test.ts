@@ -45,6 +45,12 @@ describe("ModelPolicy.allowedModels", () => {
 })
 
 describe("ModelPolicy.selectModel", () => {
+  test("pins a workflow worker to its approved model and variant without inherited fallbacks", () => {
+    const selection = ModelPolicy.selectModel({ model: "zhipuai-coding-plan/glm-5.3", variant: "high", parent, direct: true })
+    expect(selection).toEqual({ ok: true, model: { ...glmStep, variant: ModelV2.VariantID.make("high"), chain: null } })
+    expect(ModelPolicy.selectModel({ model: "unconfigured/model", parent, direct: true }).ok).toBe(false)
+  })
+
   test("inherits the agent model while keeping the parent's Settings fallback chain", () => {
     const agent = ModelV2.Ref.make({ id: ModelV2.ID.make("gpt-5.6-sol"), providerID: openai })
     const selection = ModelPolicy.selectModel({ agent, parent })

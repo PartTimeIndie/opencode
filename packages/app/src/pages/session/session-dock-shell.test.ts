@@ -12,6 +12,35 @@ import { controlPanelPaneId } from "./composer/session-request-tree"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { directoryKey } from "@/utils/path-key"
 import { pinnedControlPanelPaneId } from "@/context/control-panel-key"
+import { inactiveDockPaneIds, sessionTabIsInactive } from "./dock-tab-bulk-close"
+
+describe("inactiveDockPaneIds", () => {
+  test("targets finished panes independently of selection and preserves unknown state", () => {
+    expect(inactiveDockPaneIds([
+      { id: "selected-finished", inactive: () => true },
+      { id: "unselected-working", inactive: () => false },
+      { id: "unresolved" },
+    ])).toEqual(["selected-finished"])
+    expect(inactiveDockPaneIds([])).toEqual([])
+  })
+
+  test("rechecks work state at invocation instead of capturing an earlier idle snapshot", () => {
+    let working = false
+    const panes = [{ id: "session", inactive: () => !working }]
+    expect(inactiveDockPaneIds(panes)).toEqual(["session"])
+    working = true
+    expect(inactiveDockPaneIds(panes)).toEqual([])
+  })
+
+  test("requires idle status and protects loading, tools, questions and permissions", () => {
+    const idle = { status: "idle", working: false, question: false, permission: false }
+    expect(sessionTabIsInactive(idle)).toBe(true)
+    for (const change of [{ status: undefined }, { status: "busy" }, { status: "retry" },
+      { status: "waiting_for_user" }, { working: true }, { question: true }, { permission: true }]) {
+      expect(sessionTabIsInactive({ ...idle, ...change })).toBe(false)
+    }
+  })
+})
 
 describe("shouldDockControlPanel", () => {
   test("opens control panels as popups unless docking is explicit", () => {

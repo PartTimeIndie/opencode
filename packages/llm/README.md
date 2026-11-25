@@ -33,6 +33,70 @@ Run `LLMClient.stream(request)` instead of `generate` when you want incremental 
 - **`LLMClient.prepare(request)`** — compile a request through protocol body construction, validation, and HTTP preparation without sending. Useful for inspection and testing.
 - **`LLMEvent.is.*`** — typed guards (`is.textDelta`, `is.toolCall`, `is.finish`, …) for filtering streams.
 
+## Structured results
+
+Use `LLM.generateObject({ model, prompt, schema })` for a typed Effect Schema,
+or pass `jsonSchema` for a runtime JSON Schema. The helper validates the original
+JSON value or tool input before decoding, so a decoder cannot silently remove unexpected
+properties. Runtime schemas are copied before the request and unsupported rules
+fail before HTTP. A valid result requires exactly one JSON value (native mode) or
+one result call (tool mode) and a complete provider finish, not a promise to return JSON later.
+
+Automatic selection uses native JSON only for the direct OpenAI Chat/Responses
+and Google Gemini profiles at their canonical endpoints. Protocol wire support
+alone does not enable it on compatible hosts, proxies or other provider identities.
+Those routes retain their result-tool path. A custom native JSON request remains
+an explicit low-level choice, not an automatic enforcement claim.
+
+The helper owns at most one same-model format correction for a missing or invalid
+result. `retryCount: 0` disables it; larger values are capped at one. It does not
+correct provider refusals, transport failures or interrupted streams. Both turns
+retain the same schema and transport: native JSON with no tools, or only the
+inert result tool with the same tool choice.
+`response` is the final response; `responses` retains the original and corrected
+responses separately, and `usage` sums the reported usage of both. Missing usage
+fields remain unknown rather than being treated as zero. Do not wrap this helper
+in another format-repair loop. The correction explicitly uses zero HTTP retries,
+including when the initial request or route has a larger transport budget. A failure
+during that correction keeps its original error reason and carries
+`structuredOutputCorrectionAttempted: true`; outer model chains must stop rather
+than renew the consumed budget through retry or fallback.
+
+The conservative runtime-schema subset supports JSON types, required properties,
+enums/constants, arrays, additional-property schemas, schema alternatives and
+acyclic local `$ref`/`$defs`/`definitions`. It rejects unknown keywords, unknown
+dialects, recursive/external references and non-JSON values. Compilation counts
+expanded references, bounds reference depth and enum comparison work, and refuses
+excessive complexity before HTTP. Validation has a separate per-result work budget;
+exhaustion fails closed with an explicit complexity diagnostic. Diagnostics contain
+bounded paths and expectations, not result-value dumps.
+
+Low-level `responseFormat` selects transport, not successful result validation:
+
+- `tool` normalizes to a named result tool without mutating the original request;
+  conflicting tool choices or definitions fail before HTTP.
+  The existing Responses profile for `opencode-go` explicitly selects `auto`
+  instead: the schema is still advertised and checked locally, but the provider
+  cannot be claimed to force a result call. Arbitrary compatible endpoints do
+  not inherit that exception.
+- `json` is serialized by the OpenAI Chat/Responses and Gemini protocols. Gemini
+  uses `responseJsonSchema`, without the lossy function-schema projection.
+  Protocols without native JSON support refuse this mode; use a result tool.
+- Native OpenAI JSON schema requests use `strict: true` only for a conservative
+  subset of closed objects with every property required and supported nested
+  types. Other supported schemas use `strict: false`; optional fields are never
+  made required and open objects are never closed just to enable strict mode.
+  Wire support is not proof that an arbitrary deployment or model enforces the
+  schema. Callers still own local validation.
+- HTTP body overlays cannot replace result schemas, formats or tool choices.
+  Conflicting request or route-default overlays fail before HTTP. Ordinary
+  generation overlays remain available. Managed request fingerprints include
+  the structured transport contract version; old accepted profiles are not upgraded.
+
+`LLM.stream` and `LLM.generate` still perform one provider turn and never start a
+format correction themselves. Session runners own their separate durable
+execution, correction budget and terminal-success gate.
+
 ## Caching
 
 Prompt caching is **on by default**. Every `LLMRequest` resolves to `cache: "auto"` unless the caller opts out with `cache: "none"`. Each protocol translates `CacheHint`s to its wire format (`cache_control` on Anthropic, `cachePoint` on Bedrock; OpenAI and Gemini do implicit caching server-side and don't need inline markers — auto is a no-op there).

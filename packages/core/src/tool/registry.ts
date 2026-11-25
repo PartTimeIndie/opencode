@@ -6,6 +6,8 @@ import { AgentV2 } from "../agent"
 import { Config } from "../config"
 import { ConfigOptimization } from "../config/optimization"
 import { ConfigAgent } from "../config/agent"
+import { Database } from "../database/database"
+import { ExplicitInvocation } from "./explicit-invocation"
 import { Location } from "../location"
 import { PermissionV2 } from "../permission"
 import { PluginV2 } from "../plugin"
@@ -21,6 +23,7 @@ import {
   Tool,
   capabilities,
   contractMarker,
+  explicitInvocation,
   definition,
   catalog as catalogMetadata,
   isAlwaysVisible,
@@ -40,6 +43,7 @@ export type ExecuteInput = {
   readonly call: ToolCall
   readonly skillGroupOutputs?: ReadonlyArray<string>
   readonly fileKnowledgeCutoff?: number
+  readonly progress?: Tool.Context["progress"]
 }
 
 export interface Interface {
@@ -48,12 +52,19 @@ export interface Interface {
     policy?: AgentV2.Info["tools"],
     context?: MaterializationContext,
   ) => Effect.Effect<Materialization>
-  readonly catalog: (
-    permissions?: PermissionV2.Ruleset,
-    context?: MaterializationContext,
-  ) => Effect.Effect<ReadonlyArray<CatalogEntry>>
+  /** Configurable registrations, not the tools currently executable by a Session. */
+  readonly catalog: () => Effect.Effect<ReadonlyArray<CatalogEntry>>
+  /** Name-to-marker pairs of registered contract-scoped tools, for open-run visibility computation. */
+  readonly contractTools: () => Effect.Effect<ReadonlyArray<ContractToolBinding>>
+  /** Metadata lookup only, for retaining command identity across template expansion; grants nothing. */
+  readonly hasExplicitCommand: (command: string) => Effect.Effect<boolean>
   /** Internal registration capability exposed publicly only through Tools.Service. */
   readonly register: (tools: Readonly<Record<string, AnyTool>>) => Effect.Effect<void, RegistrationError, Scope.Scope>
+}
+
+export type ContractToolBinding = {
+  readonly name: string
+  readonly marker: string
 }
 
 export type MaterializationContext = {
@@ -61,15 +72,24 @@ export type MaterializationContext = {
   readonly agent: AgentV2.ID
   /**
    * Text of the current turn's latest user prompt. Contract-scoped tools
-   * (for example the scheduler result tool) are only advertised when this
-   * text carries their marker, so ordinary chat turns never see them.
+   * (for example the scheduler result tool) are advertised when this text
+   * carries their marker, so ordinary chat turns never see them.
    */
   readonly lastUserText?: string
+  /**
+   * Markers whose latest host-injected contracted prompt in this session is
+   * still unsettled (no completed result call after it). An open scheduled
+   * run keeps its result tool advertised across ordinary interjected user
+   * inputs and allowed agent switches; once the result call completes, the
+   * gate closes for that run.
+   */
+  readonly openContractMarkers?: ReadonlyArray<string>
 }
 
 export interface CatalogEntry {
   readonly id: string
   readonly description: string
+  readonly parameters: ToolDefinition["inputSchema"]
   readonly scope: "application" | "location"
   readonly project?: string
   readonly source?: string
@@ -90,6 +110,41 @@ export interface Settlement {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/ToolRegistry") {}
+
+export type ContractGateMessage = {
+  readonly type: string
+  readonly text?: string
+  readonly content?: ReadonlyArray<{
+    readonly type: string
+    readonly name?: string
+    readonly state?: { readonly status?: string }
+  }>
+}
+
+/**
+ * Contract-scoped tool visibility follows the open scheduled run, not the
+ * latest prompt text: for each binding, the latest user message carrying its
+ * marker opens the gate until a completed call of that tool settles the run.
+ * Only host-injected user prompts are evidence; assistant echoes, compaction
+ * summaries and other non-user text never open the gate.
+ */
+export const openContractMarkers = (
+  messages: ReadonlyArray<ContractGateMessage>,
+  bindings: ReadonlyArray<ContractToolBinding>,
+): ReadonlyArray<string> =>
+  bindings.flatMap(({ name, marker }) => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      if (message.type !== "user" || !message.text?.includes(marker)) continue
+      const settled = messages
+        .slice(index + 1)
+        .some((entry) =>
+          entry.content?.some((part) => part.type === "tool" && part.name === name && part.state?.status === "completed"),
+        )
+      return settled ? [] : [marker]
+    }
+    return []
+  })
 
 export function budgetCategory(toolName: string, tool: AnyTool | undefined, input: unknown): Tool.BudgetCategory {
   if (tool && Tool.hasBudgetCategory(tool)) return Tool.budgetCategory(tool, input)
@@ -120,6 +175,9 @@ const registryLayer = Layer.effect(
     const location = Option.getOrUndefined(yield* Effect.serviceOption(Location.Service))
     const plugin = Option.getOrUndefined(yield* Effect.serviceOption(PluginV2.Service))
     const capabilityLeases = Option.getOrUndefined(yield* Effect.serviceOption(CapabilityLease.Service))
+    const database = Option.getOrUndefined(yield* Effect.serviceOption(Database.Service))
+    const permissions = Option.getOrUndefined(yield* Effect.serviceOption(PermissionV2.Service))
+    const invocations = database && permissions ? ExplicitInvocation.make(database.db, permissions) : undefined
     // Location config is static for this layer; toggling the feature requires reopening the location.
     const materializationCacheEnabled = Option.isSome(config)
       ? ConfigOptimization.resolve(
@@ -154,6 +212,7 @@ const registryLayer = Layer.effect(
           isAlwaysVisible(registration.tool),
           isDefaultDisabled(registration.tool),
           capabilities(registration.tool),
+          explicitInvocation(registration.tool),
         ]),
         permissions,
         pluginGeneration,
@@ -172,6 +231,7 @@ const registryLayer = Layer.effect(
       input: ExecuteInput,
       advertised?: object,
       policy?: AgentV2.Info["tools"],
+      invocation?: ExplicitInvocation.Grant,
     ) {
       const registration =
         local.get(input.call.name)?.at(-1)?.registration ?? applications.entries().get(input.call.name)
@@ -184,15 +244,40 @@ const registryLayer = Layer.effect(
         }
       if (advertised && registration.identity !== advertised)
         return { result: { type: "error" as const, value: `Stale tool call: ${input.call.name}` } }
+      let progressActive = true
+      const publishProgress = input.progress
       const pending = yield* settle(registration.tool, input.call, {
         sessionID: input.sessionID,
         agent: input.agent,
         assistantMessageID: input.assistantMessageID,
         toolCallID: input.call.id,
         fileKnowledgeCutoff: input.fileKnowledgeCutoff,
+        // Delivery stays opt-in per call; emission vs. capture is decided by the
+        // publisher so fanout receipts persist even when the live-progress
+        // display toggle is off.
+        ...(publishProgress
+          ? {
+              progress: (snapshot: Tool.Progress) =>
+                Effect.suspend(() => (progressActive ? publishProgress(snapshot) : Effect.void)),
+            }
+          : {}),
         ...(policy ? { toolPolicy: policy } : {}),
+        ...(invocation
+          ? {
+              explicitInvocation: {
+                command: invocation.command,
+                inputID: invocation.inputID,
+                activityID: invocation.activityID,
+              },
+            }
+          : {}),
         ...(input.skillGroupOutputs ? { skillGroupOutputs: input.skillGroupOutputs } : {}),
       }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            progressActive = false
+          }),
+        ),
         Effect.map((output) => ({ output })),
         Effect.catchTag("LLM.ToolFailure", (failure) =>
           Effect.succeed({ result: { type: "error" as const, value: failure.message } }),
@@ -215,38 +300,41 @@ const registryLayer = Layer.effect(
         : { result, output: bounded.output }
     })
 
+    const resolveDefinition = Effect.fn("ToolRegistry.resolveDefinition")(function* (name: string, tool: AnyTool) {
+      const base = definition(name, tool)
+      if (!plugin) return base
+      const output = yield* plugin.trigger(
+        "tool.definition",
+        { toolID: name },
+        {
+          description: base.description,
+          parameters: base.inputSchema,
+          outputSchema: base.outputSchema,
+          cache: base.cache,
+          metadata: base.metadata,
+          native: base.native,
+        },
+      )
+      return ToolDefinition.make({
+        name: base.name,
+        description: output.description,
+        inputSchema: output.inputSchema ?? output.parameters,
+        outputSchema: output.outputSchema,
+        cache: output.cache,
+        metadata: output.metadata,
+        native: output.native,
+      })
+    })
+
     const materializeDefinitions = Effect.fn("ToolRegistry.materializeDefinitions")(function* (
       registrations: ReadonlyMap<string, Registration>,
       capabilitySnapshot: CapabilityLease.Snapshot,
       policy?: AgentV2.Info["tools"],
+      grants: ReadonlyMap<string, ExplicitInvocation.Grant> = new Map(),
     ) {
       const definitions = yield* Effect.forEach(
         Array.from(registrations),
-        Effect.fnUntraced(function* ([name, registration]) {
-          const base = definition(name, registration.tool)
-          if (!plugin) return base
-          const output = yield* plugin.trigger(
-            "tool.definition",
-            { toolID: name },
-            {
-              description: base.description,
-              parameters: base.inputSchema,
-              outputSchema: base.outputSchema,
-              cache: base.cache,
-              metadata: base.metadata,
-              native: base.native,
-            },
-          )
-          return ToolDefinition.make({
-            name: base.name,
-            description: output.description,
-            inputSchema: output.inputSchema ?? output.parameters,
-            outputSchema: output.outputSchema,
-            cache: output.cache,
-            metadata: output.metadata,
-            native: output.native,
-          })
-        }),
+        ([name, registration]) => resolveDefinition(name, registration.tool),
         { concurrency: "unbounded" },
       )
       return {
@@ -257,6 +345,21 @@ const registryLayer = Layer.effect(
           const registration = registrations.get(input.call.name)
           if (registration)
             return Effect.gen(function* () {
+              const invocation = grants.get(input.call.name)
+              if (
+                explicitInvocation(registration.tool) !== undefined &&
+                (!invocation ||
+                  !invocations ||
+                  input.sessionID !== invocation.sessionID ||
+                  input.agent !== invocation.agent ||
+                  !(yield* invocations.valid(invocation)))
+              )
+                return {
+                  result: {
+                    type: "error" as const,
+                    value: `Explicit invocation is no longer active for tool: ${input.call.name}`,
+                  },
+                }
               for (const capability of capabilities(registration.tool)) {
                 const expected = capabilitySnapshot[capability]
                 if (
@@ -271,19 +374,14 @@ const registryLayer = Layer.effect(
                     },
                   }
               }
-              return yield* settleWith(input, registration.identity, policy)
+              return yield* settleWith(input, registration.identity, policy, invocation)
             })
           return Effect.succeed({ result: { type: "error" as const, value: `Unknown tool: ${input.call.name}` } })
         },
       }
     })
 
-    const effective = (
-      permissions?: PermissionV2.Ruleset,
-      policy?: AgentV2.Info["tools"],
-      capabilitySnapshot: CapabilityLease.Snapshot = {},
-      lastUserText?: string,
-    ) => {
+    const registered = () => {
       const registrations = new Map(applications.entries())
       for (const [name, entries] of local) {
         const registration =
@@ -293,6 +391,17 @@ const registryLayer = Layer.effect(
         if (catalogMetadata(registration.tool)?.project && applications.entries().has(name)) continue
         registrations.set(name, registration)
       }
+      return registrations
+    }
+
+    const effective = (
+      permissions?: PermissionV2.Ruleset,
+      policy?: AgentV2.Info["tools"],
+      capabilitySnapshot: CapabilityLease.Snapshot = {},
+      lastUserText?: string,
+      openContractMarkers?: ReadonlyArray<string>,
+    ) => {
+      const registrations = registered()
       if (policy)
         for (const [name, registration] of registrations) {
           if (!ConfigAgent.projectScopeAllows(policy.entries[name]?.scope, location?.project.directory ?? "")) {
@@ -310,12 +419,15 @@ const registryLayer = Layer.effect(
             registrations.delete(name)
         }
       // Contract-scoped tools stay registered for eviction safety, but they are
-      // only advertised for turns whose current prompt carries their marker
-      // (for example scheduled job runs). Ordinary user turns never see them,
-      // so history echo can no longer trigger stray result calls.
+      // only advertised for open scheduled runs: either the current prompt
+      // carries their marker (job start and recovery re-submission), or the
+      // session's latest contracted prompt is still unsettled, so ordinary
+      // interjected user inputs and allowed agent switches cannot drop the
+      // result tool mid-run. A completed result call closes the gate again.
       for (const [name, registration] of registrations) {
         const marker = contractMarker(registration.tool)
-        if (marker !== undefined && !lastUserText?.includes(marker)) registrations.delete(name)
+        if (marker === undefined) continue
+        if (!lastUserText?.includes(marker) && !openContractMarkers?.includes(marker)) registrations.delete(name)
       }
       for (const [name, registration] of registrations)
         if (capabilities(registration.tool).some((capability) => capabilitySnapshot[capability] === undefined))
@@ -378,18 +490,23 @@ const registryLayer = Layer.effect(
           }),
         )
       }),
-      catalog: Effect.fn("ToolRegistry.catalog")(function* (permissions, context) {
-        const capabilitySnapshot =
-          context && capabilityLeases ? yield* capabilityLeases.snapshot(context.sessionID, context.agent) : {}
-        const registrations = effective(permissions, undefined, capabilitySnapshot)
+      hasExplicitCommand: (command) => Effect.sync(() => Array.from(registered().values()).some(registration => explicitInvocation(registration.tool)?.includes(command) === true)),
+      catalog: Effect.fn("ToolRegistry.catalog")(function* () {
+        // Settings must be able to configure inactive and denied tools without
+        // activating a capability or granting execution permission. Turn-only
+        // protocol tools still do not belong in this user-configurable catalog.
+        const registrations = Array.from(registered()).filter(
+          ([, registration]) => contractMarker(registration.tool) === undefined,
+        )
         return yield* Effect.forEach(
-          Array.from(registrations),
+          registrations,
           Effect.fnUntraced(function* ([id, registration]) {
-            const resolved = definition(id, registration.tool)
+            const resolved = yield* resolveDefinition(id, registration.tool)
             const metadata = catalogMetadata(registration.tool)
             return {
               id,
               description: resolved.description,
+              parameters: resolved.inputSchema,
               scope: metadata?.scope ?? (applications.entries().get(id) === registration ? "application" : "location"),
               project: metadata?.project,
               source: metadata?.source,
@@ -400,13 +517,39 @@ const registryLayer = Layer.effect(
           { concurrency: "unbounded" },
         )
       }),
+      contractTools: () =>
+        Effect.sync(() =>
+          Array.from(registered()).flatMap(([name, registration]) => {
+            const marker = contractMarker(registration.tool)
+            return marker === undefined ? [] : [{ name, marker }]
+          }),
+        ),
       materialize: Effect.fn("ToolRegistry.materialize")(function* (permissions, policy, context) {
         const capabilitySnapshot =
           context && capabilityLeases ? yield* capabilityLeases.snapshot(context.sessionID, context.agent) : {}
-        const registrations = effective(permissions, policy, capabilitySnapshot, context?.lastUserText)
+        const registrations = effective(
+          permissions,
+          policy,
+          capabilitySnapshot,
+          context?.lastUserText,
+          context?.openContractMarkers,
+        )
+        const grants = new Map<string, ExplicitInvocation.Grant>()
+        for (const [name, registration] of registrations) {
+          const command = explicitInvocation(registration.tool)
+          if (command === undefined) continue
+          const grant =
+            context && invocations
+              ? yield* invocations.authorize(context, name, command, identityID(registration.identity))
+              : undefined
+          if (grant) grants.set(name, grant)
+          else registrations.delete(name)
+        }
         if (materializationCacheEnabled) {
           const key =
             JSON.stringify(policy) +
+            "\0" +
+            JSON.stringify([...grants]) +
             "\0" +
             cacheKey(registrations, permissions ?? [], plugin ? yield* plugin.generation() : 0, capabilitySnapshot)
           const cached = materializationCache.get(key)
@@ -424,11 +567,14 @@ const registryLayer = Layer.effect(
           if (cached) return cached
           return remember(
             key,
-            withBudgetCategory(yield* materializeDefinitions(registrations, capabilitySnapshot, policy), registrations),
+            withBudgetCategory(
+              yield* materializeDefinitions(registrations, capabilitySnapshot, policy, grants),
+              registrations,
+            ),
           )
         }
         return withBudgetCategory(
-          yield* materializeDefinitions(registrations, capabilitySnapshot, policy),
+          yield* materializeDefinitions(registrations, capabilitySnapshot, policy, grants),
           registrations,
         )
       }),

@@ -15,7 +15,7 @@ export class Policy extends Schema.Class<Policy>("ConfigV2.Experimental.Policy")
 
 export class Experimental extends Schema.Class<Experimental>("ConfigV2.Experimental")({
   policies: Policy.pipe(Schema.Array, Schema.optional),
-  session_orchestrator: Schema.Boolean.pipe(Schema.optional).annotate({
-    description: "Allow session orchestrator admission when supported by the host; disabled by default",
+  tool_live_progress: Schema.Boolean.pipe(Schema.optional).annotate({
+    description: "Publish bounded live shell and fanout progress; enabled by default",
   }),
 }) {}

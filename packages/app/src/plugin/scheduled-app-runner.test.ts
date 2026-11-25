@@ -21,16 +21,33 @@ test("duplicate handoffs admit one deterministic job and preserve policy/result 
   } finally { fixture.dispose() }
 })
 
-test("recovery uses the persisted session and message without creating another session", async () => {
+test("recovery observes the persisted execution without admitting another prompt", async () => {
   const fixture = setup({ lastRunSessionID: "ses_recovered", lastRunMessageID: "msg_recovered", lastRunResultContract: resultContractMarker })
   try {
     await fixture.runner.handle(handoff)
     await until(() => fixture.states.some((state) => state.status === "success"))
     expect(fixture.created).toEqual([])
-    expect(fixture.prompts).toHaveLength(1)
-    expect(fixture.prompts[0]?.id).toBe("msg_recovered")
+    expect(fixture.prompts).toEqual([])
     expect(fixture.navigation).toEqual([{ directory: "C:/project", sessionID: "ses_recovered" }])
   } finally { fixture.dispose() }
+})
+
+test("recovers a run that becomes pending after startup without receiving a deep link", async () => {
+  const fixture = setup({ lastRunStatus: "success" }, undefined, undefined, undefined, 10)
+  try {
+    await fixture.runner.resume()
+    expect(fixture.prompts).toEqual([])
+    fixture.job.lastRunStatus = "running"
+    await until(() => fixture.states.some((state) => state.status === "success"))
+    expect(fixture.created).toHaveLength(1)
+    expect(fixture.prompts).toHaveLength(1)
+    await fixture.runner.resume()
+    await Bun.sleep(25)
+    expect(fixture.prompts).toHaveLength(1)
+  } finally { fixture.dispose() }
+  const requestCount = fixture.requests.length
+  await Bun.sleep(25)
+  expect(fixture.requests).toHaveLength(requestCount)
 })
 
 test("global recovery binds job lookup, outcome polling and state updates to the job project", async () => {
@@ -44,7 +61,57 @@ test("global recovery binds job lookup, outcome polling and state updates to the
     expect(scoped.some((request) => request.path.endsWith("/outcome"))).toBe(true)
     expect(scoped.some((request) => request.path.endsWith("/state"))).toBe(true)
     expect(scoped.every((request) => request.directory === fixture.job.workdir)).toBe(true)
+    expect(fixture.prompts).toEqual([])
+  } finally { fixture.dispose() }
+})
+
+test("recovery does not resolve changed model settings or overwrite session policy", async () => {
+  const fixture = setup({ lastRunSessionID: "ses_recovered", lastRunMessageID: "msg_recovered", lastRunResultContract: resultContractMarker,
+    run: { model: "removed/model", runTarget: "app", accessControl: { mode: "full_access" } } })
+  try {
+    await fixture.runner.resume()
+    await until(() => fixture.states.some((state) => state.status === "success"))
+    expect(fixture.prompts).toEqual([])
+    expect(fixture.events).not.toContain("policy:full_access")
+    expect(fixture.events).not.toContain("resolve-model")
+  } finally { fixture.dispose() }
+})
+
+test("recovery admits the same saved message only after durable admission_missing evidence", async () => {
+  const fixture = setup({ lastRunSessionID: "ses_recovered", lastRunMessageID: "msg_recovered", lastRunResultContract: resultContractMarker },
+    undefined, undefined, [{ status: "pending", phase: "admission_missing" }, { status: "success", activityID: "activity-one" }])
+  try {
+    await fixture.runner.resume()
+    await until(() => fixture.states.some((state) => state.status === "success"), 3000)
     expect(fixture.prompts).toHaveLength(1)
+    expect(fixture.prompts[0]?.id).toBe("msg_recovered")
+    expect(fixture.events.indexOf("outcome:pending")).toBeLessThan(fixture.events.indexOf("prompt"))
+    expect(fixture.created).toEqual([])
+  } finally { fixture.dispose() }
+})
+
+for (const status of ["running", "awaiting_input", "pending"]) {
+  test(`recovery keeps a durable ${status} execution observational`, async () => {
+    const fixture = setup({ lastRunSessionID: "ses_recovered", lastRunMessageID: "msg_recovered", lastRunResultContract: resultContractMarker },
+      undefined, undefined, [{ status, activityID: "activity-one", ...(status === "pending" ? { phase: "admitted" } : {}) }])
+    try {
+      await fixture.runner.resume()
+      await until(() => fixture.events.includes(`outcome:${status}`))
+      expect(fixture.prompts).toEqual([])
+      expect(fixture.created).toEqual([])
+      expect(fixture.states.some((state) => state.status === "success" || state.status === "failed")).toBe(false)
+    } finally { fixture.dispose() }
+  })
+}
+
+test("recovery preserves a durable failure instead of trying the job again", async () => {
+  const fixture = setup({ lastRunSessionID: "ses_recovered", lastRunMessageID: "msg_recovered", lastRunResultContract: resultContractMarker },
+    undefined, undefined, [{ status: "failed", activityID: "activity-one", error: "Required explicit result is missing." }])
+  try {
+    await fixture.runner.resume()
+    await until(() => fixture.states.some((state) => state.status === "failed"))
+    expect(fixture.prompts).toEqual([])
+    expect(fixture.states.at(-1)).toMatchObject({ status: "failed", error: "Required explicit result is missing.", messageID: "msg_recovered" })
   } finally { fixture.dispose() }
 })
 
@@ -94,7 +161,7 @@ test("rejects forged handoff shapes and ignores a superseded run", async () => {
   } finally { fixture.dispose() }
 })
 
-function setup(overrides: Record<string, unknown> = {}, pending?: Promise<unknown>, promptFailure?: Error) {
+function setup(overrides: Record<string, unknown> = {}, pending?: Promise<unknown>, promptFailure?: Error, outcomes?: Record<string, unknown>[], reconcileIntervalMs?: number) {
   const controller = new AbortController()
   const cleanup: (() => void)[] = []
   const events: string[] = []
@@ -106,9 +173,13 @@ function setup(overrides: Record<string, unknown> = {}, pending?: Promise<unknow
   const job: Record<string, unknown> = { workdir: "C:/project", scopeId: "scope-one", slug: "nightly", lastRunRunId: runId, lastRunStatus: "running", run: { prompt: "Saved work", model: "neutral/model", runTarget: "app", appSessionStrategy: "new" }, ...overrides }
   const request = async (input: { path: string; directory?: string; method?: string; body?: Record<string, unknown> }) => {
     requests.push(input)
-    if (input.path.endsWith("/outcome")) return promptFailure && prompts.length < 2
-      ? { data: { status: "pending", phase: "admission_missing" } }
-      : { data: { status: "success", activityID: "activity-one" } }
+    if (input.path.endsWith("/outcome")) {
+      const outcome = outcomes?.shift() ?? (promptFailure && prompts.length < 2
+        ? { status: "pending", phase: "admission_missing" }
+        : { status: "success", activityID: "activity-one" })
+      events.push(`outcome:${outcome.status}`)
+      return { data: outcome }
+    }
     if (input.path.endsWith("/state")) {
       states.push(input.body!)
       events.push(`state:${input.body!.status}`)
@@ -133,8 +204,8 @@ function setup(overrides: Record<string, unknown> = {}, pending?: Promise<unknow
         return { ok: true, body: { id: decodeURIComponent(input.path.split("/").at(-1)!) } }
       } },
     },
-    ui: { models: { resolve: () => ({ providerID: "neutral", id: "model" }) } },
-  }, request, () => {})
+    ui: { models: { resolve: () => { events.push("resolve-model"); return { providerID: "neutral", id: "model" } } } },
+  }, request, () => {}, { reconcileIntervalMs })
   return { runner, job, states, prompts, created, navigation, events, requests, dispose() { controller.abort(); cleanup.forEach((fn) => fn()) } }
 }
 

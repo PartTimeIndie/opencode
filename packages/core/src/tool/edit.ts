@@ -1,8 +1,6 @@
 /**
- * Model-facing V2 exact-edit leaf. Relative paths resolve within the active
- * Location. Absolute paths inside that Location are accepted, while explicit
- * absolute external paths retain mutation capability through a separate
- * external_directory approval before edit approval.
+ * Model-facing V2 exact-edit leaf. External targets require separate
+ * external_directory approval before edit approval, regardless of path form.
  * Named project references
  * are read-oriented and deliberately are not accepted by mutation tools.
  */
@@ -13,6 +11,8 @@ import { Effect, Layer, Option, Schema } from "effect"
 import { FileMutation } from "../file-mutation"
 import { FSUtil } from "../fs-util"
 import { LocationMutation } from "../location-mutation"
+import { WorkspaceCheckout } from "../session/workspace/checkout"
+import { LegacyDelegationGuard } from "../session/legacy-delegation/guard"
 import { PermissionV2 } from "../permission"
 import { SessionFileMutation } from "../session/file-mutation"
 import { Database } from "../database/database"
@@ -25,7 +25,7 @@ export const name = "edit"
 export const Input = Schema.Struct({
   path: Schema.String.pipe(Schema.optional).annotate({
     description:
-      "File path to edit. Relative paths resolve within the active Location. Absolute paths inside that Location are accepted; external absolute paths require external_directory approval.",
+      "File path to edit. Relative paths resolve from the active Location. External targets, including those reached via links, require external_directory approval.",
   }),
   filePath: Schema.String.pipe(Schema.optional).annotate({
     description: "Legacy provider alias for path",
@@ -122,6 +122,7 @@ export const layer = Layer.effectDiscard(
     const permission = yield* PermissionV2.Service
     const journal = Option.getOrUndefined(yield* Effect.serviceOption(SessionFileMutation.Service))
     const database = Option.getOrUndefined(yield* Effect.serviceOption(Database.Service))
+    const checkouts = Option.getOrUndefined(yield* Effect.serviceOption(WorkspaceCheckout.Service))
 
     yield* tools
       .register({
@@ -140,11 +141,13 @@ export const layer = Layer.effectDiscard(
               const unableToEdit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
                 effect.pipe(
                   Effect.mapError((error) =>
-                    error instanceof FileMutation.StaleContentError
-                      ? new ToolFailure({
-                          message: "File changed after permission approval. Read it again before editing.",
-                        })
-                      : new ToolFailure({ message: `Unable to edit ${resource}` }),
+                    error instanceof ToolFailure
+                      ? error
+                      : error instanceof FileMutation.StaleContentError
+                        ? new ToolFailure({
+                            message: "File changed after permission approval. Read it again before editing.",
+                          })
+                        : new ToolFailure({ message: `Unable to edit ${resource}` }),
                   ),
                 )
 
@@ -165,7 +168,16 @@ export const layer = Layer.effectDiscard(
                   })
                 }
 
-                const target = yield* unableToEdit(mutation.resolve({ path: resource, kind: "file" }))
+                const target = yield* unableToEdit(
+                  mutation.resolve({ path: resource, kind: "file" }, LocationMutation.guardedPaths),
+                )
+                yield* unableToEdit(
+                  LegacyDelegationGuard.assertFileWrite(
+                    { db: database?.db, checkouts },
+                    context.sessionID,
+                    target.canonical,
+                  ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message }))),
+                )
                 const external = target.externalDirectory
                 if (external) {
                   yield* unableToEdit(
@@ -217,6 +229,7 @@ export const layer = Layer.effectDiscard(
                   files,
                   resolution: mutation,
                   journal,
+                  checkouts,
                   operations: [
                     {
                       type: "edit",

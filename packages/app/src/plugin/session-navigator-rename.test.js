@@ -123,7 +123,9 @@ function serverApi(name, calls, failure) {
 
 function favoriteServerApi(name, favorites, resolve) {
   const requests = []
-  const items = new Map(favorites.map((favorite) => [`${favorite.directory}:${favorite.id}`, { ...favorite }]))
+  const writes = []
+  // Mirrors the host contract: the session id identifies a favorite, the directory is metadata.
+  const items = new Map(favorites.map((favorite) => [favorite.id, { ...favorite }]))
   const api = {
     host: {
       projects: {
@@ -133,12 +135,12 @@ function favoriteServerApi(name, favorites, resolve) {
         favorites: {
           list: () => [...items.values()].map((favorite) => ({ ...favorite })),
           set: (favorite, picked) => {
-            const key = `${favorite.directory}:${favorite.id}`
+            writes.push(picked)
             if (!picked) {
-              items.delete(key)
+              items.delete(favorite.id)
               return
             }
-            items.set(key, { ...favorite })
+            items.set(favorite.id, { ...favorite })
           },
         },
       },
@@ -156,25 +158,20 @@ function favoriteServerApi(name, favorites, resolve) {
       set() {},
     },
   }
-  return { api, items, requests }
+  return { api, items, requests, writes }
 }
 
 function stateWithFavorites(api) {
   return {
     api,
     host: api.host,
-    favoriteItems: Object.fromEntries(
-      api.host.sessions.favorites.list().map((favorite) => [favoriteKey(favorite.directory, favorite.id), favorite]),
-    ),
+    favoriteItems: Object.fromEntries(api.host.sessions.favorites.list().map((favorite) => [favorite.id, favorite])),
+    missingFavorites: new Set(),
     renderCalls: 0,
     render() {
       this.renderCalls++
     },
   }
-}
-
-function favoriteKey(directory, id) {
-  return `${directory.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}:${id}`
 }
 
 async function settle() {
@@ -561,8 +558,8 @@ describe("session navigator semantic title events", () => {
       host: api.host,
       root: undefined,
       favoriteItems: {
-        [`${session.directory}:${session.id}`]: { ...session },
-        [`${other.directory}:${other.id}`]: { ...other },
+        [session.id]: { ...session },
+        [other.id]: { ...other },
       },
       favorites: { key: "favorites", sessions: [{ ...other }, { ...session }] },
       recent: { key: "recent", loaded: false, loading: false, sessions: [] },
@@ -577,7 +574,7 @@ describe("session navigator semantic title events", () => {
       properties: { sessionID: session.id, title: "Generated favorite title", timestamp: 42 },
     })
 
-    expect(state.favoriteItems[`${session.directory}:${session.id}`]).toMatchObject({
+    expect(state.favoriteItems[session.id]).toMatchObject({
       title: "Generated favorite title",
       time: { updated: 42 },
     })
@@ -585,7 +582,7 @@ describe("session navigator semantic title events", () => {
     expect(state.favorites.sessions[0].title).toBe("Generated favorite title")
   })
 
-  test("updates a mixed-case favorite through its persisted directory key", () => {
+  test("updates a mixed-case favorite by session id and keeps its persisted directory", () => {
     const api = { host: {} }
     const session = {
       id: "ses_mixed_case_favorite",
@@ -598,7 +595,7 @@ describe("session navigator semantic title events", () => {
       api,
       host: api.host,
       root: undefined,
-      favoriteItems: { [`${favorite.directory}:${favorite.id}`]: favorite },
+      favoriteItems: { [favorite.id]: favorite },
       favorites: { key: "favorites", sessions: [{ ...favorite }] },
       recent: { key: "recent", loaded: true, loading: false, sessions: [{ ...session }] },
       groups: new Map(),
@@ -617,7 +614,7 @@ describe("session navigator semantic title events", () => {
       title: "Mixed-case favorite title",
       time: { updated: 42 },
     })
-    expect(state.favoriteItems[`${favorite.directory}:${favorite.id}`]).toMatchObject({
+    expect(state.favoriteItems[favorite.id]).toMatchObject({
       directory: "C:/project",
       title: "Mixed-case favorite title",
       time: { updated: 42 },
@@ -647,10 +644,9 @@ describe("session navigator semantic title events", () => {
       host: api.host,
       root: undefined,
       favoriteItems: {
-        [`${first.directory}:${first.id}`]: { ...first },
-        [`${second.directory}:${second.id}`]: { ...second },
+        [first.id]: { ...first },
       },
-      favorites: { key: "favorites", sessions: [{ ...first }, { ...second }] },
+      favorites: { key: "favorites", sessions: [{ ...first }] },
       recent: { key: "recent", loaded: true, loading: false, sessions: [{ ...first }, { ...second }] },
       groups: new Map([
         [first.directory, { key: `project:${first.directory}`, directory: first.directory, sessions: [{ ...first }] }],
@@ -669,10 +665,13 @@ describe("session navigator semantic title events", () => {
       { directory: "c:/project-a/" },
     )
 
-    for (const sessions of [state.recent.sessions, state.search.sessions, state.favorites.sessions]) {
+    for (const sessions of [state.recent.sessions, state.search.sessions]) {
       expect(sessions.find((session) => session.directory === first.directory)?.title).toBe("Generated Project A title")
       expect(sessions.find((session) => session.directory === second.directory)?.title).toBe("Project B title")
     }
+    // A favorite is identified by its session id, so the same id cannot be listed twice.
+    expect(state.favorites.sessions.map((session) => session.directory)).toEqual([first.directory])
+    expect(state.favorites.sessions[0].title).toBe("Generated Project A title")
     expect(state.groups.get(first.directory).sessions[0].title).toBe("Generated Project A title")
     expect(state.groups.get(second.directory).sessions[0].title).toBe("Project B title")
   })
@@ -851,10 +850,9 @@ describe("session navigator live event upserts", () => {
       host: api.host,
       root: undefined,
       favoriteItems: {
-        [`${first.directory}:${first.id}`]: { ...first },
-        [`${second.directory}:${second.id}`]: { ...second },
+        [first.id]: { ...first },
       },
-      favorites: { key: "favorites", sessions: [{ ...first }, { ...second }] },
+      favorites: { key: "favorites", sessions: [{ ...first }] },
       recent: { key: "recent", loaded: true, loading: false, sessions: [{ ...first }, { ...second }] },
       groups: new Map([
         [first.directory, { key: `project:${first.directory}`, directory: first.directory, sessions: [{ ...first }] }],
@@ -892,19 +890,18 @@ describe("session navigator live event upserts", () => {
     expect(state.groups.get(first.directory).sessions.map((session) => session.title)).toEqual(["Project A session"])
     expect(state.groups.get(second.directory).sessions.map((session) => session.title)).toEqual(["Project B session"])
     expect(state.search.sessions.map((session) => session.title)).toEqual(["Project A session", "Project B session"])
-    expect(Object.values(state.favoriteItems).map((session) => session.title)).toEqual([
-      "Project A session",
-      "Project B session",
-    ])
+    // A favorite is identified by its session id, so the deleted id leaves the list.
+    expect(state.favoriteItems).toEqual({})
   })
 })
 
 describe("session navigator favorite parent resolution", () => {
-  test("resolves roots once, removes only 404s, and retains transient failures", async () => {
+  test("resolves roots once, marks 404s without removing them, and retains transient failures", async () => {
     const directory = "C:/shared/project"
     const roots = ["ses_root_1", "ses_root_2", "ses_root_3"]
     const stale = "ses_stale"
     const transient = "ses_transient"
+    let staleExists = false
     const server = favoriteServerApi(
       "server-a",
       [...roots, stale, transient].map((id) => ({ id, directory, title: id })),
@@ -912,7 +909,11 @@ describe("session navigator favorite parent resolution", () => {
         if (roots.includes(sessionID)) {
           return { ok: true, status: 200, body: { exists: true, session: { id: sessionID } } }
         }
-        if (sessionID === stale) return { ok: true, status: 200, body: { exists: false } }
+        if (sessionID === stale) {
+          return staleExists
+            ? { ok: true, status: 200, body: { exists: true, session: { id: sessionID } } }
+            : { ok: true, status: 200, body: { exists: false } }
+        }
         return { ok: false, status: 500, statusText: "Server Error" }
       },
     )
@@ -923,15 +924,24 @@ describe("session navigator favorite parent resolution", () => {
 
     for (const id of roots) {
       expect(server.requests.filter((request) => request.path.endsWith(`/${id}/exists`))).toHaveLength(1)
-      expect(state.favoriteItems[favoriteKey(directory, id)]?.parentID).toBeNull()
-      expect(server.items.get(`${directory}:${id}`)?.parentID).toBeNull()
+      expect(state.favoriteItems[id]?.parentID).toBeNull()
+      expect(server.items.get(id)?.parentID).toBeNull()
     }
-    expect(server.requests.filter((request) => request.path.endsWith(`/${stale}/exists`))).toHaveLength(1)
-    expect(state.favoriteItems[favoriteKey(directory, stale)]).toBeUndefined()
-    expect(server.items.has(`${directory}:${stale}`)).toBe(false)
+    // A favorite whose session is gone is marked, never removed on the user's behalf.
+    expect(server.requests.filter((request) => request.path.endsWith(`/${stale}/exists`))).toHaveLength(2)
+    expect(state.favoriteItems[stale]).toBeDefined()
+    expect(state.missingFavorites.has(stale)).toBe(true)
+    expect(server.items.has(stale)).toBe(true)
+    expect(server.writes).not.toContain(false)
     expect(server.requests.filter((request) => request.path.endsWith(`/${transient}/exists`))).toHaveLength(2)
-    expect(state.favoriteItems[favoriteKey(directory, transient)]).toBeDefined()
-    expect(server.items.has(`${directory}:${transient}`)).toBe(true)
+    expect(state.favoriteItems[transient]).toBeDefined()
+    expect(state.missingFavorites.has(transient)).toBe(false)
+    expect(server.items.has(transient)).toBe(true)
+
+    staleExists = true
+    await refreshFavoriteParents(server.api, state)
+    expect(state.missingFavorites.has(stale)).toBe(false)
+    expect(state.favoriteItems[stale]?.parentID).toBeNull()
   })
 
   test("isolates the same directory and session ID across server hosts", async () => {
@@ -955,10 +965,14 @@ describe("session navigator favorite parent resolution", () => {
       refreshFavoriteParents(serverB.api, stateB),
     ])
 
-    expect(stateA.favoriteItems[favoriteKey(directory, favorite.id)]).toBeUndefined()
-    expect(serverA.items.has(`${directory}:${favorite.id}`)).toBe(false)
-    expect(stateB.favoriteItems[favoriteKey(directory, favorite.id)]?.parentID).toBeNull()
-    expect(serverB.items.get(`${directory}:${favorite.id}`)?.parentID).toBeNull()
+    // Server A only marks its favorite; neither host store receives a removal.
+    expect(stateA.favoriteItems[favorite.id]).toBeDefined()
+    expect(stateA.missingFavorites.has(favorite.id)).toBe(true)
+    expect(serverA.items.has(favorite.id)).toBe(true)
+    expect(stateB.favoriteItems[favorite.id]?.parentID).toBeNull()
+    expect(stateB.missingFavorites.has(favorite.id)).toBe(false)
+    expect(serverB.items.get(favorite.id)?.parentID).toBeNull()
+    expect([...serverA.writes, ...serverB.writes]).toEqual([true])
     expect(serverA.requests).toHaveLength(1)
     expect(serverB.requests).toHaveLength(1)
   })

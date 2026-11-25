@@ -6,12 +6,12 @@ import { createDockContentRegistry, type DockContentParts } from "./dock-content
 const element = (value: string) => value as unknown as JSX.Element
 
 const parts = (value: string): DockContentParts => ({
-  header: element(`${value}:header`),
-  review: element(`${value}:review`),
-  changes: element(`${value}:changes`),
-  files: element(`${value}:files`),
+  header: () => element(`${value}:header`),
+  review: () => element(`${value}:review`),
+  changes: () => element(`${value}:changes`),
+  files: () => element(`${value}:files`),
   bottom: () => element(`${value}:bottom`),
-  mobileChanges: element(`${value}:mobileChanges`),
+  mobileChanges: () => element(`${value}:mobileChanges`),
   mobileChangesOpen: () => false,
 })
 
@@ -25,7 +25,7 @@ describe("createDockContentRegistry", () => {
         registry.register(parts("first"))
         return dispose
       })
-      expect(registry.parts()?.review).toBe("first:review")
+      expect(registry.parts()?.review()).toBe("first:review")
 
       disposeRegistration()
       expect(registry.parts()).toBeUndefined()
@@ -40,10 +40,10 @@ describe("createDockContentRegistry", () => {
         return dispose
       })
       createRoot(() => registry.register(parts("next")))
-      expect(registry.parts()?.files).toBe("next:files")
+      expect(registry.parts()?.files()).toBe("next:files")
 
       stale()
-      expect(registry.parts()?.files).toBe("next:files")
+      expect(registry.parts()?.files()).toBe("next:files")
     })
   })
 
@@ -62,18 +62,23 @@ describe("createDockContentRegistry", () => {
   test("does not construct lazy dock content during registration", () => {
     createRoot(() => {
       const registry = createDockContentRegistry()
-      let mounts = 0
+      const mounts: string[] = []
       registry.register({
         ...parts("lazy"),
+        header: () => { mounts.push("header"); return element("lazy:header") },
+        review: () => { mounts.push("review"); return element("lazy:review") },
+        changes: () => { mounts.push("changes"); return element("lazy:changes") },
+        files: () => { mounts.push("files"); return element("lazy:files") },
         bottom: () => {
-          mounts++
+          mounts.push("bottom")
           return element("lazy:bottom")
         },
+        mobileChanges: () => { mounts.push("mobile"); return element("lazy:mobileChanges") },
       })
 
-      expect(mounts).toBe(0)
+      expect(mounts).toEqual([])
       expect(registry.parts()?.bottom()).toBe("lazy:bottom")
-      expect(mounts).toBe(1)
+      expect(mounts).toEqual(["bottom"])
     })
   })
 })

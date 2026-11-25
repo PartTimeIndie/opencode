@@ -643,14 +643,15 @@ describe("SessionV2 runner parity harness", () => {
     )
   })
 
-  it.effect(
-    "delivers host identity through tool follow-up, child, root resume and compaction without plugin hooks",
+  for (const late of [false, true]) it.effect(
+    `delivers host identity through tool follow-up, child, root resume and compaction without plugin hooks (late=${late})`,
     () =>
       Effect.gen(function* () {
         const rootID = SessionV2.ID.make("ses_host_identity_root")
         const childID = SessionV2.ID.make("ses_host_identity_child")
         const session = yield* setup(rootID)
         yield* setup(childID)
+        currentModel = Model.make({ id: "parity", provider: "test", route: { ...route, runtimeContext: late ? "late-system" : undefined } })
         const database = yield* Database.Service
         yield* database.db
           .update(SessionTable)
@@ -667,7 +668,10 @@ describe("SessionV2 runner parity harness", () => {
         yield* session.resume(rootID)
         const marker = "OpenCode host session (authoritative): "
         const identity = (request: LLMRequest) => {
-          const entries = request.system.map((part) => part.text).filter((text) => text.startsWith(marker))
+          const entries = (late ? request.runtimeContext ?? [] : request.system).map((part) => part.text).filter((text) => text.startsWith(marker))
+          if (late) expect(request.system.some((part) => part.text.startsWith(marker))).toBe(false)
+          else expect(request.runtimeContext).toBeUndefined()
+          if (late) expect(entries[0]).toContain("OpenCode host working directory: ")
           expect(entries).toHaveLength(1)
           return JSON.parse(entries[0]!.slice(marker.length).split("\n")[0]!)
         }
@@ -700,6 +704,7 @@ describe("SessionV2 runner parity harness", () => {
         yield* session.compact({ sessionID: rootID })
         expect(requests).toHaveLength(5)
         expect(requests[4]!.system.some((part) => part.text.startsWith(marker))).toBe(false)
+        expect(requests[4]!.runtimeContext).toBeUndefined()
         responses = [textTurn("host-post-compaction", "Resumed")]
         yield* session.prompt({
           sessionID: rootID,
@@ -806,7 +811,46 @@ describe("SessionV2 runner parity harness", () => {
       }),
     )
 
-  it.effect("applies plugin chat request hooks before streaming", () =>
+  for (const backend of ["google/gemini-fixture", "anthropic/fixture", "openrouter/fixture"])
+    it.effect(`SDK backend ID does not change ordinary request routing: ${backend}`, () =>
+      Effect.gen(function* () {
+        const { createOpenAI } = yield* Effect.promise(() => import("@ai-sdk/openai"))
+        const { model } = yield* Effect.promise(() => import("../plugin/provider-helper"))
+        const { SessionRunnerAISDK } = yield* Effect.promise(() => import("@opencode-ai/core/session/runner/aisdk"))
+        const bodies: string[] = []
+        const language = createOpenAI({
+          apiKey: "fixture-not-a-secret",
+          fetch: Object.assign(async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            bodies.push(String(init?.body))
+            return new Response('data: {"choices":[{"index":0,"delta":{"content":"Done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+              { headers: { "content-type": "text/event-stream" } })
+          }, { preconnect: fetch.preconnect }),
+        }).chat(backend)
+        const plugin = yield* PluginV2.Service
+        const id = PluginV2.ID.make("sdk-namespace-probe")
+        yield* plugin.add({ id, effect: Effect.succeed({
+          "chat.params": (event) => Effect.sync(() => { event.options = { parallelToolCalls: false } }),
+        }) })
+        const sessionID = SessionV2.ID.make("ses_sdk_namespace")
+        const session = yield* setup(sessionID)
+        currentModel = SessionRunnerModel.fromAISDKModel(model("openai", "fixture"), language)
+        responses = [textTurn("sdk-namespace", "Done")]
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Preserve OpenAI options" }), resume: false })
+        yield* session.resume(sessionID)
+        const prepared = requests[0]
+        if (!prepared) return yield* Effect.die("Missing prepared runner request")
+        expect(prepared.providerOptions?.openai?.parallelToolCalls).toBe(false)
+        expect(prepared.providerOptions?.gemini).toBeUndefined()
+        expect(prepared.providerOptions?.anthropic).toBeUndefined()
+        expect(prepared.generation?.maxTokens).not.toBe(2048)
+        yield* SessionRunnerAISDK.stream(language, prepared).pipe(Stream.runDrain)
+        expect(bodies).toHaveLength(1)
+        expect(JSON.parse(bodies[0] ?? "{}").parallel_tool_calls).toBe(false)
+        yield* plugin.remove(id)
+      }),
+    )
+
+  for (const late of [false, true]) it.effect(`applies plugin chat request hooks before streaming (late=${late})`, () =>
     Effect.gen(function* () {
       const plugin = yield* PluginV2.Service
       const id = PluginV2.ID.make("runner-chat-hooks")
@@ -838,6 +882,7 @@ describe("SessionV2 runner parity harness", () => {
 
       const sessionID = SessionV2.ID.make("ses_parity_plugin_chat")
       const session = yield* setup(sessionID)
+      currentModel = Model.make({ id: "parity", provider: "test", route: { ...route, runtimeContext: late ? "late-system" : undefined } })
       responses = [textTurn("text-plugin-hooks", "Hooks applied")]
 
       yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Use hooks" }), resume: false })
@@ -847,7 +892,7 @@ describe("SessionV2 runner parity harness", () => {
       expect(request).toBeDefined()
       if (!request) return
       expect(request.system.map((part) => part.text)).toContain("hook system")
-      expect(request.system.at(-1)?.text).toStartWith("OpenCode host session (authoritative): ")
+      expect((late ? request.runtimeContext : request.system)?.at(-1)?.text).toStartWith("OpenCode host session (authoritative): ")
       expect(userTexts(request)).toEqual(["Use hooks", "hook message"])
       expect(request.generation?.temperature).toBe(0.25)
       expect(request.generation?.topP).toBe(0.75)
@@ -929,14 +974,13 @@ describe("SessionV2 runner parity harness", () => {
     }),
   )
 
-  it.effect("covers queued delivery after the active activity settles", () =>
+  it.effect("covers queued delivery at the next turn boundary while the activity runs", () =>
     Effect.gen(function* () {
       const sessionID = SessionV2.ID.make("ses_parity_queue")
       const session = yield* setup(sessionID)
       responses = [
         toolTurn("call-echo", "echo", { text: "queued" }),
-        textTurn("text-queue-first", "First activity complete"),
-        textTurn("text-queue-second", "Queued activity complete"),
+        textTurn("text-queue-first", "Queued activity complete"),
       ]
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
@@ -954,10 +998,9 @@ describe("SessionV2 runner parity harness", () => {
       streamGate = undefined
       streamStarted = undefined
 
-      expect(requests).toHaveLength(3)
+      expect(requests).toHaveLength(2)
       expect(userTexts(requests[0])).toEqual(["Start working"])
-      expect(userTexts(requests[1])).toEqual(["Start working"])
-      expect(userTexts(requests[2])).toEqual(["Start working", "Wait until the next activity"])
+      expect(userTexts(requests[1])).toEqual(["Start working", "Wait until the next activity"])
     }),
   )
 

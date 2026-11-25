@@ -3,6 +3,9 @@ export { Auth } from "./route/auth"
 export { Provider } from "./provider"
 export { isContextOverflow, isContextOverflowFailure } from "./provider-error"
 export { isQuotaExceeded } from "./provider-quota"
+export { RequestRuntimeContext } from "./runtime-context"
+export { StructuredOutputTransport } from "./structured-output-transport"
+export { StructuredJsonSubset } from "./structured-json-subset"
 export type {
   RouteModelInput,
   RouteRoutedModelInput,

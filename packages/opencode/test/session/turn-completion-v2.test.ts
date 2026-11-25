@@ -198,6 +198,100 @@ function reset() {
 }
 
 describe("TurnCompletionV2", () => {
+  for (const status of ["success", "failed", "unbound"] as const) {
+    itWithManualService.effect(`settles a scheduled turn with a ${status} result receipt`, () =>
+      Effect.gen(function* () {
+        reset()
+        completionStatus = "incomplete"
+        const sessionID = SessionID.make(`ses_scheduled_${status}`)
+        const activityID = `activity_scheduled_${status}`
+        const contract = "opencode.scheduled-job-result/v1"
+        yield* seed(sessionID, activityID)
+        const { db } = yield* Database.Service
+        yield* db
+          .update(SessionActivityTable)
+          .set({ closed_seq: 3 })
+          .where(eq(SessionActivityTable.id, activityID))
+          .run()
+          .pipe(Effect.orDie)
+        const model = { id: "test-model", providerID: "test" }
+        const result = status === "failed" ? { contract, status, error: "Job check failed" } : { contract, status: "success" }
+        const messages = [
+          {
+            id: "msg_scheduled_prompt",
+            type: "user",
+            text: status === "unbound" ? "Normal task" : contract,
+            time: { created: 1 },
+          },
+          {
+            id: "msg_scheduled_receipt",
+            type: "assistant",
+            agent: "build",
+            model,
+            finish: "tool-calls",
+            time: { created: 2, completed: 2 },
+            content: [
+              {
+                type: "tool",
+                id: "call_scheduled_job_result",
+                name: "scheduled_job_result",
+                time: { created: 2 },
+                state: {
+                  status: "completed",
+                  input: {},
+                  content: [],
+                  outputPaths: [],
+                  structured: { metadata: { result } },
+                },
+              },
+            ],
+          },
+          {
+            id: "msg_scheduled_final",
+            type: "assistant",
+            agent: "build",
+            model,
+            finish: "stop",
+            time: { created: 3, completed: 3 },
+            content: [{ type: "text", id: "text", text: "Run ended." }],
+          },
+        ] as const
+        yield* db
+          .insert(SessionMessageTable)
+          .values(messages.map(({ id, type, ...data }, index) => ({
+            id: SessionMessage.ID.make(id),
+            session_id: sessionID,
+            type,
+            seq: index + 1,
+            time_created: index + 1,
+            time_updated: index + 1,
+            data,
+          })))
+          .run()
+          .pipe(Effect.orDie)
+        const queued: SessionV2.ID[] = []
+        const execution = Layer.mock(SessionExecution.Service, {
+          queueContinuation: (target) => Effect.sync(() => void queued.push(target)),
+        })
+        yield* Layer.build(TurnCompletionV2.layer.pipe(
+          Layer.provide(events),
+          Layer.provide(completion),
+          Layer.provide(instances),
+          Layer.provide(execution),
+          Layer.provide(Layer.succeed(Database.Service, { db })),
+        ))
+        yield* listener(terminal(sessionID, activityID))
+
+        expect(yield* marker(activityID)).toMatchObject({
+          state: "done",
+          result: status === "unbound" ? "incomplete" : "done",
+        })
+        expect(evaluated.includes(sessionID)).toBe(status === "unbound")
+        expect(queued).toEqual(status === "unbound" ? [sessionID] : [])
+      }),
+    )
+  }
+
   for (const scenario of ["failed", "interrupted", "saved-done", "saved-incomplete"] as const) {
     itWithManualService.effect(`settles historical ${scenario} with only the required legacy project startup`, () =>
       Effect.gen(function* () {
@@ -474,6 +568,46 @@ describe("TurnCompletionV2", () => {
       expect(TurnCompletionV2.backgroundStartupDelayMs({ OPENCODE_DEFER_BACKGROUND_STARTUP: "1" })).toBe(
         TurnCompletionV2.DESKTOP_BACKGROUND_STARTUP_DELAY_MS,
       )
+    }),
+  )
+
+  itWithManualService.effect("observes live terminal events while historical desktop scanning is deferred", () =>
+    Effect.gen(function* () {
+      reset()
+      const previous = process.env.OPENCODE_DEFER_BACKGROUND_STARTUP
+      process.env.OPENCODE_DEFER_BACKGROUND_STARTUP = "1"
+      yield* Effect.addFinalizer(() => Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENCODE_DEFER_BACKGROUND_STARTUP
+        else process.env.OPENCODE_DEFER_BACKGROUND_STARTUP = previous
+      }))
+      const historicalSessionID = SessionID.make("ses_deferred_historical")
+      const historicalActivityID = "activity_deferred_historical"
+      const liveSessionID = SessionID.make("ses_deferred_live")
+      const liveActivityID = "activity_deferred_live"
+      yield* seed(historicalSessionID, historicalActivityID)
+      yield* seed(liveSessionID, liveActivityID)
+      const databaseService = yield* Database.Service
+      const deferred = TurnCompletionV2.layer.pipe(
+        Layer.provide(events),
+        Layer.provide(completion),
+        Layer.provide(instances),
+        Layer.provide(Layer.succeed(Database.Service, databaseService)),
+      )
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      yield* Layer.buildWithScope(Layer.fresh(deferred), scope)
+      expect((yield* marker(historicalActivityID))?.attempts).toBe(0)
+      yield* listener(terminal(liveSessionID, liveActivityID))
+      expect(yield* marker(liveActivityID)).toMatchObject({ state: "done", result: "done", attempts: 1 })
+      expect(published).toContainEqual({
+        id: EventV2.ID.fromExternal({ namespace: "session-turn-completion", key: liveActivityID }),
+        sessionID: liveSessionID,
+        status: "done",
+      })
+      expect((yield* marker(historicalActivityID))?.attempts).toBe(0)
+      yield* TestClock.adjust(TurnCompletionV2.DESKTOP_BACKGROUND_STARTUP_DELAY_MS)
+      yield* waitForState(historicalActivityID, "done")
+      expect((yield* marker(liveActivityID))?.attempts).toBe(1)
     }),
   )
 

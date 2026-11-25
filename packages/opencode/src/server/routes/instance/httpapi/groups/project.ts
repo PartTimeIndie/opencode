@@ -1,4 +1,5 @@
 import { Project } from "@/project/project"
+import { ProjectIcon } from "@/project/icon"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
@@ -56,8 +57,8 @@ export const ProjectApi = HttpApi.make("project")
           query: WorkspaceRoutingQuery,
           payload: UpdatePayload,
           success: described(Project.Info, "Updated project information"),
-          error: [HttpApiError.BadRequest, ProjectNotFoundError],
-        }).annotateMerge(
+          error: [HttpApiError.BadRequest, ProjectNotFoundError, ProjectIcon.InvalidIconError],
+         }).annotateMerge(
           OpenApi.annotations({
             identifier: "project.update",
             summary: "Update project",
@@ -98,6 +99,41 @@ export const ProjectApi = HttpApi.make("project")
             identifier: "project.directories",
             summary: "List project directories",
             description: "List known local absolute directories for a project.",
+          }),
+        ),
+        HttpApiEndpoint.get("directoryIcons", `${root}/directory-icons`, {
+          query: WorkspaceRoutingQuery,
+          success: described(Project.DirectoryIcons, "Directory icons"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "project.directoryIcons",
+            summary: "List directory icons",
+            description: "List the icons stored for directories that have no project row of their own.",
+          }),
+        ),
+        HttpApiEndpoint.put("directoryIcon", `${root}/directory-icon`, {
+          query: WorkspaceRoutingQuery,
+          payload: Project.DirectoryIconInput,
+          success: described(Project.DirectoryIconUpdate, "Stored directory icon, or the directory alone once cleared"),
+          error: [HttpApiError.BadRequest, ProjectIcon.InvalidIconError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "project.directoryIcon",
+            summary: "Set or clear a directory icon",
+            description:
+              "Store a 128px thumbnail of an uploaded image for a directory. An omitted or empty url clears the icon.",
+          }),
+        ),
+        HttpApiEndpoint.post("resolve", `${root}/resolve`, {
+          query: WorkspaceRoutingQuery,
+          payload: Project.ResolveDirectoriesInput,
+          success: described(Project.ResolvedDirectories, "Resolved directories in request order"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "project.resolve",
+            summary: "Resolve directories",
+            description:
+              "Resolve junctions, symlinks and alias spellings to the real directory on the server host and report whether it exists.",
           }),
         ),
       )

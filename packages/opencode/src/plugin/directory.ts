@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises"
 import { posix, resolve, win32 } from "node:path"
 
 /** Server plugin APIs always receive an absolute host-owned project scope. */
@@ -15,6 +16,35 @@ export function sameDirectory(left: string, right: string) {
     return win32.resolve(left).toLowerCase() === win32.resolve(right).toLowerCase()
   }
   return resolve(left) === resolve(right)
+}
+
+const resolvedEqual = (left: string, right: string) =>
+  // Follow the host platform, not the input shape: win32.isAbsolute also
+  // claims POSIX root paths, so an input-shape rule would fold case for two
+  // distinct case-sensitive POSIX directories without touching the
+  // filesystem. samePluginScope only compares host-resolved directories,
+  // where this rule matches absolutePluginDirectory's normalization.
+  process.platform === "win32"
+    ? win32.resolve(left).toLowerCase() === win32.resolve(right).toLowerCase()
+    : resolve(left) === resolve(right)
+
+/**
+ * Same project scope for plugin host APIs, tolerating Windows drive aliases
+ * (subst/junction, e.g. C:\proj vs E:\proj for one physical checkout), case
+ * and separator drift across app relaunches. The gate compares physical
+ * scope: an in-tree symlink into another project resolves to that project's
+ * directory. Identical spellings are accepted lexically without filesystem
+ * access (archived catalogs can outlive their directories); differing
+ * spellings fall back to realpath and reject when either cannot be resolved.
+ */
+export async function samePluginScope(left: string, right: string) {
+  if (resolvedEqual(left, right)) return true
+  try {
+    const [leftReal, rightReal] = await Promise.all([realpath(left), realpath(right)])
+    return resolvedEqual(leftReal, rightReal)
+  } catch {
+    return false
+  }
 }
 
 /**

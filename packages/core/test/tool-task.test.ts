@@ -1,11 +1,16 @@
 import { describe, expect } from "bun:test"
+import { createHash } from "node:crypto"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { adjust } from "effect/testing/TestClock"
-import { LLMError, TransportReason } from "@opencode-ai/llm"
+import { LLMError, TransportReason, LLMEvent, LLMResponse, Model, type LLMRequest } from "@opencode-ai/llm"
+import { LLMClient } from "@opencode-ai/llm/route"
+import { route } from "@opencode-ai/llm/protocols/openai-chat"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { FanoutWorkflow } from "@opencode-ai/core/fanout-workflow"
 import { ContentStore } from "@opencode-ai/core/content-store"
 import { Database } from "@opencode-ai/core/database/database"
+import { BackgroundJob } from "@opencode-ai/core/background-job"
+import { BackgroundJobTable } from "@opencode-ai/core/background-job.sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -15,15 +20,22 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionFailure } from "@opencode-ai/core/session/failure"
+import { SessionFork } from "@opencode-ai/core/session/fork"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { TaskAdmission } from "@opencode-ai/core/session/task-admission"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { TaskTool } from "@opencode-ai/core/tool/task"
+import { TaskJob } from "@opencode-ai/core/tool/task-job"
+import { ReviewerLoopPolicy } from "@opencode-ai/core/tool/reviewer-loop-policy"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
+import { reviewerDetails, type ReviewerDetail } from "@opencode-ai/core/util/tool-details"
 import { testEffect } from "./lib/effect"
 import { settleTool, toolDefinitions, toolIdentity } from "./lib/tool"
 
@@ -218,7 +230,7 @@ const workflows = Layer.effectDiscard(
       tools: ["read", "grep", "glob"],
       resultSchema: {
         type: "object",
-        properties: { findings: { type: "array", items: {} }, notes: { type: "array", items: { type: "string" } } },
+        properties: { findings: { type: "array", items: { type: "object", properties: { title: { type: "string" } }, required: ["title"], additionalProperties: false } }, notes: { type: "array", items: { type: "string" } } },
         required: ["findings", "notes"],
         additionalProperties: false,
       },
@@ -234,6 +246,62 @@ const task = TaskTool.layer.pipe(
   Layer.provide(taskEvents),
 )
 const it = testEffect(Layer.mergeAll(permission, agents, sessions, registry, workflows, taskDatabase, taskEvents, task))
+
+let acquisitionBoundary: { acquired: Deferred.Deferred<void>; release: Deferred.Deferred<void> } | undefined
+const acquisitionJobs = Layer.effect(TaskJob.Service, Effect.gen(function* () {
+  const jobs = yield* TaskJob.Service
+  return TaskJob.Service.of({ ...jobs,
+    // Interrupt exactly at acquisition return, before any setup instruction.
+    reserve: (input) => jobs.reserve(input).pipe(Effect.tap(() => Effect.suspend(() => {
+      const boundary = acquisitionBoundary!
+      return Deferred.succeed(boundary.acquired, undefined).pipe(Effect.andThen(Deferred.await(boundary.release)))
+    }))),
+  })
+})).pipe(Layer.provide(TaskJob.layer.pipe(Layer.provide(Layer.mergeAll(
+  taskDatabase, taskEvents, BackgroundJob.defaultLayer,
+)))))
+const acquisitionTask = TaskTool.sessionLayer.pipe(Layer.provide(Layer.mergeAll(
+  registry, permission, agents, sessions, workflows, taskEvents, acquisitionJobs,
+)))
+const acquisitionIt = testEffect(Layer.mergeAll(taskDatabase, registry, acquisitionTask))
+
+acquisitionIt.live("settles and stops the lease when interruption lands at reservation return", () =>
+  Effect.gen(function* () {
+    reset()
+    acquisitionBoundary = { acquired: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+    const registry = yield* ToolRegistry.Service
+    const task = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+      call: { type: "tool-call", id: "call-acquisition-interrupt", name: "task",
+        input: { ...taskInput(), background: true } },
+    }).pipe(Effect.forkScoped)
+    yield* Deferred.await(acquisitionBoundary.acquired)
+    const stopped = yield* Fiber.interrupt(task).pipe(Effect.forkScoped({ startImmediately: true }))
+    yield* Deferred.succeed(acquisitionBoundary.release, undefined)
+    yield* Fiber.join(stopped)
+    const db = (yield* Database.Service).db
+    const rows = yield* db.select().from(BackgroundJobTable).all()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ status: "error", lease_until: null,
+      error: "Task preparation was interrupted before launch", time_owner_settled: expect.any(Number) })
+    expect(created).toHaveLength(0)
+    expect(resumed).toHaveLength(0)
+  }),
+)
+
+const repairRequests: LLMRequest[] = []
+let repairEvents: LLMEvent[] = []
+const repairModel = Model.make({ id: "fake-model", provider: "fake", route: route.with({ limits: { context: 200_000, output: 4_000 } }) })
+const repairClient = Layer.succeed(LLMClient.Service, LLMClient.Service.of({
+  prepare: () => Effect.die("unused"),
+  stream: (request) => { repairRequests.push(request); return Stream.fromIterable(repairEvents) },
+  generate: (request) => Effect.sync(() => { repairRequests.push(request); return new LLMResponse({ events: repairEvents }) }),
+}))
+const repairResolver = SessionRunnerModel.layerWith(() => Effect.succeed(repairModel))
+const repairTask = TaskTool.layer.pipe(
+  Layer.provide(registry), Layer.provide(permission), Layer.provide(agents), Layer.provide(sessions),
+  Layer.provide(workflows), Layer.provide(taskEvents), Layer.provide(repairClient), Layer.provide(repairResolver),
+)
+const repairIt = testEffect(Layer.mergeAll(permission, agents, sessions, registry, workflows, taskDatabase, taskEvents, repairClient, repairResolver, repairTask))
 
 const handoffRuns: { readonly sessionID: SessionSchema.ID; readonly model: ModelV2.Ref; readonly history: string[] }[] =
   []
@@ -334,6 +402,46 @@ const handoffIt = testEffect(
 )
 
 describe("TaskTool", () => {
+  it.effect("pending admission gives a typed non-retryable next action without changing other failures", () =>
+    Effect.sync(() => {
+      for (const prefix of ["Unable to create task session", "Unable to admit the task follow-up"]) {
+        const failure = TaskTool.admissionFailure(new SessionFork.CaptureConflict({ reason: "pending" }), prefix)
+        expect(failure.metadata).toEqual({ code: "task_pending_input", retryable: false, next_action: "process_pending_input" })
+        expect(failure.message).toContain("was not started")
+        expect(failure.message).toContain("normal session flow")
+        expect(failure.message).toContain("do not retry this rejected assignment")
+        expect(failure.message).toContain("context:fresh as a fallback")
+        for (const reason of ["missing", "boundary", "epoch", "history"] as const) {
+          const other = TaskTool.admissionFailure(new SessionFork.CaptureConflict({ reason }), prefix)
+          expect(other.message).toBe(`${prefix}: Session fork capture refused (${reason})`)
+          expect(other.metadata).toBeUndefined()
+        }
+        // A matching string alone is not host-attested pending-input evidence.
+        const untyped = TaskTool.admissionFailure(new Error("Session fork capture refused (pending)"), prefix)
+        expect(untyped.message).toBe(`${prefix}: Session fork capture refused (pending)`)
+        expect(untyped.metadata).toBeUndefined()
+      }
+    }),
+  )
+
+  it.effect("reports a refused or dismissed mirror folder choice as a non-retryable typed failure", () =>
+    Effect.sync(() => {
+      const prefix = "Unable to create task session"
+      const refused = TaskTool.admissionFailure(new TaskAdmission.Conflict({ reason: "placement", stage: "mirror-root",
+        cause: new Error("the folder is on another volume") }), prefix)
+      expect(refused.message).toBe(`${prefix}: Native task admission refused (placement/mirror-root): the folder is on another volume`)
+      expect(refused.metadata).toEqual({ code: "task_mirror_root_refused", retryable: false })
+      const dismissed = TaskTool.admissionFailure(new TaskAdmission.Conflict({ reason: "dismissed",
+        cause: new Error("The user dismissed the mirror folder choice; no task was started") }), prefix)
+      expect(dismissed.message).toContain("no task was started")
+      expect(dismissed.metadata).toEqual({ code: "task_mirror_root_dismissed", retryable: false })
+      // Other admission conflicts keep their plain bounded message.
+      const mirror = TaskTool.admissionFailure(new TaskAdmission.Conflict({ reason: "placement", stage: "mirror", cause: new Error("EIO") }), prefix)
+      expect(mirror.message).toContain("placement/mirror")
+      expect(mirror.metadata).toBeUndefined()
+    }),
+  )
+
   it.effect("creates a linked child session and runs it through SessionV2 prompt/resume", () =>
     Effect.gen(function* () {
       reset()
@@ -460,6 +568,12 @@ describe("TaskTool", () => {
       expect(properties?.workflow?.description).toContain("ID, command, or public name")
       expect(properties?.workflow?.description).toContain("leading slash")
       expect(TaskTool.description).toContain("unconfigured models are rejected")
+      expect(properties?.context?.description).toContain("independent of workspace")
+      expect(properties?.context?.description).toContain("Defaults to fork")
+      expect(properties?.context?.description).toContain("no parent history or attachments")
+      expect(properties?.context?.description).toContain("a failed fork never falls back")
+      expect(TaskTool.description).toContain("context=fresh")
+      expect(TaskTool.description).toContain("Workspace still defaults to mirror")
     }),
   )
 
@@ -475,9 +589,12 @@ describe("TaskTool", () => {
       expect(definition?.description).toContain("use read, grep, or glob directly")
       expect(definition?.description).toContain("A configured model chain selects models")
       expect(definition?.description).toContain("it is not a request for parallel reviewers")
-      expect(definition?.description).toContain("look directly instead of using multiple agents, follow that instruction")
+      expect(definition?.description).toContain(
+        "look directly instead of using multiple agents, follow that instruction",
+      )
       expect(definition?.description).toContain("without reviewer runtime ceilings")
       expect(definition?.description).toContain("collect every worker exactly once")
+      expect(JSON.stringify(definition?.inputSchema)).toContain("Initial reviewer context")
     }),
   )
 
@@ -648,10 +765,14 @@ describe("TaskTool", () => {
         text: expect.stringContaining("spawn_no_output"),
       })
       expect(resumed).toHaveLength(4)
+      expect(created.every((entry) => entry.model?.chain === null)).toBe(true)
+      expect(prompts.every((entry) => entry.model?.chain === null)).toBe(true)
       expect(interrupted).toEqual([])
       expect(permissionAssertions).toHaveLength(4)
       expect(permissionAssertions.every((entry) => entry.action === "multi_agent_fanout")).toBe(true)
       expect(permissionAssertions.every((entry) => entry.resources[0] === "review")).toBe(true)
+      expect(permissionAssertions.every((entry) => entry.source?.type === "tool" && entry.source.callID === "call-task-fanout-no-output")).toBe(true)
+      expect(new Set(created.map((entry) => entry.id)).size).toBe(4)
       expect(
         created.every(
           (entry) => JSON.stringify(entry.metadata?.tool_budget) === JSON.stringify({ read: 9, grep: 4, glob: 3 }),
@@ -660,7 +781,256 @@ describe("TaskTool", () => {
     }),
   )
 
-  it.live("settles from terminal child history while every reviewer run remains pending", () =>
+  it.effect("does not cancel reviewer recovery on an intermediate failed step", () =>
+    Effect.gen(function* () {
+      reset()
+      const failed = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const events = yield* EventV2.Service
+      resumeOverride = (id) => Effect.gen(function* () {
+        const prompt = prompts.find((entry) => entry.sessionID === id)
+        if (!prompt?.id) return yield* Effect.die("Expected admitted prompt")
+        const response = assistant("", "msg_recoverable_review", {
+          error: { type: "unknown", message: "Provider stream stalled" },
+        })
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), response])
+        yield* events.publish(SessionEvent.Step.Failed, {
+          sessionID: id, timestamp: DateTime.makeUnsafe(1), assistantMessageID: response.id,
+          error: { type: "unknown", message: "Provider stream stalled" },
+        })
+        yield* Deferred.succeed(failed, undefined)
+        yield* Deferred.await(release)
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), response,
+          assistant(JSON.stringify({ findings: [], notes: ["Recovered"] }), "msg_review_recovered")])
+      })
+      const registry = yield* ToolRegistry.Service
+      const fiber = yield* settleTool(registry, {
+        sessionID: parentID, ...toolIdentity,
+        call: { type: "tool-call", id: "call-review-recovery", name: "multi_agent_fanout",
+          input: { workflow: "review", prompt: "Inspect", requested_reviewers: [{ model: "fake/fake-model" }] } },
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(failed)
+      yield* adjust("1 second")
+      expect(fiber.pollUnsafe()).toBeUndefined()
+      yield* Deferred.succeed(release, undefined)
+      const result = yield* Fiber.join(fiber)
+      expect(result.output?.structured).toMatchObject({ results: [{ status: "success", result: { notes: ["Recovered"] } }] })
+      expect(interrupted).toEqual([])
+    }),
+  )
+
+  it.effect("retains validated findings when the original review ends in a structured-output failure", () =>
+    Effect.gen(function* () {
+      reset()
+      resumeOverride = (id) => {
+        const prompt = prompts.find((entry) => entry.sessionID === id)
+        if (!prompt?.id) return Effect.die("Missing admitted prompt")
+        const original = JSON.stringify({ findings: [{ title: "Real issue" }, { title: 5 }], notes: [] })
+        const response = new SessionMessage.Assistant({
+          id: SessionMessage.ID.make("msg_invalid_review"), type: "assistant", agent: "review", model,
+          content: [new SessionMessage.AssistantText({ type: "text", id: "text", text: original })],
+          error: { type: "unknown", message: "Structured output failed" },
+          failure: SessionFailure.make("provider.invalid-response", { retryability: "none", cause: { detail: "structured output" } }),
+          time: { created: DateTime.makeUnsafe(0), completed: DateTime.makeUnsafe(0) },
+        })
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), response])
+        return Effect.fail(childFailure())
+      }
+      const registry = yield* ToolRegistry.Service
+      const result = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        call: { type: "tool-call", id: "call-review-invalid", name: "multi_agent_fanout",
+          input: { workflow: "review", prompt: "Inspect", requested_reviewers: [{ model: "fake/fake-model" }] } },
+      })
+      const row = (result.output?.structured as { results: Array<{ status: string; recovery?: { findings: unknown[]; original: string } }> })?.results[0]
+      expect(row?.status).toBe("partial")
+      expect(row?.recovery?.findings).toEqual([{ title: "Real issue" }])
+      expect(row?.recovery?.original).toContain('"title":5')
+      expect(resumed).toHaveLength(1)
+    }),
+  )
+
+  repairIt.effect("does not stack collector repair on a runner-owned structured assignment", () =>
+    Effect.gen(function* () {
+      reset()
+      repairRequests.length = 0
+      repairEvents = [LLMEvent.finish({ reason: "stop" })]
+      resumeOverride = (id) => {
+        const prompt = prompts.find((entry) => entry.sessionID === id)
+        if (!prompt?.id) return Effect.die("Missing admitted prompt")
+        const original = JSON.stringify({ findings: [{ title: "Original issue" }, { title: 5 }], notes: [] })
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), new SessionMessage.Assistant({
+          id: SessionMessage.ID.make("msg_runner_owned_review"), type: "assistant", agent: "review", model,
+          structuredOutputAttempt: {
+            version: 1, inputID: prompt.id, inputDigest: "a".repeat(64), schemaDigest: "b".repeat(64),
+            model, mode: "tool", phase: "correction",
+          },
+          content: [new SessionMessage.AssistantText({ type: "text", id: "text", text: original })],
+          error: { type: "unknown", message: "Structured output failed" },
+          failure: SessionFailure.make("provider.invalid-response", { retryability: "none", cause: { detail: "structured output" } }),
+          time: { created: DateTime.makeUnsafe(0), completed: DateTime.makeUnsafe(0) },
+        })])
+        return Effect.fail(childFailure())
+      }
+      const registry = yield* ToolRegistry.Service
+      const result = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        call: { type: "tool-call", id: "call-runner-owned", name: "multi_agent_fanout",
+          input: { workflow: "review", prompt: "Inspect", requested_reviewers: [{ model: "fake/fake-model" }] } },
+        progress: () => Effect.void,
+      })
+      expect(repairRequests).toHaveLength(0)
+      expect(result.output?.structured).toMatchObject({ results: [{
+        status: "partial", recovery: { findings: [{ title: "Original issue" }] },
+      }] })
+    }),
+  )
+
+  for (const findings of [[], [{ title: "Rephrased issue" }]]) {
+    repairIt.effect(`preserves original findings after a valid runner correction: ${JSON.stringify(findings)}`, () =>
+      Effect.gen(function* () {
+        reset()
+        repairRequests.length = 0
+        resumeOverride = (id) => {
+          const prompt = prompts.find((entry) => entry.sessionID === id)
+          if (!prompt?.id) return Effect.die("Missing admitted prompt")
+          const original = JSON.stringify({ findings: [{ title: "Original issue" }, { title: 5 }], notes: [] })
+          const corrected = { findings, notes: [] }
+          const receipt = {
+            version: 1 as const, inputID: prompt.id, inputDigest: "a".repeat(64), schemaDigest: "b".repeat(64),
+            model, mode: "tool" as const,
+          }
+          messagesByID.set(id, [user(prompt.id, prompt.prompt.text), new SessionMessage.Assistant({
+            id: SessionMessage.ID.make("msg_original_evidence"), type: "assistant", agent: "review", model,
+            structuredOutputAttempt: { ...receipt, phase: "initial" }, finish: "stop",
+            content: [new SessionMessage.AssistantText({ type: "text", id: "original", text: original })],
+            time: { created: DateTime.makeUnsafe(0), completed: DateTime.makeUnsafe(0) },
+          }), new SessionMessage.Assistant({
+            id: SessionMessage.ID.make("msg_corrected_evidence"), type: "assistant", agent: "review", model,
+            structuredOutputAttempt: { ...receipt, phase: "correction" }, finish: "stop", structured: corrected,
+            content: [new SessionMessage.AssistantText({ type: "text", id: "corrected", text: JSON.stringify(corrected) })],
+            time: { created: DateTime.makeUnsafe(1), completed: DateTime.makeUnsafe(1) },
+          })])
+          return Effect.void
+        }
+        const registry = yield* ToolRegistry.Service
+        const result = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+          call: { type: "tool-call", id: "call-preserve-original", name: "multi_agent_fanout",
+            input: { workflow: "review", prompt: "Inspect", requested_reviewers: [{ model: "fake/fake-model" }] } },
+          progress: () => Effect.void,
+        })
+        expect(repairRequests).toHaveLength(0)
+        expect(result.output?.structured).toMatchObject({ results: [{
+          status: "partial", recovery: { findings: [{ title: "Original issue" }] },
+        }] })
+      }),
+    )
+  }
+
+  repairIt.effect("legacy review recovery is local-only and never renews a format budget", () =>
+    Effect.gen(function* () {
+      reset()
+      repairRequests.length = 0
+      const original = JSON.stringify({ findings: [{ title: "Original issue" }, { title: 5 }], notes: [] })
+      const repaired = JSON.stringify({ findings: [{ title: "Rephrased issue" }], notes: [] })
+      repairEvents = [LLMEvent.stepStart({ index: 0 }), LLMEvent.textStart({ id: "repair" }),
+        LLMEvent.textDelta({ id: "repair", text: repaired }), LLMEvent.textEnd({ id: "repair" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }), LLMEvent.finish({ reason: "stop" })]
+      resumeOverride = (id) => {
+        const prompt = prompts.find((entry) => entry.sessionID === id)
+        if (!prompt?.id) return Effect.die("Missing admitted prompt")
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), new SessionMessage.Assistant({
+          id: SessionMessage.ID.make("msg_invalid_repair_review"), type: "assistant", agent: "review", model,
+          content: [new SessionMessage.AssistantText({ type: "text", id: "text", text: original })],
+          error: { type: "unknown", message: "Structured output failed" },
+          failure: SessionFailure.make("provider.invalid-response", { retryability: "none", cause: { detail: "structured output" } }),
+          time: { created: DateTime.makeUnsafe(0), completed: DateTime.makeUnsafe(0) },
+        })])
+        return Effect.fail(childFailure())
+      }
+      const registry = yield* ToolRegistry.Service
+      const call = { type: "tool-call" as const, id: "call-repair-once", name: "multi_agent_fanout",
+        input: { workflow: "review", prompt: "Inspect", requested_reviewers: [{ model: "fake/fake-model" }] } }
+      const snapshots: Array<Record<string, unknown>> = []
+      const result = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity, call,
+        progress: (snapshot) => Effect.sync(() => { snapshots.push(snapshot.structured) }) })
+      const row = (result.output?.structured as { results: Array<{ status: string; result: unknown; recovery: { findings: unknown[]; source: string; original: string; repaired: string } }> })?.results[0]
+      expect(row).toMatchObject({ status: "partial" })
+      expect(row?.result).toBeUndefined()
+      expect(row?.recovery).toMatchObject({ source: "original", findings: [{ title: "Original issue" }], original })
+      expect(row?.recovery.repaired).toBeUndefined()
+      expect(repairRequests).toHaveLength(0)
+      expect(snapshots.some((snapshot) => Array.isArray(snapshot.reviewers) &&
+        (snapshot.reviewers as Array<{ repairClaim?: string }>)[0]?.repairClaim)).toBe(false)
+      const again = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity, call })
+      expect((again.output?.structured as { results: Array<{ status: string }> })?.results[0]?.status).toBe("partial")
+      expect(repairRequests).toHaveLength(0)
+      repairEvents = [...repairEvents, LLMEvent.providerError({ message: "Provider failed after JSON", retryable: true })]
+      const providerAfterJSON = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        call: { ...call, id: "call-repair-provider-error" }, progress: () => Effect.void })
+      expect((providerAfterJSON.output?.structured as { results: Array<{ status: string; recovery: { repairStatus: string; findings: unknown[] } }> })?.results[0])
+        .toMatchObject({ status: "partial", recovery: { findings: [{ title: "Original issue" }] } })
+      expect(repairRequests).toHaveLength(0)
+      repairEvents = [...repairEvents.slice(0, -2), LLMEvent.stepFinish({ index: 0, reason: "error" }), LLMEvent.finish({ reason: "error" })]
+      const badFinish = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        call: { ...call, id: "call-repair-error-finish" }, progress: () => Effect.void })
+      expect((badFinish.output?.structured as { results: Array<{ status: string; recovery: { repairStatus: string } }> })?.results[0])
+        .toMatchObject({ status: "partial", recovery: { findings: [{ title: "Original issue" }] } })
+      expect(repairRequests).toHaveLength(0)
+      const noPublisher = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        call: { ...call, id: "call-no-durable-publisher" } })
+      expect((noPublisher.output?.structured as { results: Array<{ status: string }> })?.results[0]?.status).toBe("partial")
+      expect(repairRequests).toHaveLength(0)
+      const failed = SessionFailure.make("provider.rate-limit", { retryability: "none" })
+      resumeOverride = (id) => {
+        const prompt = prompts.find((entry) => entry.sessionID === id)
+        if (!prompt?.id) return Effect.die("Missing admitted prompt")
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), new SessionMessage.Assistant({
+          id: SessionMessage.ID.make("msg_rate_limited_review"), type: "assistant", agent: "review", model,
+          content: [new SessionMessage.AssistantText({ type: "text", id: "text", text: original })],
+          error: { type: "unknown", message: "Rate limited" }, failure: failed,
+          time: { created: DateTime.makeUnsafe(0), completed: DateTime.makeUnsafe(0) },
+        })])
+        return Effect.fail(childFailure())
+      }
+      const second = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        call: { ...call, id: "call-provider-error" } })
+      expect((second.output?.structured as { results: Array<{ status: string }> })?.results[0]?.status).toBe("error")
+      expect(repairRequests).toHaveLength(0)
+    }),
+  )
+
+  repairIt.effect("a persisted terminal repair claim blocks dispatch after a fresh layer build", () =>
+    Effect.gen(function* () {
+      reset()
+      repairRequests.length = 0
+      const callID = "call-persisted-repair"
+      const claim = createHash("sha256").update(`${parentID}:${callID}\0${0}\0review`).digest("hex")
+      messagesByID.set(parentID, [new SessionMessage.Assistant({ ...assistant("Earlier result"),
+        content: [new SessionMessage.AssistantTool({ type: "tool", id: callID, name: "multi_agent_fanout",
+          state: new SessionMessage.ToolStateError({ status: "error", input: {}, content: [],
+            structured: { results: [{ repairClaim: claim }] }, error: { type: "unknown", message: "Interrupted" } }),
+          time: { created: DateTime.makeUnsafe(0) },
+        })],
+      })])
+      resumeOverride = (id) => {
+        const prompt = prompts.find((entry) => entry.sessionID === id)
+        if (!prompt?.id) return Effect.die("Missing prompt")
+        messagesByID.set(id, [user(prompt.id, prompt.prompt.text), new SessionMessage.Assistant({
+          ...assistant(JSON.stringify({ findings: [{ title: "Original issue" }, { title: 5 }], notes: [] })),
+          failure: SessionFailure.make("provider.invalid-response", { retryability: "none", cause: { detail: "structured output" } }),
+        })])
+        return Effect.fail(childFailure())
+      }
+      const registry = yield* ToolRegistry.Service
+      const result = yield* settleTool(registry, { sessionID: parentID, ...toolIdentity,
+        progress: () => Effect.void,
+        call: { type: "tool-call", id: callID, name: "multi_agent_fanout",
+          input: { workflow: "review", prompt: "Inspect", requested_reviewers: [{ model: "fake/fake-model" }] } } })
+      expect((result.output?.structured as { results: Array<{ status: string }> })?.results[0]?.status).toBe("partial")
+      expect(repairRequests).toHaveLength(0)
+    }),
+  )
+
+  it.live("collects terminal child history after every reviewer drain settles", () =>
     Effect.gen(function* () {
       reset()
       sessionsByID.set(
@@ -749,7 +1119,6 @@ describe("TaskTool", () => {
               activityID: `activity-${index}`,
             })
           }
-          return yield* Effect.never
         })
       const registry = yield* ToolRegistry.Service
 
@@ -1020,7 +1389,7 @@ describe("TaskTool", () => {
       expect(result.output?.structured).toMatchObject({
         state: "error",
         text: expect.stringContaining("never_settled"),
-        next_action: "resume",
+        next_action: "none",
       })
       expect(result.result.value).not.toContain("Prior response")
     }),
@@ -1050,7 +1419,7 @@ describe("TaskTool", () => {
       expect(result.output?.structured).toMatchObject({
         state: "error",
         text: expect.stringContaining("never_settled"),
-        next_action: "resume",
+        next_action: "none",
       })
       expect(result.result.value).not.toContain("Later response")
     }),
@@ -1191,22 +1560,25 @@ describe("TaskTool", () => {
         providerID: ProviderV2.ID.make("openai"),
         chain: null,
       }
-      sessionsByID.set(parentID, sessionInfo(parentID, {
-        title: "Parent",
-        model: {
-          id: ModelV2.ID.make("gpt-5.6-sol"),
-          providerID: ProviderV2.ID.make("openai"),
-          chain: {
-            id: "standard",
-            name: "Standard",
-            active: 0,
-            steps: [
-              { id: ModelV2.ID.make("gpt-5.6-sol"), providerID: ProviderV2.ID.make("openai") },
-              { id: ModelV2.ID.make("gpt-5.6-luna"), providerID: ProviderV2.ID.make("openai") },
-            ],
+      sessionsByID.set(
+        parentID,
+        sessionInfo(parentID, {
+          title: "Parent",
+          model: {
+            id: ModelV2.ID.make("gpt-5.6-sol"),
+            providerID: ProviderV2.ID.make("openai"),
+            chain: {
+              id: "standard",
+              name: "Standard",
+              active: 0,
+              steps: [
+                { id: ModelV2.ID.make("gpt-5.6-sol"), providerID: ProviderV2.ID.make("openai") },
+                { id: ModelV2.ID.make("gpt-5.6-luna"), providerID: ProviderV2.ID.make("openai") },
+              ],
+            },
           },
-        },
-      }))
+        }),
+      )
       sessionsByID.set(
         existingID,
         sessionInfo(existingID, {
@@ -1254,22 +1626,25 @@ describe("TaskTool", () => {
       // model + variant re-selects from agent + parent and applies the
       // requested step, including its chain.
       reset()
-      sessionsByID.set(parentID, sessionInfo(parentID, {
-        title: "Parent",
-        model: {
-          id: ModelV2.ID.make("gpt-5.6-sol"),
-          providerID: ProviderV2.ID.make("openai"),
-          chain: {
-            id: "standard",
-            name: "Standard",
-            active: 0,
-            steps: [
-              { id: ModelV2.ID.make("gpt-5.6-sol"), providerID: ProviderV2.ID.make("openai") },
-              { id: ModelV2.ID.make("gpt-5.6-luna"), providerID: ProviderV2.ID.make("openai") },
-            ],
+      sessionsByID.set(
+        parentID,
+        sessionInfo(parentID, {
+          title: "Parent",
+          model: {
+            id: ModelV2.ID.make("gpt-5.6-sol"),
+            providerID: ProviderV2.ID.make("openai"),
+            chain: {
+              id: "standard",
+              name: "Standard",
+              active: 0,
+              steps: [
+                { id: ModelV2.ID.make("gpt-5.6-sol"), providerID: ProviderV2.ID.make("openai") },
+                { id: ModelV2.ID.make("gpt-5.6-luna"), providerID: ProviderV2.ID.make("openai") },
+              ],
+            },
           },
-        },
-      }))
+        }),
+      )
       sessionsByID.set(
         existingID,
         sessionInfo(existingID, {
@@ -1511,7 +1886,7 @@ describe("TaskTool", () => {
         state: "error",
         summary: "Task failed: Review code",
         text: "Task timed out after 10ms",
-        next_action: "resume",
+        next_action: "none",
       })
       expect(interrupted).toEqual([spawnedID])
       expect(interrupted).not.toContain(parentID)
@@ -1520,14 +1895,8 @@ describe("TaskTool", () => {
 
   it.live("reports stream failure before timeout when the child stream already failed", () =>
     Effect.gen(function* () {
-      // Sol causal shape (evidence 1729): the child stream failed with
-      // TypeError: terminated BEFORE the parent timeout fired. The harness
-      // projects the stream failure as a terminal assistant error, then the
-      // drain hangs (Effect.never AFTER the terminal history exists): the
-      // foreground race observes the terminal failure first, so the durable
-      // child error is the stream failure and no timeout interrupt fires.
-      // Removing the stream-failure setup changes the outcome to a timeout,
-      // so the test pins failure-before-timeout ordering, not just text.
+      // A failed step alone is not terminal: the owning drain must settle
+      // before the task can report its error instead of a local timeout.
       reset()
       const streamFailure = "Failed to read openai/openai-responses-codex stream: TypeError: terminated"
       const events = yield* EventV2.Service
@@ -1546,7 +1915,6 @@ describe("TaskTool", () => {
             assistantMessageID: failedID,
             error: { type: "unknown", message: streamFailure },
           })
-          return yield* Effect.never
         })
       const registry = yield* ToolRegistry.Service
 
@@ -1569,7 +1937,7 @@ describe("TaskTool", () => {
         sessionID: spawnedID,
         state: "error",
         text: streamFailure,
-        next_action: "resume",
+        next_action: "none",
       })
       expect(interrupted).toEqual([])
       expect(interrupted).not.toContain(parentID)
@@ -1645,6 +2013,68 @@ describe("TaskTool", () => {
       )
     }
   }
+
+  it.effect("publishes completed and failed reviewers while another reviewer is still running", () =>
+    Effect.gen(function* () {
+      reset()
+      const release = yield* Deferred.make<void>()
+      const early = yield* Deferred.make<void>()
+      let rows: ReviewerDetail[] = []
+      let partial: unknown[] = []
+      resumeOverride = (id) =>
+        Effect.gen(function* () {
+          const position = resumed.indexOf(id)
+          if (position === 1) yield* Deferred.await(release)
+          const prompt = prompts.find((entry) => entry.sessionID === id)
+          if (!prompt?.id) return yield* Effect.die("Expected admitted reviewer")
+          messagesByID.set(
+            id,
+            position === 2
+              ? []
+              : [user(prompt.id, prompt.prompt.text), assistant(JSON.stringify({ findings: [], notes: ["Done"] }))],
+          )
+        })
+      const registry = yield* ToolRegistry.Service
+      const fiber = yield* settleTool(registry, {
+        sessionID: parentID,
+        ...toolIdentity,
+        progress: (snapshot) =>
+          Effect.gen(function* () {
+            rows = reviewerDetails(snapshot.structured)
+            partial = Array.isArray(snapshot.structured.partial_results) ? snapshot.structured.partial_results : []
+            if (
+              rows.some((row) => row.state === "completed") &&
+              rows.some((row) => row.state === "error") &&
+              rows.some((row) => row.state === "running")
+            )
+              yield* Deferred.succeed(early, undefined)
+          }),
+        call: {
+          type: "tool-call",
+          id: "call-live-fanout",
+          name: "multi_agent_fanout",
+          input: {
+            workflow: "review",
+            prompt: "Inspect",
+            requested_reviewers: Array.from({ length: 3 }, () => ({ model: "fake/fake-model" })),
+          },
+        },
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(early)
+      expect(fiber.pollUnsafe()).toBeUndefined()
+      expect(rows.every((row) => row.sessionID && sessionsByID.has(SessionSchema.ID.make(row.sessionID)))).toBe(true)
+      expect(rows.find((row) => row.state === "completed")?.text).toContain("Done")
+      expect(partial).toMatchObject([{ status: "success", result: { findings: [], notes: ["Done"] } }])
+      yield* Deferred.succeed(release, undefined)
+      const result = yield* Fiber.join(fiber)
+      expect(result.output?.structured).toMatchObject({
+        results: [{ status: "success" }, { status: "success" }, { status: "spawn_no_output" }],
+      })
+      expect(created).toHaveLength(3)
+      expect(prompts).toHaveLength(3)
+      expect(resumed).toHaveLength(3)
+    }),
+  )
 
   it.effect("collects every fanout reviewer despite an accidentally supplied runtime ceiling", () =>
     Effect.gen(function* () {
@@ -1736,7 +2166,7 @@ describe("TaskTool", () => {
         state: "error",
         summary: "Task failed: Review code",
         text: "Task fast_error: no usable assistant response produced. Do not retry this task unchanged.",
-        next_action: "resume",
+        next_action: "none",
       })
     }),
   )
@@ -1864,7 +2294,7 @@ describe("TaskTool", () => {
       expect(result.output?.structured).toMatchObject({
         state: "error",
         text: "Task was interrupted before completing",
-        next_action: "resume",
+        next_action: "none",
       })
     }),
   )
@@ -1897,8 +2327,42 @@ describe("TaskTool", () => {
       expect(output?.results[0]?.task).toMatchObject({
         state: "error",
         text: "Task was interrupted before completing",
-        next_action: "resume",
+        next_action: "none",
       })
+    }),
+  )
+
+  it.effect("keeps the chat-sentence suspicion stop locked when it only appears in prompt text", () =>
+    Effect.gen(function* () {
+      reset()
+      resumeOverride = (id) =>
+        Effect.gen(function* () {
+          const prompt = prompts.find((entry) => entry.sessionID === id)
+          if (!prompt?.id) return yield* Effect.die("Expected admitted reviewer")
+          messagesByID.set(id, [user(prompt.id, prompt.prompt.text), assistant(JSON.stringify({ findings: [], notes: ["Read"] }))])
+        })
+      const registry = yield* ToolRegistry.Service
+      const result = yield* settleTool(registry, {
+        sessionID: parentID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-fanout-chat-sentence",
+          name: "multi_agent_fanout",
+          input: {
+            workflow: "review",
+            prompt: "Bei diesem Review schon bei Verdacht abbrechen. Review the change.",
+            requested_reviewers: [{ model: "fake/fake-model" }],
+          },
+        },
+      })
+      expect(result.output?.structured).toMatchObject({
+        results: [{ status: "success" }],
+      })
+      // The sentences are review content, not authorization: no override exists
+      // for the parent session, call, or child run.
+      expect(ReviewerLoopPolicy.overrideFor({ sessionID: parentID, callID: "call-fanout-chat-sentence", runID: "" })).toBeUndefined()
+      expect(interrupted).toEqual([])
     }),
   )
 })

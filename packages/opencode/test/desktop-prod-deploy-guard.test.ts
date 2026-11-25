@@ -13,6 +13,8 @@ import {
   filterCompetingWriters,
   MIN_BUILD_FREE_MEMORY_BYTES,
   minBuildFreeMemoryBytes,
+  ownedViteDevServer,
+  viteDevServerLaunch,
   parseDeployLock,
   type ProcessEntry,
 } from "../script/desktop-prod-deploy"
@@ -129,6 +131,32 @@ describe("desktop build prerequisites", () => {
     expect(() => assertNoCompetingWriters(entries, root, process.pid)).toThrow(
       /build blocked: 2 competing process\(es\).*PID 4321 bun\.exe/,
     )
+  })
+
+  test("pauses only this checkout's exact Vite dev process tree", () => {
+    const root = "E:\\GitRepros\\opencode"
+    const entries: ProcessEntry[] = [
+      { pid: 10, name: "bun.exe", commandLine: "bun  run dev ", parentPid: 1 },
+      { pid: 11, name: "vite.exe", commandLine: `${root}\\packages\\app\\node_modules\\.bin\\vite.exe`, parentPid: 10 },
+      { pid: 12, name: "node.exe", commandLine: `node "${root}\\packages\\app\\node_modules\\vite\\bin\\vite.js"`, parentPid: 11 },
+      { pid: 14, name: "conhost.exe", commandLine: "\\??\\C:\\WINDOWS\\system32\\conhost.exe 0x4", parentPid: 11 },
+    ]
+    expect(ownedViteDevServer(entries, root)?.pid).toBe(10)
+    expect(ownedViteDevServer(entries.map((entry) => entry.pid === 10 ? { ...entry, commandLine: 'C:\\Users\\crisc\\.bun\\bin\\bun.exe run dev' } : entry), root)?.pid).toBe(10)
+    expect(ownedViteDevServer(entries, "C:\\GitRepros\\opencode")).toBeUndefined()
+    expect(ownedViteDevServer([...entries, { pid: 13, parentPid: 11, name: "python.exe", commandLine: "python writer.py" }], root)).toBeUndefined()
+    expect(ownedViteDevServer(entries.map((entry) => entry.pid === 10 ? { ...entry, commandLine: "bun run test" } : entry), root)).toBeUndefined()
+    expect(viteDevServerLaunch(root)).toEqual({ command: [process.execPath, "run", "dev"], cwd: path.join(root, "packages", "app") })
+    const options = "--host 127.0.0.1 --port 5192 --strictPort"
+    const configured = entries.map((entry) => ({
+      ...entry,
+      commandLine: entry.pid === 10 ? `"C:\\Users\\crisc\\.bun\\bin\\bun.exe" run dev ${options}` :
+        entry.pid === 11 || entry.pid === 12 ? `${entry.commandLine} ${options}` : entry.commandLine,
+    }))
+    const owned = ownedViteDevServer(configured, root)
+    expect(owned?.pid).toBe(10)
+    expect(viteDevServerLaunch(root, owned).command).toEqual([process.execPath, "run", "dev", "--host", "127.0.0.1", "--port", "5192", "--strictPort"])
+    expect(ownedViteDevServer(configured.map((entry) => entry.pid === 12 ? { ...entry, commandLine: "node other.js" } : entry), root)).toBeUndefined()
   })
 
   test("detects source changes for both guarded build phases", () => {

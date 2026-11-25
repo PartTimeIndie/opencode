@@ -12,6 +12,7 @@ import { Tools } from "./tools"
 import { SurfaceTool } from "./surface"
 import { NonNegativeInt } from "../schema"
 import { dailyReviewBuildPrompt, dailyReviewHandoffMarkdown } from "./agent-handoff"
+import { dailyReviewPlanFormatError, dailyReviewSnapshotBindings } from "./daily-review-plan"
 
 export { dailyReviewBuildPrompt } from "./agent-handoff"
 
@@ -51,7 +52,7 @@ export function confirmation(
     return
   if (request.tool.purpose === dailyReviewPurpose) {
     const snapshot = request.tool.planDocument
-    if (!snapshot?.sha256 || snapshot.markdown === undefined) return
+    if (!snapshot?.sha256 || snapshot.markdown === undefined || !dailyReviewSnapshotBindings(snapshot.markdown)) return
     if (
       step.agent !== "build" ||
       step.prompt !== dailyReviewBuildPrompt ||
@@ -164,6 +165,8 @@ export const layer = Layer.effectDiscard(
                 : undefined
               if (input.purpose === dailyReviewPurpose && !planDocument)
                 return yield* new Tool.Failure({ message: "A Daily Review handoff requires a current durable plan document" })
+              if (input.purpose === dailyReviewPurpose && planDocument && !dailyReviewSnapshotBindings(planDocument.markdown))
+                return yield* new Tool.Failure({ message: dailyReviewPlanFormatError })
 
               const request = yield* surface
                 .present({

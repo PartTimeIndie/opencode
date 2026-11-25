@@ -38,6 +38,34 @@ for (const directory of ["/workspace/allowed", "/workspace/other"]) {
   )
 
   describe(`agent tool policy in ${directory}`, () => {
+    it.effect("inherits newly registered tools while keeping targeted and bounded-agent denies", () =>
+      Effect.gen(function* () {
+        const config = Config.Service.of({ entries: () => Effect.succeed([
+          new Config.Document({ type: "document", info: decode({ agents: {
+            build: { tools: { mode: "inherit", entries: {
+              read: { visible: true, permission: "allow" }, bash: { visible: false, permission: "deny" },
+            } } },
+            bounded: { tools: { mode: "inherit", entries: {
+              "*": { visible: false, permission: "deny" }, read: { visible: true, permission: "allow" },
+            } } },
+          } }) }),
+          new Config.Document({ type: "document", info: decode({ agents: {
+            build: { tools: { mode: "inherit", entries: { read: { permission: "ask" } } } },
+          } }) }),
+        ]) })
+        yield* ConfigAgentPlugin.Plugin.effect.pipe(Effect.provideService(Config.Service, config))
+        const agents = yield* AgentV2.Service
+        const registry = yield* ToolRegistry.Service
+        yield* registry.register({ read: make(), bash: make(), future_tool: make() })
+        const build = yield* agents.get(AgentV2.ID.make("build"))
+        const bounded = yield* agents.get(AgentV2.ID.make("bounded"))
+        if (!build || !bounded) throw new Error("Expected inherited agents")
+        const request = yield* registry.materialize(build.permissions, build.tools)
+        expect(request.definitions.map((tool) => tool.name)).toEqual(["read", "future_tool"])
+        const restricted = yield* registry.materialize(bounded.permissions, bounded.tools)
+        expect(restricted.definitions.map((tool) => tool.name)).toEqual(["read"])
+      }),
+    )
     it.effect("filters host tools through the project allowlist without bypassing central project restrictions", () =>
       Effect.gen(function* () {
         const config = Config.Service.of({

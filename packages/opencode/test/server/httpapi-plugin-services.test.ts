@@ -28,96 +28,320 @@ const stateLayer = Layer.effectDiscard(
 const it = testEffect(Layer.mergeAll(stateLayer, httpApiLayer, Config.defaultLayer))
 
 describe("external plugin services over HTTP", () => {
-  it.live("serializes optional service fields and rejects outputs without a JSON representation", () =>
-    Effect.gen(function* () {
-      const fixture = yield* setup({ capabilities: ["services:neutral-server:json"] })
-      const response = yield* call(fixture, "json", "optional")
-      expect({ status: response.status, body: yield* response.json }).toEqual({
-        status: 200, body: { ok: true, data: { nested: { keep: 1 }, values: [null, "present"] } },
-      })
-      const invalid = yield* call(fixture, "json", "bigint")
-      expect(invalid.status).toBe(503)
-      expect(yield* invalid.json).toMatchObject({ message: "Plugin service output is not JSON serializable" })
-    }), 30_000)
-  for (const pluginID of ["opencode-runtime-services", "opencode-scheduler"]) {
-    it.live(`loads the actual ${pluginID} package through its directory entry and lists over HTTP`, () =>
+  it.live(
+    "retired orchestrator service has no public route for any former operation",
+    () =>
       Effect.gen(function* () {
-        const fixture = yield* setup({
-          serverPackage: pluginID,
-          capabilities: [`services:${pluginID}:${pluginID === "opencode-scheduler" ? "jobs" : "list"}`],
-        })
-        const result = yield* call(fixture, pluginID === "opencode-scheduler" ? "jobs" : "list",
-          pluginID === "opencode-scheduler" ? { method: "GET", path: "/scheduler/jobs" } : {}, { pluginID })
-        const body = yield* result.json
-        expect({ status: result.status, body }).toMatchObject({ status: 200, body: { ok: true } })
-        expect(body).toMatchObject(pluginID === "opencode-scheduler"
-          ? { data: { status: 200, body: { success: true, data: { jobs: [{ slug: "read-only-fixture" }] } } } }
-          : { data: { ok: true } })
-      }), 30_000)
-  }
+        const fixture = yield* setup({ capabilities: ["host:sessions"] })
+        const fallback = yield* HttpClient.execute(HttpClientRequest.get("/"))
+        const html = yield* fallback.text
+        expect(fallback.headers["content-type"]).toContain("text/html")
+        const request = (
+          operation: unknown,
+          hash = fixture.hash,
+          directory = fixture.directory,
+          id = "ses_retired_route_probe",
+        ) =>
+          HttpClientRequest.post(`/app/host/session-orchestrator?directory=${encodeURIComponent(directory)}`).pipe(
+            HttpClientRequest.bodyJson({
+              caller: { id: "service-caller", version: fixture.version, hash },
+              sessionID: id,
+              operation,
+            }),
+            Effect.flatMap(HttpClient.execute),
+          )
+        // Unknown routes receive the generic SPA, not a legacy JSON operation.
+        // Route/schema absence is also pinned by httpapi-public-openapi.test.ts.
+        for (const action of ["get", "configure", "control", "cancel", "cleanup", "review", "integrate", "retire", "recordCache"]) {
+          const response = yield* request({ action })
+          expect(response.status).toBe(fallback.status)
+          expect(response.headers["content-type"]).toContain("text/html")
+          expect(yield* response.text).toBe(html)
+        }
+        const forged = yield* request({ action: "get" }, "forged")
+        expect(forged.headers["content-type"]).toContain("text/html")
+        expect(yield* forged.text).toBe(html)
+      }),
+    30_000,
+  )
 
-  it.live("provides the real Session service to external plugin callbacks", () =>
-    Effect.gen(function* () {
-      const fixture = yield* setup()
-      const response = yield* HttpClientRequest.post("/api/session").pipe(
-        HttpClientRequest.bodyJson({ location: { directory: fixture.directory } }),
-        Effect.flatMap(HttpClient.execute),
-      )
-      expect(response.status).toBe(200)
-      const target = (yield* response.json) as { data: { id: string } }
-      const opened = yield* call(fixture, "sessions", target.data.id)
-      const body = yield* opened.json
-      expect(body).toMatchObject({ ok: true, data: { exists: true, link: { targetSessionID: target.data.id } } })
-      expect(opened.status).toBe(200)
-      const result = body as { data: { link: { sourceSessionID: string } } }
-      const source = yield* HttpClientRequest.get(`/api/session/${result.data.link.sourceSessionID}`).pipe(HttpClient.execute)
-      expect(source.status).toBe(200)
-      expect(yield* source.json).toMatchObject({ data: { id: result.data.link.sourceSessionID, title: "Neutral plugin conversation" } })
-    }), 30_000)
-  it.live("authorizes session policy access and rejects foreign sessions and forged callers", () =>
-    Effect.gen(function* () {
-      const fixture = yield* setup({ capabilities: ["host:session-policy"] })
-      const create = yield* HttpClientRequest.post("/api/session").pipe(
-        HttpClientRequest.bodyJson({ location: { directory: fixture.directory } }),
-        Effect.flatMap(HttpClient.execute),
-      )
-      expect(create.status).toBe(200)
-      const created = (yield* create.json) as { data: { id: string } }
-      const seeded = yield* HttpClientRequest.patch(`/session/${created.data.id}?directory=${encodeURIComponent(fixture.directory)}`).pipe(
-        HttpClientRequest.bodyJson({ metadata: { retained: "value", access_control: { mode: "full_access", extra: "preserved", safety_review: { model: "test/reviewer" } } } }),
-        Effect.flatMap(HttpClient.execute),
-      )
-      expect(seeded.status).toBe(200)
-      expect(yield* seeded.json).toMatchObject({ metadata: { retained: "value" } })
-      const request = (action: "read" | "write", extra: Record<string, unknown> = {}, hash = fixture.hash, directory = fixture.directory) =>
-        HttpClientRequest.post(`/app/host/session-policy?directory=${encodeURIComponent(directory)}`).pipe(
-          HttpClientRequest.bodyJson({ caller: { id: "service-caller", version: fixture.version, hash }, action, ...extra }),
+  it.live(
+    "retired service is absent even for a missing session",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup({ capabilities: ["host:sessions"] })
+        const response = yield* HttpClientRequest.post(
+          `/app/host/session-orchestrator?directory=${encodeURIComponent(fixture.directory)}`,
+        ).pipe(
+          HttpClientRequest.bodyJson({
+            caller: { id: "service-caller", version: fixture.version, hash: fixture.hash },
+            sessionID: "ses_missing",
+            operation: { action: "get" },
+          }),
           Effect.flatMap(HttpClient.execute),
         )
-      expect((yield* request("read", {}, "forged")).status).toBe(403)
-      expect(yield* (yield* request("read")).json).toEqual({ ok: true, mode: "approve_for_me" })
-      expect((yield* request("read", { sessionID: "ses_missing" })).status).toBe(400)
-      expect((yield* request("write", { mode: "full_access" })).status).toBe(400)
-      const write = yield* request("write", { sessionID: created.data.id, mode: "ask" })
-      expect(write.status).toBe(200)
-      expect(yield* write.json).toEqual({ ok: true, mode: "ask" })
-      const read = yield* request("read", { sessionID: created.data.id })
-      expect(yield* read.json).toEqual({ ok: true, mode: "ask" })
-      const after = yield* HttpClientRequest.get(`/api/session/${created.data.id}`).pipe(HttpClient.execute)
-      expect((yield* after.json) as unknown).toMatchObject({ data: { metadata: { retained: "value", access_control: { mode: "ask", extra: "preserved", safety_review: { model: "test/reviewer" } } } } })
-      const foreign = yield* tmpdirScoped({ git: true })
-      expect((yield* request("write", { sessionID: created.data.id, mode: "full_access" }, fixture.hash, foreign)).status).toBe(403)
-    }), 30_000)
+        const fallback = yield* HttpClient.execute(HttpClientRequest.get("/"))
+        expect(response.status).toBe(fallback.status)
+        expect(response.headers["content-type"]).toContain("text/html")
+        expect(yield* response.text).toBe(yield* fallback.text)
+      }),
+    30_000,
+  )
 
-  it.live("requires the explicit policy capability even for a valid plugin identity", () =>
-    Effect.gen(function* () {
-      const fixture = yield* setup()
-      const response = yield* HttpClientRequest.post(`/app/host/session-policy?directory=${encodeURIComponent(fixture.directory)}`).pipe(
-        HttpClientRequest.bodyJson({ caller: { id: "service-caller", version: fixture.version, hash: fixture.hash }, action: "read" }),
-        Effect.flatMap(HttpClient.execute),
-      )
-      expect(response.status).toBe(403)
-    }), 30_000)
+  it.live(
+    "controls the session goal through the fixed plugin service with the validated session",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup({ goalControl: true })
+        const created = yield* HttpClientRequest.post(`/api/session?directory=${encodeURIComponent(fixture.directory)}`).pipe(
+          HttpClientRequest.bodyJson({ location: { directory: fixture.directory } }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        expect(created.status).toBe(200)
+        const session = (yield* created.json) as { data: { id: string } }
+        const request = (body: Record<string, unknown>, directory = fixture.directory, id = session.data.id) =>
+          HttpClientRequest.post(`/app/host/session-goal?directory=${encodeURIComponent(directory)}`).pipe(
+            HttpClientRequest.bodyJson({ ...body, sessionID: id }),
+            Effect.flatMap(HttpClient.execute),
+          )
+
+        const pause = yield* request({ action: "pause", operationID: "op-pause-1" })
+        expect(pause.status).toBe(200)
+        // Derived goal state must not be cached like a static resource.
+        expect(pause.headers["cache-control"]).toBe("no-store")
+        const paused = (yield* pause.json) as { ok: true; data: { ok: boolean; runID: string; controlRevision: number; status: { stopped: boolean; controlRevision: number } } }
+        expect(paused.data.ok).toBe(true)
+        expect(paused.data.runID).toBe("run-1")
+        expect(paused.data.controlRevision).toBe(1)
+        expect(paused.data.status.stopped).toBe(true)
+
+        // The forwarded identity is fixed: the validated session and the
+        // plugin's own caller id, never a request-chosen target.
+        const calls = yield* Effect.promise(() => Bun.file(path.join(fixture.directory, "goal-control-calls.jsonl")).text())
+        const lines = calls.trim().split("\n").map((line) => JSON.parse(line) as {
+          value: { sessionID: string; action: string }
+          contextSessionID: string | undefined
+          callerPluginID: string
+        })
+        expect(lines).toHaveLength(1)
+        expect(lines[0].value.sessionID).toBe(session.data.id)
+        expect(lines[0].contextSessionID).toBe(session.data.id)
+        expect(lines[0].callerPluginID).toBe("opencode-goal-plugin")
+
+        // Idempotent operation: the same operation id returns the recorded
+        // outcome without another revision bump.
+        const repeated = yield* request({ action: "pause", operationID: "op-pause-1" })
+        expect(((yield* repeated.json) as { data: { repeated?: boolean; controlRevision: number } }).data).toMatchObject({
+          repeated: true,
+          controlRevision: 1,
+        })
+
+        const resume = yield* request({ action: "resume", operationID: "op-resume-1" })
+        expect(((yield* resume.json) as { data: { ok: boolean; controlRevision: number; status: { stopped: boolean } } }).data).toMatchObject({
+          ok: true,
+          controlRevision: 2,
+          status: { stopped: false },
+        })
+
+        // Semantic rejections are explicit outputs, not server errors.
+        const staleRun = yield* request({ action: "pause", operationID: "op-stale", runID: "run-old" })
+        expect(staleRun.status).toBe(200)
+        expect(((yield* staleRun.json) as { data: { ok: boolean; error: string } }).data).toMatchObject({
+          ok: false,
+          error: "stale-run",
+        })
+        const staleRevision = yield* request({ action: "pause", operationID: "op-rev", expectedRevision: 99 })
+        expect(((yield* staleRevision.json) as { data: { ok: boolean; error: string } }).data).toMatchObject({
+          ok: false,
+          error: "revision",
+        })
+        const invalidAction = yield* request({ action: "rewind", operationID: "op-bad" })
+        expect(invalidAction.status).toBe(400)
+        const missingSession = yield* request(
+          { action: "pause", operationID: "op-missing" },
+          fixture.directory,
+          "ses_missing",
+        )
+        expect(missingSession.status).toBe(400)
+        const foreign = yield* tmpdirScoped({ git: true })
+        const foreignResponse = yield* request({ action: "pause", operationID: "op-foreign" }, foreign)
+        expect(foreignResponse.status).toBe(403)
+      }),
+    60_000,
+  )
+
+  it.live(
+    "reports the goal control as unavailable without a loaded goal plugin",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup({})
+        const created = yield* HttpClientRequest.post(`/api/session?directory=${encodeURIComponent(fixture.directory)}`).pipe(
+          HttpClientRequest.bodyJson({ location: { directory: fixture.directory } }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        const session = (yield* created.json) as { data: { id: string } }
+        const response = yield* HttpClientRequest.post(
+          `/app/host/session-goal?directory=${encodeURIComponent(fixture.directory)}`,
+        ).pipe(
+          HttpClientRequest.bodyJson({ sessionID: session.data.id, action: "pause", operationID: "op-1" }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        expect(response.status).toBe(503)
+      }),
+    60_000,
+  )
+  it.live(
+    "serializes optional service fields and rejects outputs without a JSON representation",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup({ capabilities: ["services:neutral-server:json"] })
+        const response = yield* call(fixture, "json", "optional")
+        expect({ status: response.status, body: yield* response.json }).toEqual({
+          status: 200,
+          body: { ok: true, data: { nested: { keep: 1 }, values: [null, "present"] } },
+        })
+        const invalid = yield* call(fixture, "json", "bigint")
+        expect(invalid.status).toBe(503)
+        expect(yield* invalid.json).toMatchObject({ message: "Plugin service output is not JSON serializable" })
+      }),
+    30_000,
+  )
+  for (const pluginID of ["opencode-runtime-services", "opencode-scheduler"]) {
+    it.live(
+      `loads the actual ${pluginID} package through its directory entry and lists over HTTP`,
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* setup({
+            serverPackage: pluginID,
+            capabilities: [`services:${pluginID}:${pluginID === "opencode-scheduler" ? "jobs" : "list"}`],
+          })
+        AppPluginAssets.invalidate()
+          const result = yield* call(
+            fixture,
+            pluginID === "opencode-scheduler" ? "jobs" : "list",
+            pluginID === "opencode-scheduler" ? { method: "GET", path: "/scheduler/jobs" } : {},
+            { pluginID },
+          )
+          const body = yield* result.json
+          expect({ status: result.status, body }).toMatchObject({ status: 200, body: { ok: true } })
+          expect(body).toMatchObject(
+            pluginID === "opencode-scheduler"
+              ? { data: { status: 200, body: { success: true, data: { jobs: [{ slug: "read-only-fixture" }] } } } }
+              : { data: { ok: true } },
+          )
+        }),
+      30_000,
+    )
+  }
+
+  it.live(
+    "provides the real Session service to external plugin callbacks",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup()
+        const response = yield* HttpClientRequest.post(`/api/session?directory=${encodeURIComponent(fixture.directory)}`).pipe(
+          HttpClientRequest.bodyJson({ location: { directory: fixture.directory } }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        expect(response.status).toBe(200)
+        const target = (yield* response.json) as { data: { id: string } }
+        const opened = yield* call(fixture, "sessions", target.data.id)
+        const body = yield* opened.json
+        expect(body).toMatchObject({ ok: true, data: { exists: true, link: { targetSessionID: target.data.id } } })
+        expect(opened.status).toBe(200)
+        const result = body as { data: { link: { sourceSessionID: string } } }
+        const source = yield* HttpClientRequest.get(`/api/session/${result.data.link.sourceSessionID}`).pipe(
+          HttpClient.execute,
+        )
+        expect(source.status).toBe(200)
+        expect(yield* source.json).toMatchObject({
+          data: { id: result.data.link.sourceSessionID, title: "Neutral plugin conversation" },
+        })
+      }),
+    30_000,
+  )
+  it.live(
+    "authorizes session policy access and rejects foreign sessions and forged callers",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup({ capabilities: ["host:session-policy"] })
+        const create = yield* HttpClientRequest.post(`/api/session?directory=${encodeURIComponent(fixture.directory)}`).pipe(
+          HttpClientRequest.bodyJson({ location: { directory: fixture.directory } }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        expect(create.status).toBe(200)
+        const created = (yield* create.json) as { data: { id: string } }
+        const seeded = yield* HttpClientRequest.patch(
+          `/session/${created.data.id}?directory=${encodeURIComponent(fixture.directory)}`,
+        ).pipe(
+          HttpClientRequest.bodyJson({
+            metadata: {
+              retained: "value",
+              access_control: { mode: "full_access", extra: "preserved", safety_review: { model: "test/reviewer" } },
+            },
+          }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        expect(seeded.status).toBe(200)
+        expect(yield* seeded.json).toMatchObject({ metadata: { retained: "value" } })
+        const request = (
+          action: "read" | "write",
+          extra: Record<string, unknown> = {},
+          hash = fixture.hash,
+          directory = fixture.directory,
+        ) =>
+          HttpClientRequest.post(`/app/host/session-policy?directory=${encodeURIComponent(directory)}`).pipe(
+            HttpClientRequest.bodyJson({
+              caller: { id: "service-caller", version: fixture.version, hash },
+              action,
+              ...extra,
+            }),
+            Effect.flatMap(HttpClient.execute),
+          )
+        expect((yield* request("read", {}, "forged")).status).toBe(403)
+        expect(yield* (yield* request("read")).json).toEqual({ ok: true, mode: "approve_for_me" })
+        expect((yield* request("read", { sessionID: "ses_missing" })).status).toBe(400)
+        expect((yield* request("write", { mode: "full_access" })).status).toBe(400)
+        const write = yield* request("write", { sessionID: created.data.id, mode: "ask" })
+        expect(write.status).toBe(200)
+        expect(yield* write.json).toEqual({ ok: true, mode: "ask" })
+        const read = yield* request("read", { sessionID: created.data.id })
+        expect(yield* read.json).toEqual({ ok: true, mode: "ask" })
+        const after = yield* HttpClientRequest.get(`/api/session/${created.data.id}`).pipe(HttpClient.execute)
+        expect((yield* after.json) as unknown).toMatchObject({
+          data: {
+            metadata: {
+              retained: "value",
+              access_control: { mode: "ask", extra: "preserved", safety_review: { model: "test/reviewer" } },
+            },
+          },
+        })
+        const foreign = yield* tmpdirScoped({ git: true })
+        expect(
+          (yield* request("write", { sessionID: created.data.id, mode: "full_access" }, fixture.hash, foreign)).status,
+        ).toBe(403)
+      }),
+    30_000,
+  )
+
+  it.live(
+    "requires the explicit policy capability even for a valid plugin identity",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup()
+        const response = yield* HttpClientRequest.post(
+          `/app/host/session-policy?directory=${encodeURIComponent(fixture.directory)}`,
+        ).pipe(
+          HttpClientRequest.bodyJson({
+            caller: { id: "service-caller", version: fixture.version, hash: fixture.hash },
+            action: "read",
+          }),
+          Effect.flatMap(HttpClient.execute),
+        )
+        expect(response.status).toBe(403)
+      }),
+    30_000,
+  )
 
   it.live(
     "routes encoded scoped plugin identities without granting unrelated targets",
@@ -251,7 +475,9 @@ function call(
   )
 }
 
-function setup(options: { capabilities?: string[]; failInitialization?: boolean; serverID?: string; serverPackage?: string } = {}) {
+function setup(
+  options: { capabilities?: string[]; failInitialization?: boolean; serverID?: string; serverPackage?: string; goalControl?: boolean } = {},
+) {
   return Effect.gen(function* () {
     const directory = yield* tmpdirScoped({ git: true })
     const config = yield* Config.Service
@@ -287,13 +513,63 @@ function setup(options: { capabilities?: string[]; failInitialization?: boolean;
             app: {
               capabilities:
                 options.capabilities ??
-                ["echo", "double", "broken", "sessions"].map((id) => `services:${options.serverID ?? "neutral-server"}:${id}`),
+                ["echo", "double", "broken", "sessions"].map(
+                  (id) => `services:${options.serverID ?? "neutral-server"}:${id}`,
+                ),
             },
           },
         }),
       )
       await Bun.write(path.join(appDirectory, "index.js"), "export default { id: 'service-caller', app() {} }")
       const file = path.join(directory, "neutral-server.ts")
+      if (options.goalControl) {
+        // Mimics the external goal plugin's control contract: same service id,
+        // version and session binding, so the built-in endpoint is exercised
+        // against the real host boundary without loading the real plugin.
+        await Bun.write(
+          path.join(directory, "goal-control-server.ts"),
+          `
+          import { z } from ${JSON.stringify(import.meta.resolve("zod"))}
+          export default {
+            id: "opencode-goal-plugin",
+            async server(input) {
+              const goals = new Map()
+              input.services.register({
+                id: "control", version: 1,
+                input: z.object({
+                  sessionID: z.string(),
+                  action: z.enum(["pause", "resume"]),
+                  operationID: z.string(),
+                  runID: z.string().optional(),
+                  expectedRevision: z.number().int().nonnegative().optional(),
+                }),
+                output: z.unknown(),
+                async execute(value, context) {
+                  await Bun.write(input.directory + "/goal-control-calls.jsonl", JSON.stringify({
+                    value, contextSessionID: context.sessionID, callerPluginID: context.callerPluginID,
+                  }) + "\\n", { append: true })
+                  if (context.sessionID && value.sessionID !== context.sessionID)
+                    return { ok: false, error: "session-mismatch", runID: "", controlRevision: 0 }
+                  const goal = goals.get(value.sessionID) ?? { runID: "run-1", controlRevision: 0, stopped: false, receipts: new Map() }
+                  goals.set(value.sessionID, goal)
+                  if (value.runID && value.runID !== goal.runID)
+                    return { ok: false, error: "stale-run", runID: goal.runID, controlRevision: goal.controlRevision }
+                  const known = goal.receipts.get(value.operationID)
+                  if (known) return { ...known, repeated: true }
+                  if (value.expectedRevision !== undefined && value.expectedRevision !== goal.controlRevision)
+                    return { ok: false, error: "revision", runID: goal.runID, controlRevision: goal.controlRevision }
+                  if (value.action === "pause" && !goal.stopped) { goal.stopped = true; goal.controlRevision += 1 }
+                  if (value.action === "resume" && goal.stopped) { goal.stopped = false; goal.controlRevision += 1 }
+                  const outcome = { ok: true, runID: goal.runID, controlRevision: goal.controlRevision, status: { runID: goal.runID, condition: "ship it", phase: "working", stopped: goal.stopped, stopReason: goal.stopped ? "paused" : "" } }
+                  goal.receipts.set(value.operationID, outcome)
+                  return outcome
+                },
+              })
+            },
+          }
+        `,
+        )
+      }
       await Bun.write(
         file,
         `
@@ -337,17 +613,39 @@ function setup(options: { capabilities?: string[]; failInitialization?: boolean;
         // Use the durable package source and its real manifest, then detach the generated bundle.
         const source = path.resolve(import.meta.dirname, "../../../../..", options.serverPackage)
         const manifest = await Bun.file(path.join(source, "package.json")).json()
-        const result = await Bun.build({ entrypoints: [path.join(source, "src/index.ts")], outdir: path.join(packageDirectory, "dist"), target: "node" })
+        const result = await Bun.build({
+          entrypoints: [path.join(source, "src/index.ts")],
+          outdir: path.join(packageDirectory, "dist"),
+          target: "node",
+        })
         if (!result.success) throw new AggregateError(result.logs, "Server package build failed")
         await Bun.write(path.join(packageDirectory, "package.json"), JSON.stringify(manifest))
         if (options.serverPackage === "opencode-scheduler") {
-          await Bun.write(path.join(directory, "isolated-plugin-config/opencode/scheduler/scopes/test/jobs/read-only-fixture.json"), JSON.stringify({
-            scopeId: "test", slug: "read-only-fixture", name: "Read-only fixture", schedule: "0 9 * * *", prompt: "Never executed",
-          }))
+          await Bun.write(
+            path.join(directory, "isolated-plugin-config/opencode/scheduler/scopes/test/jobs/read-only-fixture.json"),
+            JSON.stringify({
+              scopeId: "test",
+              slug: "read-only-fixture",
+              name: "Read-only fixture",
+              schedule: "0 9 * * *",
+              prompt: "Never executed",
+            }),
+          )
         }
       }
-      await Bun.write(path.join(directory, "opencode.json"), JSON.stringify({ plugin: [pathToFileURL(options.serverPackage ? packageDirectory + path.sep : file).href] }))
-      await Promise.all([markPluginDependenciesReady(directory), markPluginDependenciesReady(path.join(directory, ".opencode"))])
+      await Bun.write(
+        path.join(directory, "opencode.json"),
+        JSON.stringify({
+          plugin: [
+            pathToFileURL(options.serverPackage ? packageDirectory + path.sep : file).href,
+            ...(options.goalControl ? [pathToFileURL(path.join(directory, "goal-control-server.ts")).href] : []),
+          ],
+        }),
+      )
+      await Promise.all([
+        markPluginDependenciesReady(directory),
+        markPluginDependenciesReady(path.join(directory, ".opencode")),
+      ])
     })
     yield* config.invalidate()
     AppPluginAssets.resetForTesting()

@@ -2,7 +2,7 @@ export * as SessionMirror from "./mirror"
 
 import { createHash } from "crypto"
 import type { FileMutation } from "../file-mutation"
-import { OrchestratorCheckout } from "./orchestrator/checkout"
+import { WorkspaceCheckout } from "./workspace/checkout"
 
 export type Entry = {
   /** Canonical Main target resolved by the host, not a child-supplied path. */
@@ -28,7 +28,7 @@ export function prepareIntegration(entries: readonly Entry[]): Integration {
   const conflicts: string[] = []
   const changes: FileMutation.TransactionChange[] = []
   for (const entry of entries) {
-    const key = OrchestratorCheckout.pathKey(entry.target.canonical)
+    const key = WorkspaceCheckout.pathKey(entry.target.canonical)
     if (targets.has(key)) throw new Error("Duplicate mirror integration target")
     targets.add(key)
     const basis = digest(entry.basis)

@@ -87,7 +87,11 @@ export function startSessionActivity(
 ) {
   const id = key(directory, sessionID)
   if (evidence && activity[id]?.evidence && compareEvidence(evidence, activity[id].evidence) <= 0) return false
-  if (activityID && activity[id]?.activityID === activityID && activity[id]?.lifecycle) return false
+  if (activityID && activity[id]?.activityID === activityID && activity[id]?.lifecycle) {
+    // Consumers need the start time to distinguish a previous turn's completion.
+    if (evidence && !activity[id].evidence) setActivity(id, "evidence", evidence)
+    return false
+  }
   if (activityID && activity[id]?.closedActivityIDs?.includes(activityID)) {
     // A tracked close is terminal. Dual-pipeline replays still deliver the original
     // start after interrupt/complete; restoring busy made Stop look like it worked

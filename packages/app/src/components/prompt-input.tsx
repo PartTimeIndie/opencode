@@ -24,6 +24,7 @@ import type { useLocal } from "@/context/local"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
 import { encodeFilePath } from "@/context/file/path"
 import { insertPromptDraft, promptInsertionIdentity } from "@/context/prompt-insert"
+import { composerSendIntents, type PreparedComposerSubmission } from "@/plugin/composer-send-intent"
 import {
   ContentPart,
   DEFAULT_PROMPT,
@@ -75,6 +76,10 @@ import {
   type ComposerPickerState,
 } from "./prompt-input/composer-controls"
 import { ACCEPTED_FILE_TYPES, pickAttachmentFiles } from "./prompt-input/files"
+import { annotationScope, removeAnnotation } from "./image-annotation/storage"
+import { annotationLabels } from "./image-annotation/labels"
+import { promptImageBlob } from "./image-annotation/source"
+import { restoreAnnotations } from "./image-annotation/draft-controller"
 import { compactComposerToolbar } from "./prompt-input/composer-layout"
 import {
   canNavigateHistoryAtCursor,
@@ -88,7 +93,8 @@ import {
   promptLength,
   resumeLastPromptEntry,
 } from "./prompt-input/history"
-import { createPromptSubmit, type FollowupDraft, type PromptSubmitOptions } from "./prompt-input/submit"
+import { createPromptSubmit, type FollowupDraft, type PromptSubmitOptions, type PromptSubmitInput } from "./prompt-input/submit"
+import { createPreparedSubmit } from "./prompt-input/prepared-submit"
 import { preventNativeSubmit } from "./prompt-input/submit-event"
 import { PromptPopover, type AtOption, type SlashCommand } from "./prompt-input/slash-popover"
 import {
@@ -128,6 +134,7 @@ export type PromptInputHistory = {
 }
 
 export type PromptInputSubmission = {
+  capturePrepared?: () => PreparedComposerSubmission
   abort: () => Promise<void> | void
   handleSubmit: (event: Event, options?: PromptSubmitOptions) => Promise<void> | void
   submitText?: (input: {
@@ -152,6 +159,7 @@ export type PromptInputControls = {
     current: string
     loading: boolean
     visible: boolean
+    disabled?: boolean
     refresh: () => Promise<void>
     select: (name: string | undefined) => void
   }
@@ -161,6 +169,7 @@ export type PromptInputControls = {
     loading: boolean
     error: boolean
     retrying: boolean
+    handoffBusy?: boolean
     retry: () => void
   }
   projects: {
@@ -522,7 +531,34 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const promptAttachmentUrl = (attachment: PromptAttachmentPart) =>
     attachment.dataUrl ?? (attachment.sourcePath ? `file://${encodeFilePath(attachment.sourcePath)}` : undefined)
 
+  const annotationTarget = () => annotationScope(sdk().scope, sdk().directory, props.controls.session.id, props.draftID)
+  let annotationOpen = false
+  createEffect(() => {
+    const scope = annotationTarget()
+    const ready = prompt.ready().promise
+    if (typeof indexedDB === "undefined") return
+    let disposed = false
+    onCleanup(() => { disposed = true })
+    void Promise.resolve(ready).then(() => restoreAnnotations(scope, () => prompt.current(), (next) => {
+      if (!disposed && annotationTarget() === scope) prompt.set(next, prompt.cursor())
+    })).catch((error: unknown) => { if (!disposed) showToast({ title: language.t("common.error"), description: String(error) }) })
+  })
   const openPromptAttachment = (attachment: PromptAttachmentPart) => {
+    if (/^image\/(png|jpeg|webp)$/.test(attachment.mime)) {
+      if (annotationOpen) return
+      annotationOpen = true
+      const scope = annotationTarget()
+      const host = sdk()
+      const http = server.current?.http
+      const version = JSON.stringify(attachment.annotation)
+      const current = () => annotationTarget() === scope && prompt.current().some((part) => part.type === "image" && part.id === attachment.id && JSON.stringify(part.annotation) === version)
+      void import("./image-annotation/open").then(({ editImage }) => editImage({
+        part: { ...attachment }, scope, labels: annotationLabels(language.t), current,
+        source: () => promptImageBlob({ part: attachment, serverUrl: host.url, directory: host.directory, sessionID: props.controls.session.id, username: http?.username, password: http?.password, fetch: platform.fetch ?? fetch }),
+        apply: (part) => { if (!current()) throw new Error("The image changed while editing"); prompt.set(prompt.current().map((value) => value.type === "image" && value.id === part.id ? part : value), prompt.cursor()) },
+      })).catch((error: unknown) => showToast({ title: language.t("common.error"), description: String(error) })).finally(() => { annotationOpen = false })
+      return
+    }
     const url = promptAttachmentUrl(attachment)
     if (!url) return
     setActivePromptAttachment({
@@ -1619,18 +1655,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
   })
 
-  const submission =
-    props.submission ??
-    createPromptSubmit({
+  const submitInput: PromptSubmitInput = {
       beforeSubmit: async (context) => {
         const result = await composerRegistry.runBeforeSubmit({
           serverID: server.key,
           directory: context.directory,
           sessionID: context.sessionID,
           composerID,
-        }, context)
+        }, context, { finalAppend: context.standardAppend })
         if (!result.ok && result.error) showToast({ variant: "error", title: "Prompt not sent", description: result.error })
-        return result.ok
+        return result.ok && result.commit ? { commit: result.commit } : result.ok
       },
       prompt,
       info,
@@ -1657,9 +1691,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       onGoal: props.onGoal,
       onAbort: props.onAbort,
       onSubmit: props.onSubmit,
-    })
+    }
+  const submission = props.submission ?? { ...createPromptSubmit(submitInput), capturePrepared: createPreparedSubmit(submitInput) }
   const abort = submission.abort
   const handleSubmit = submission.handleSubmit
+
+  const sendTarget = () => ({ serverID: server.key, directory: props.controls.projects.directory, sessionID: props.controls.session.id, composerID })
+  const [preparationVersion, setPreparationVersion] = createSignal(0)
+  onCleanup(composerSendIntents.subscribe(() => setPreparationVersion((value) => value + 1)))
+  const preparationAvailable = () => { preparationVersion(); return store.mode === "normal" && composerSendIntents.available(sendTarget()) }
+  const preparationPending = () => { preparationVersion(); return composerSendIntents.busy(sendTarget()) }
 
   createEffect(() => {
     const target = {
@@ -1675,12 +1716,15 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         composerID,
         text: promptText(),
         mode: store.mode,
+        agent: props.controls.agents.current,
         model: ((model) => model ? `${model.provider.id}/${model.id}` : undefined)(props.controls.model.selection.current()),
       }),
       change: setPromptText,
       appendText: appendPromptText,
       insertText(input) {
         if (store.mode !== "normal") return { ok: false, error: "Composer is not available for text insertion" }
+        const before = JSON.parse(JSON.stringify(prompt.current())) as Prompt
+        const cursor = prompt.cursor() ?? promptText().length
         const inserted = insertPromptDraft(
           prompt,
           input,
@@ -1692,7 +1736,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           }),
         )
         if (inserted.ok) requestAnimationFrame(() => focusEditor())
-        return inserted
+        return { ...inserted, insertionReceiptID: inserted.ok && input.operationID
+          ? composerSendIntents.recordInsertion(input, input.operationID, before, prompt.current(), input.text, cursor,
+              input.replace ? { replace: input.replace, cursor: prompt.cursor() ?? cursor } : undefined) : undefined }
       },
       async submitText(text) {
         if (props.disabled) return { ok: false, error: "Composer is disabled" }
@@ -1718,6 +1764,27 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
     if (submitPending()) return Promise.resolve()
 
+    if (preparationAvailable()) {
+      handleInput()
+      const target = sendTarget()
+      return composerSendIntents.submit(target, () => {
+        try {
+          if (!submission.capturePrepared) throw new Error("This composer does not support prepared submission")
+          return submission.capturePrepared()
+        } catch (error) {
+          showToast({ variant: "error", title: language.t("prompt.toast.promptSendFailed.title"), description: error instanceof Error ? error.message : String(error) })
+          throw error
+        }
+      }, composerRegistry.leaseBeforeSubmit(target))?.then((result) => {
+        if (result.status === "admitted") clearTemporarySelection(false)
+      })
+    }
+
+    if (composerSendIntents.ambiguousCommand(sendTarget(), prompt.current())) {
+      showToast({ variant: "error", title: language.t("prompt.toast.commandSendFailed.title"), description: "The previous request may already have run. Edit the command before submitting it again." })
+      return Promise.resolve()
+    }
+
     // An empty idle composer submit restarts the last agent run, mirroring the Enter-key behavior.
     if (!options?.resume && blank() && !working() && resumeLastPrompt(event)) return Promise.resolve()
 
@@ -1741,6 +1808,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   })
 
   const resumeLastPrompt = (event: Event) => {
+    if (preparationAvailable()) return false
     const eligible = resumeLastPromptEntry({
       mode: store.mode,
       working: working(),
@@ -2162,7 +2230,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       event.preventDefault()
       event.stopPropagation()
       if (event.repeat) return
-      if (blank()) {
+      if (blank() && !preparationAvailable()) {
         if (working()) return
         // An empty idle composer restarts the last agent run instead of doing nothing
         if (resumeLastPrompt(event)) return
@@ -2202,6 +2270,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     paid: props.controls.model.paid,
     error: props.controls.model.error,
     retrying: props.controls.model.retrying,
+    disabled: props.controls.model.handoffBusy,
     onRetry: props.controls.model.retry,
     title: selectedChainLabel() ?? language.t("command.model.choose"),
     keybind: command.keybind("model.choose"),
@@ -2211,6 +2280,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     style: control(),
     onClose: restoreFocus,
     onUnpaidClick: () => {
+      if (props.controls.model.handoffBusy) return
       void import("@/components/dialog-select-model-unpaid").then((x) => {
         dialog.show(() => <x.DialogSelectModelUnpaid model={props.controls.model.selection} />)
       })
@@ -2230,7 +2300,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     <ProjectAvatar
       fallback={displayName(project)}
       src={getProjectAvatarSource(project.id, project.icon)}
-      monochrome={getProjectAvatarMonochrome(project.id)}
+      monochrome={getProjectAvatarMonochrome(project.id, project.icon)}
       variant={getProjectAvatarVariant(project.icon?.color)}
     />
   )
@@ -2303,13 +2373,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     options: props.controls.agents.options,
     current: props.controls.agents.current,
     open: store.agentOpen,
+    disabled: props.controls.agents.disabled,
     style: control(),
     onOpenChange: (open) => {
+      if (open && props.controls.agents.disabled) return
       setStore("agentOpen", open)
       if (open) void props.controls.agents.refresh()
     },
     onSelect: (value) => {
       if (!store.agentOpen) return
+      if (props.controls.agents.disabled) return
       props.controls.agents.select(value)
       restoreFocus()
     },
@@ -2397,8 +2470,24 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           <PromptAttachments
             attachments={promptAttachments()}
             onOpen={openPromptAttachment}
-            onRemove={removeAttachment}
+            onRemove={(id) => {
+              const part = prompt.current().find((value) => value.type === "image" && value.id === id)
+              if (part?.type !== "image" || !part.annotation) { removeAttachment(id); return }
+              const scope = annotationTarget()
+              const version = JSON.stringify(part.annotation)
+              void removeAnnotation(part.annotation).then(() => {
+                if (annotationTarget() !== scope) return
+                if (prompt.current().some((value) => value.type === "image" && value.id === id && JSON.stringify(value.annotation) === version)) removeAttachment(id)
+              }).catch((error: unknown) => showToast({ title: language.t("common.error"), description: String(error) }))
+            }}
             removeLabel={language.t("prompt.attachment.remove")}
+            unpackLabel={language.t("prompt.attachment.unpack")}
+            onUnpack={(id, unpack) =>
+              prompt.set(
+                prompt.current().map((part) => part.type === "image" && part.id === id ? { ...part, unpack } : part),
+                prompt.cursor(),
+              )
+            }
           />
           <div
             class="relative min-h-[52px]"
@@ -2507,10 +2596,14 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                     <Select
                       size="normal"
                       disallowEmptySelection
+                      disabled={props.controls.model.handoffBusy}
                       options={variants()}
                       current={props.controls.model.selection.variant.current() ?? "default"}
                       label={(x) => (x === "default" ? language.t("common.default") : x)}
-                      onOpenChange={(open) => setStore("variantOpen", open)}
+                      onOpenChange={(open) => {
+                        if (open && props.controls.model.handoffBusy) return
+                        setStore("variantOpen", open)
+                      }}
                       onSelect={(value) => {
                         // Kobalte's single-select can emit a selection change while syncing
                         // its value on mount. Only a pick from the opened listbox is a real
@@ -2596,23 +2689,30 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                   />
                 </Tooltip>
               </Show>
-              <Tooltip placement="top" inactive={!working() && blank() && !canResumeLastPrompt()} value={tip()}>
+              <Show when={preparationPending()}>
+                <span role="status" class="text-xs">Preparing message…</span>
+                <IconButton type="button" icon="close" aria-label="Cancel prepared message" onClick={() => {
+                  const target = sendTarget()
+                  composerSendIntents.cancel((value) => value.serverID === target.serverID && value.directory === target.directory && value.composerID === target.composerID)
+                }} />
+              </Show>
+              <Tooltip placement="top" inactive={!working() && blank() && !canResumeLastPrompt() && !preparationAvailable()} value={tip()}>
                 <IconButton
                   data-action="prompt-submit"
                   data-mobile-touch-target
-                  type={stopping() ? "button" : "submit"}
-                  disabled={props.disabled || (!working() && blank() && !canResumeLastPrompt())}
+                  type={stopping() && !preparationAvailable() ? "button" : "submit"}
+                  disabled={props.disabled || preparationPending() || (!preparationAvailable() && !working() && blank() && !canResumeLastPrompt())}
                   tabIndex={store.mode === "normal" ? undefined : -1}
-                  icon={stopping() ? "stop" : store.mode === "shell" ? "arrow-undo-down" : "arrow-up"}
+                  icon={stopping() && !preparationAvailable() ? "stop" : store.mode === "shell" ? "arrow-undo-down" : "arrow-up"}
                   variant="primary"
                   class="size-7 rounded-md p-[6px] text-v2-icon-icon-inverse shadow-[var(--v2-elevation-button-contrast)] disabled:opacity-50 [&_[data-slot=icon-svg]]:text-v2-icon-icon-inverse"
                   style={{
                     "background-image":
                       "linear-gradient(180deg,var(--v2-alpha-light-20) 0%,var(--v2-alpha-light-0) 100%),linear-gradient(90deg,var(--v2-background-bg-contrast) 0%,var(--v2-background-bg-contrast) 100%)",
                   }}
-                  aria-label={stopping() ? language.t("prompt.action.stop") : language.t("prompt.action.send")}
+                  aria-label={stopping() && !preparationAvailable() ? language.t("prompt.action.stop") : language.t("prompt.action.send")}
                   onClick={
-                    stopping()
+                    stopping() && !preparationAvailable()
                       ? (event) => {
                           event.preventDefault()
                           void abort()

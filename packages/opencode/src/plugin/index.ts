@@ -28,13 +28,18 @@ import type { ServerServiceCall } from "@opencode-ai/plugin/server"
 import { createPluginServiceRegistry, PluginServiceError, type PluginServiceCaller } from "./services"
 import { createPluginHost } from "./host"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { Database } from "@opencode-ai/core/database/database"
+import { ShellEnvironment } from "@opencode-ai/core/shell-environment"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { sessionRuntimeLayer } from "@opencode-ai/server/handlers"
 import { absolutePluginDirectory, sameDirectory } from "./directory"
 import { pluginEventType, runPluginEventHooks } from "./event"
+import { registerShellEnvironment } from "./shell-environment"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
 
+type PluginHooks = { pluginID: string; hooks: Hooks }
 type State = {
-  hooks: Hooks[]
+  hooks: PluginHooks[]
   services: ReturnType<typeof createPluginServiceRegistry>
   directory: string
   projectID: string
@@ -59,7 +64,7 @@ export interface Interface {
   readonly init: () => Effect.Effect<void>
   readonly call: (
     request: ServerServiceCall,
-    caller: Pick<PluginServiceCaller, "pluginID" | "signal" | "capabilities">,
+    caller: Pick<PluginServiceCaller, "pluginID" | "signal" | "capabilities"> & { sessionID?: string },
   ) => Effect.Effect<unknown, PluginServiceError | Error>
 }
 
@@ -72,7 +77,7 @@ export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel
 async function applyPlugin(
   load: PluginLoader.Loaded,
   input: Omit<PluginInput, "services" | "host">,
-  hooks: Hooks[],
+  hooks: PluginHooks[],
   services: State["services"],
   disposers: Array<() => Promise<void>>,
   bridge: EffectBridge.Shape,
@@ -85,24 +90,25 @@ async function applyPlugin(
   const binding = services.bind({ pluginID, directory: input.directory, projectID: input.project.id })
   disposers.push(binding.dispose)
   const hostBinding = createPluginHost({ pluginID, directory: input.directory, bridge, disposers })
+  const initialization = { kind: "plugin", pluginID, name: "server.initialize" } as const
   try {
     if (plugin) {
-      hooks.push(
-        await (plugin as PluginModule).server(
+      hooks.push({ pluginID, hooks: await CrashActivity.trackPromise(initialization,
+        () => (plugin as PluginModule).server(
           { ...input, services: binding.services, host: hostBinding.host },
           load.options,
         ),
-      )
+      ) })
       return
     }
 
     for (const server of legacyServerPlugins(load.mod)) {
-      hooks.push(
-        await (server as PluginInstance)(
+      hooks.push({ pluginID, hooks: await CrashActivity.trackPromise(initialization,
+        () => (server as PluginInstance)(
           { ...input, services: binding.services, host: hostBinding.host },
           load.options,
         ),
-      )
+      ) })
     }
   } catch (error) {
     await Promise.all([binding.dispose(), hostBinding.dispose()])
@@ -117,11 +123,13 @@ export const layer = Layer.effect(
     const config = yield* Config.Service
     const flags = yield* RuntimeFlags.Service
     const sessions = yield* SessionV2.Service
+    const database = yield* Database.Service
+    const shellEnvironment = yield* ShellEnvironment.Service
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Plugin.state")(function* (ctx) {
         const directory = absolutePluginDirectory(ctx.directory)
-        const hooks: Hooks[] = []
+        const hooks: PluginHooks[] = []
         const services = createPluginServiceRegistry({
           authorize: ({ caller, target }) =>
             caller.capabilities?.includes(`services:${target.pluginID}:${target.serviceID}`) ?? false,
@@ -145,9 +153,12 @@ export const layer = Layer.effect(
             )
             yield* Effect.forEach(
               hooks,
-              (hook) =>
+              ({ pluginID, hooks: hook }) =>
                 Effect.tryPromise({
-                  try: () => Promise.resolve(hook.dispose?.()),
+                  try: () => hook.dispose
+                    ? CrashActivity.trackPromise({ kind: "plugin", pluginID, name: "server.dispose" },
+                        async () => hook.dispose!())
+                    : Promise.resolve(),
                   catch: errorMessage,
                 }).pipe(
                   Effect.tapError((error) => Effect.logError("plugin dispose hook failed", { error })),
@@ -157,7 +168,12 @@ export const layer = Layer.effect(
             )
           }),
         )
-        const bridge = yield* EffectBridge.make().pipe(Effect.provideService(SessionV2.Service, sessions))
+        // Deferred instance callbacks must retain the host services, not just
+        // the location layer's public services, which do not export Database.
+        const bridge = yield* EffectBridge.make().pipe(
+          Effect.provideService(SessionV2.Service, sessions),
+          Effect.provideService(Database.Service, database),
+        )
 
         function publishPluginError(message: string) {
           bridge.fork(events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() }))
@@ -271,9 +287,12 @@ export const layer = Layer.effect(
         }
 
         // Notify plugins of current config
-        for (const hook of hooks) {
+        for (const { pluginID, hooks: hook } of hooks) {
           yield* Effect.tryPromise({
-            try: () => Promise.resolve((hook as any).config?.(cfg)),
+            try: () => hook.config
+              ? CrashActivity.trackPromise({ kind: "plugin", pluginID, name: "server.config" },
+                  async () => (hook as any).config(cfg))
+              : Promise.resolve(),
             catch: errorMessage,
           }).pipe(
             Effect.tapError((error) => Effect.logError("plugin config hook failed", { error })),
@@ -287,7 +306,12 @@ export const layer = Layer.effect(
             event: { id: event.id, type: pluginEventType(event.type), properties: event.data } as any,
           }
           return Effect.tryPromise({
-            try: () => runPluginEventHooks(hooks.map((hook) => hook["event"]), input),
+            try: () => runPluginEventHooks(hooks.map(({ pluginID, hooks }) => {
+              const hook = hooks.event
+              return hook && ((event: typeof input) => CrashActivity.trackPromise(
+                { kind: "plugin", pluginID, name: "server.event" }, async () => hook(event),
+              ))
+            }), input),
             catch: errorMessage,
           }).pipe(
             Effect.flatMap((errors) =>
@@ -309,6 +333,22 @@ export const layer = Layer.effect(
         })
         yield* Effect.addFinalizer(() => unsubscribe)
 
+        // Host routes rebuild plugin state under a lightweight instance for a
+        // directory the main instance already registered; the registry's first
+        // handler keeps serving, so a duplicate must not kill the whole init.
+        yield* registerShellEnvironment(directory, hooks.map(({ hooks, pluginID }) => ({
+          "shell.env": hooks["shell.env"] && ((input, output) => CrashActivity.trackPromise(
+            { kind: "plugin", pluginID, sessionID: input.sessionID, name: "server.shell.env" },
+            async () => hooks["shell.env"]!(input, output),
+          )),
+        }))).pipe(
+          Effect.provideService(ShellEnvironment.Service, shellEnvironment),
+          Effect.tapError((error) =>
+            Effect.logWarning("plugin shell environment registration skipped; existing registration stays active for this directory", { directory, error: errorMessage(error) })
+          ),
+          Effect.ignore,
+        )
+
         return { hooks, services, directory, projectID: ctx.project.id }
       }),
     )
@@ -320,17 +360,19 @@ export const layer = Layer.effect(
     >(name: Name, input: Input, output: Output) {
       if (!name) return output
       const s = yield* InstanceState.get(state)
-      for (const hook of s.hooks) {
+      for (const { pluginID, hooks: hook } of s.hooks) {
         const fn = hook[name] as any
         if (!fn) continue
-        yield* Effect.promise(async () => fn(input, output))
+        yield* Effect.promise(() => CrashActivity.trackPromise(
+          { kind: "plugin", pluginID, name: `server.${name}` }, async () => fn(input, output),
+        ))
       }
       return output
     })
 
     const list = Effect.fn("Plugin.list")(function* () {
       const s = yield* InstanceState.get(state)
-      return s.hooks
+      return s.hooks.map(({ hooks }) => hooks)
     })
 
     const init = Effect.fn("Plugin.init")(function* () {
@@ -347,7 +389,11 @@ export const layer = Layer.effect(
       })
     return Service.of({ trigger, list, init, call })
   }),
-).pipe(Layer.provide(sessionRuntimeLayer), Layer.provide(LocationServiceMap.layer))
+).pipe(
+  Layer.provide(sessionRuntimeLayer),
+  Layer.provide(LocationServiceMap.layer),
+  Layer.provide(Database.defaultLayer),
+)
 
 export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),

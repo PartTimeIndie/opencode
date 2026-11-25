@@ -22,6 +22,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
 import { TurnCompletion } from "./turn-completion"
+import { goalOwnershipRegistry } from "@/plugin/completion"
 
 export interface Interface {
   readonly ready: true
@@ -234,14 +235,16 @@ export const layer = Layer.effect(
             claimed.status === "completed"
               ? yield* durableCompletionMessages(db, SessionID.make(claimed.sessionID), claimed.closedSeq)
               : []
-          const resolved =
-            saved ??
-            (claimed.status === "completed"
-              ? ((yield* completion.resolve(SessionID.make(claimed.sessionID), {
-                  agent: stored.agent ?? undefined,
-                  messages,
-                })) ?? "skipped")
-              : "incomplete")
+          const scheduledReceipt = hasScheduledJobReceipt(messages)
+          const resolved = scheduledReceipt
+            ? "done"
+            : (saved ??
+              (claimed.status === "completed"
+                ? ((yield* completion.resolve(SessionID.make(claimed.sessionID), {
+                    agent: stored.agent ?? undefined,
+                    messages,
+                  })) ?? "skipped")
+                : "incomplete"))
           // An unavailable evaluator may return `unknown` even though the
           // durable V2 history already contains a terminal provider result.
           // Keep that fallback separate from explicit failure or policy vetoes.
@@ -264,7 +267,7 @@ export const layer = Layer.effect(
                 : "done"
               : resolved
 
-          if (!saved) {
+          if (!saved || (scheduledReceipt && saved !== result)) {
             const updated = yield* db
               .update(SessionActivityTable)
               .set({ turn_completion_result: result })
@@ -305,17 +308,28 @@ export const layer = Layer.effect(
           }
 
           if (result === "incomplete" && claimed.status === "completed" && execution !== undefined) {
-            const resumed = yield* autoResume(
-              SessionID.make(claimed.sessionID),
-              activityID,
-              ownerID,
-              claimed.attempts,
-              progress,
-            )
-            // While a resume is armed the verdict stays deferred: the Session continues
-            // instead of flashing incomplete to the UI. Once the budget is exhausted
-            // (autoResume returns false), the normal publish below reports incomplete.
-            if (resumed) return
+            // One continuation owner: a plugin goal lifecycle that claims this
+            // session keeps the host's generic auto-resume out of the way
+            // (fail-closed on errors — the session then settles incomplete
+            // visibly instead of racing the plugin with a second owner).
+            // One continuation owner: a plugin goal lifecycle that claims this
+            // session keeps the host's generic auto-resume out of the way.
+            // Checked synchronously (no async boundary in the settle fiber);
+            // async/erroring policies fail closed to owned.
+            const goalOwned = goalOwnershipRegistry.ownedSync(stored.directory, claimed.sessionID)
+            if (!goalOwned) {
+              const resumed = yield* autoResume(
+                SessionID.make(claimed.sessionID),
+                activityID,
+                ownerID,
+                claimed.attempts,
+                progress,
+              )
+              // While a resume is armed the verdict stays deferred: the Session continues
+              // instead of flashing incomplete to the UI. Once the budget is exhausted
+              // (autoResume returns false), the normal publish below reports incomplete.
+              if (resumed) return
+            }
           }
 
           yield* events.publish(
@@ -415,20 +429,22 @@ export const layer = Layer.effect(
       yield* Effect.forEach(rows, (row) => handle(row.id), { discard: true })
     })
 
+    // Only historical maintenance is deferred. Register the live listener before
+    // returning the layer so new CLI runs cannot lose their terminal event and
+    // wait behind the historical scan for a bound completion verdict.
+    const unsubscribe = yield* events.listen((event) => {
+      const status = terminalStatus(event.type)
+      if (!status) return Effect.void
+      const data = event.data
+      if (typeof data !== "object" || data === null) return Effect.void
+      if (!("activityID" in data) || typeof data.activityID !== "string") return Effect.void
+      if (!("sessionID" in data) || typeof data.sessionID !== "string") return Effect.void
+      return handle(data.activityID, { sessionID: data.sessionID, status })
+    })
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const delay = backgroundStartupDelayMs()
     const background = Effect.gen(function* () {
-      const delay = backgroundStartupDelayMs()
       if (delay > 0) yield* Effect.sleep(delay)
-
-      const unsubscribe = yield* events.listen((event) => {
-        const status = terminalStatus(event.type)
-        if (!status) return Effect.void
-        const data = event.data
-        if (typeof data !== "object" || data === null) return Effect.void
-        if (!("activityID" in data) || typeof data.activityID !== "string") return Effect.void
-        if (!("sessionID" in data) || typeof data.sessionID !== "string") return Effect.void
-        return handle(data.activityID, { sessionID: data.sessionID, status })
-      })
-      yield* Effect.addFinalizer(() => unsubscribe)
       yield* Effect.forever(
         scan().pipe(
           Effect.catchCause((cause) =>
@@ -438,12 +454,8 @@ export const layer = Layer.effect(
         ),
       )
     })
-    if (backgroundStartupDelayMs() > 0) {
-      yield* background.pipe(Effect.forkScoped)
-    } else {
-      yield* background.pipe(Effect.forkScoped)
-      yield* Effect.yieldNow
-    }
+    yield* background.pipe(Effect.forkScoped)
+    if (delay === 0) yield* Effect.yieldNow
 
     return Service.of({ ready: true })
   }),
@@ -470,6 +482,27 @@ function retryDelay(attempts: number) {
 function completionResult(value: string | null): CompletionResult | undefined {
   if (value === "plan_ready") return "incomplete"
   if (value === "done" || value === "incomplete" || value === "unknown" || value === "skipped") return value
+}
+
+function hasScheduledJobReceipt(messages: TurnCompletion.CompletionMessage[]) {
+  const marker = "opencode.scheduled-job-result/v1"
+  const task = messages.findLastIndex((message) => message.info.role === "user")
+  if (task < 0 || !messages[task].parts.some((part) => part.type === "text" && part.text?.includes(marker))) return false
+
+  // A receipt ends generic continuation. The scheduler still validates result
+  // order, uniqueness, and success or failure against its admission anchor.
+  return messages.slice(task + 1).some((message) =>
+    message.parts.some((part) => {
+      if (part.type !== "tool" || part.tool !== "scheduled_job_result" || part.state?.status !== "completed") return false
+      const structured = part.state.metadata
+      const metadata = structured?.metadata
+      const result = metadata && typeof metadata === "object" && "result" in metadata ? metadata.result : structured
+      if (!result || typeof result !== "object" || !("contract" in result) || result.contract !== marker) return false
+      if (!("status" in result)) return false
+      if (result.status === "success") return !("error" in result) || result.error === undefined
+      return result.status === "failed" && "error" in result && typeof result.error === "string" && !!result.error.trim()
+    }),
+  )
 }
 
 function durableCompletionMessages(db: Database.Interface["db"], sessionID: SessionID, closedSeq: number | null) {

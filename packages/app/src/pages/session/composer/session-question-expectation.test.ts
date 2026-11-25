@@ -87,4 +87,16 @@ describe("questionExpectation", () => {
     expect(isFormExpectation(node)).toBe(false)
     expect(isFormExpectationText(node)).toBe(true)
   })
+
+  test("names the one-click chat approval for questions that carry chatSend", () => {
+    expect(
+      questionExpectation(
+        { question: "Skill freigeben?", chatSend: { text: "/visual-qa-testing" } } as QuestionV2Info,
+        "pick_one",
+      ),
+    ).toBe("Erwartet: Freigabe-Klick sendet den hinterlegten Text in den Chat und bestätigt die Frage.")
+    expect(
+      questionExpectation({ question: "Weiter?" } as QuestionV2Info, "pick_one"),
+    ).toBe("Erwartet: Eine Option auswählen und bestätigen.")
+  })
 })

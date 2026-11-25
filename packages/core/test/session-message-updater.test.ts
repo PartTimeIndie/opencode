@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { DateTime, Effect } from "effect"
+import { DateTime, Effect, Schema } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -14,6 +14,38 @@ const created = DateTime.makeUnsafe(0)
 const model = { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") }
 
 describe("SessionMessageUpdater", () => {
+  test("preserves optional structured attempt receipts through settlement and message JSON", async () => {
+    const receipt = {
+      version: 1 as const, phase: "correction" as const, mode: "tool" as const,
+      inputID: SessionMessage.ID.make("msg_original_input"),
+      inputDigest: "a".repeat(64), schemaDigest: "b".repeat(64), model,
+    }
+    for (const structuredOutputAttempt of [undefined, receipt]) {
+      const state: SessionMessageUpdater.MemoryState = { messages: [] }
+      const adapter = SessionMessageUpdater.memory(state)
+      await Effect.runPromise(SessionMessageUpdater.update(adapter, {
+        id: EventV2.ID.make("evt_attempt_started"), type: "session.next.step.started",
+        data: { sessionID, assistantMessageID, agent: "build", model, timestamp: created, structuredOutputAttempt },
+      } satisfies SessionEvent.Event))
+      await Effect.runPromise(SessionMessageUpdater.update(adapter, {
+        id: EventV2.ID.make("evt_attempt_ended"), type: "session.next.step.ended",
+        data: {
+          sessionID, assistantMessageID, timestamp: DateTime.makeUnsafe(1), finish: "stop", cost: 0,
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      } satisfies SessionEvent.Event))
+      const message = state.messages[0]
+      expect(message?.type).toBe("assistant")
+      if (message?.type !== "assistant") throw new Error("Missing projected assistant")
+      expect(message.structuredOutputAttempt).toEqual(structuredOutputAttempt)
+      const decoded = Schema.decodeUnknownSync(SessionMessage.Message)(JSON.parse(JSON.stringify(
+        Schema.encodeSync(SessionMessage.Message)(message),
+      )))
+      expect(decoded).toMatchObject({ type: "assistant", finish: "stop" })
+      if (decoded.type !== "assistant") throw new Error("Missing decoded assistant")
+      expect(decoded.structuredOutputAttempt).toEqual(structuredOutputAttempt)
+    }
+  })
   test("makes an activity failure visible on an assistant that never emitted content", async () => {
     const state: SessionMessageUpdater.MemoryState = {
       messages: [

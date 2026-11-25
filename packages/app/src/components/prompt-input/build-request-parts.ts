@@ -28,6 +28,7 @@ type PromptRequestPart =
       filename?: string
       url: string
       source?: FilePartSource
+      unpack?: boolean
     }
   | {
       id: string
@@ -86,6 +87,7 @@ const isFileAttachment = (part: Prompt[number]): part is FileAttachmentPart => p
 const isAgentAttachment = (part: Prompt[number]): part is AgentPart => part.type === "agent"
 
 export function imageAttachmentUrl(attachment: ImageAttachmentPart) {
+  if (attachment.annotation) throw new Error("Annotation must be resolved before sending")
   if (attachment.sourcePath) return `file://${encodeFilePath(attachment.sourcePath)}`
   return attachment.dataUrl
 }
@@ -99,6 +101,7 @@ export function imageAttachmentRequestPart(attachment: ImageAttachmentPart, id =
     mime: attachment.mime,
     url,
     filename: attachment.sourcePath ?? attachment.filename,
+    ...(attachment.unpack ? { unpack: true } : {}),
   } satisfies PromptRequestPart
 }
 
@@ -109,6 +112,7 @@ export function imageAttachmentPromptFile(attachment: ImageAttachmentPart): Prom
     uri,
     mime: attachment.mime,
     name: attachment.sourcePath ?? attachment.filename,
+    ...(attachment.unpack ? { unpack: true } : {}),
   }
 }
 
@@ -251,6 +255,7 @@ export function buildRequestParts(input: BuildRequestPartsInput) {
         uri: part.url,
         mime: part.mime,
         name: part.filename,
+        ...(part.unpack ? { unpack: true } : {}),
         ...(part.source
           ? {
               source: {

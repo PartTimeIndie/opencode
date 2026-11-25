@@ -19,6 +19,7 @@ import { FileAttachment } from "./session/prompt"
 import { isRecord } from "./util/record"
 import { boundedPersistedContentPreview, MAX_PERSISTED_CONTENT_PREVIEW_BYTES } from "./content-preview"
 import { StructuredContentReference } from "./structured-content-reference"
+import { boundedToolDetails } from "./util/tool-details"
 
 export const MAX_LINES = 2_000
 export const MAX_BYTES = 50 * 1024
@@ -151,7 +152,8 @@ export const layer = Layer.effect(
       return { maxLines: outputSettings.maxLines, maxBytes: outputSettings.maxBytes }
     })
     const settings = Effect.fn("ToolOutputStore.settings")(function* () {
-      if (Option.isNone(config)) return { unlimited: false, maxLines: MAX_LINES, maxBytes: MAX_BYTES, stablePreview: true, compression: true }
+      if (Option.isNone(config))
+        return { unlimited: false, maxLines: MAX_LINES, maxBytes: MAX_BYTES, stablePreview: true, compression: true }
       const entries = yield* config.value.entries().pipe(Effect.catch(() => Effect.succeed([] as Config.Entry[])))
       const configured = Object.assign(
         {},
@@ -210,7 +212,10 @@ export const layer = Layer.effect(
       // the deterministic model view. The tool's own structured value stays untouched.
       let contextualText = contextual
       let contextView: ContextView | undefined
-      const structuredType = isRecord(input.output.structured) && typeof input.output.structured.type === "string" ? input.output.structured.type : undefined
+      const structuredType =
+        isRecord(input.output.structured) && typeof input.output.structured.type === "string"
+          ? input.output.structured.type
+          : undefined
       if (
         outputLimits.compression &&
         contentStore &&
@@ -294,7 +299,9 @@ export const layer = Layer.effect(
                 mime: "application/json",
                 name: `${sanitize(input.toolCallID)}-structured.json`,
               })
+              const details = input.tool ? boundedToolDetails(input.tool, sourceStructured) : undefined
               return {
+                ...(details ? { toolDetails: details } : {}),
                 $opencode: {
                   type: "content-reference",
                   uri: stored.uri,
@@ -320,7 +327,9 @@ export const layer = Layer.effect(
         contextView === undefined &&
         (contextualLines > outputLimits.maxLines ||
           contextualBytes >
-            (text.length > 0 ? Math.min(MAX_PERSISTED_CONTENT_PREVIEW_BYTES, outputLimits.maxBytes) : outputLimits.maxBytes))
+            (text.length > 0
+              ? Math.min(MAX_PERSISTED_CONTENT_PREVIEW_BYTES, outputLimits.maxBytes)
+              : outputLimits.maxBytes))
       ) {
         const stored = yield* contentStore.storeTextAttachment({
           sessionID: input.sessionID,
@@ -385,7 +394,9 @@ export const layer = Layer.effect(
       if (!contentStore) return input.output
       const outputSettings = yield* settings()
       const unlimited = outputSettings.unlimited
-      const budget = unlimited ? { remaining: Number.POSITIVE_INFINITY } : (input.budget ?? { remaining: MAX_PROVIDER_TOTAL_PREVIEW_BYTES })
+      const budget = unlimited
+        ? { remaining: Number.POSITIVE_INFINITY }
+        : (input.budget ?? { remaining: MAX_PROVIDER_TOTAL_PREVIEW_BYTES })
       const attachmentBudget = input.attachmentBudget ?? { remaining: ContentStore.MAX_PROVIDER_TOTAL_BYTES }
       const consumePreview = (text: string, marker: string) => {
         const allowance = unlimited ? Number.POSITIVE_INFINITY : Math.min(MAX_PROVIDER_PREVIEW_BYTES, budget.remaining)
@@ -419,12 +430,7 @@ export const layer = Layer.effect(
               }
               const content = Buffer.alloc(allowance * 2)
               const head = await handle.read(content, 0, allowance, 0)
-              const tail = await handle.read(
-                content,
-                allowance,
-                allowance,
-                Math.max(0, located.sizeBytes - allowance),
-              )
+              const tail = await handle.read(content, allowance, allowance, Math.max(0, located.sizeBytes - allowance))
               return Buffer.concat([
                 content.subarray(0, head.bytesRead),
                 Buffer.from(`\n... full tool output available at ${uri} ...\n`, "utf8"),
@@ -436,10 +442,7 @@ export const layer = Layer.effect(
           },
           catch: (cause) => new ContentStore.StorageError({ operation: "read", resource: uri, cause }),
         })
-        return consumePreview(
-          Buffer.from(bytes).toString("utf8"),
-          `... full tool output available at ${uri} ...`,
-        )
+        return consumePreview(Buffer.from(bytes).toString("utf8"), `... full tool output available at ${uri} ...`)
       })
       const resolve = Effect.fn("ToolOutputStore.resolveContent")(function* (uri: string) {
         const located = yield* contentStore.locate({ uri, sessionID: input.sessionID })
@@ -505,25 +508,27 @@ export const layer = Layer.effect(
             },
           }
         : yield* Effect.try({
-              try: () => JSON.stringify(input.output.structured) ?? String(input.output.structured),
-              catch: (cause) => new StorageError({ operation: "encode", cause }),
-            }).pipe(
-              Effect.map((encoded) => {
-                const sizeBytes = Buffer.byteLength(encoded, "utf8")
-                const allowance = unlimited ? Number.POSITIVE_INFINITY : Math.min(MAX_PROVIDER_PREVIEW_BYTES, budget.remaining)
-                if (sizeBytes <= allowance) {
-                  budget.remaining -= sizeBytes
-                  return input.output.structured
-                }
-                return {
-                  $opencode: {
-                    type: "provider-preview",
-                    sizeBytes,
-                    preview: consumePreview(encoded, "... structured tool output truncated for provider replay ..."),
-                  },
-                }
-              }),
-            )
+            try: () => JSON.stringify(input.output.structured) ?? String(input.output.structured),
+            catch: (cause) => new StorageError({ operation: "encode", cause }),
+          }).pipe(
+            Effect.map((encoded) => {
+              const sizeBytes = Buffer.byteLength(encoded, "utf8")
+              const allowance = unlimited
+                ? Number.POSITIVE_INFINITY
+                : Math.min(MAX_PROVIDER_PREVIEW_BYTES, budget.remaining)
+              if (sizeBytes <= allowance) {
+                budget.remaining -= sizeBytes
+                return input.output.structured
+              }
+              return {
+                $opencode: {
+                  type: "provider-preview",
+                  sizeBytes,
+                  preview: consumePreview(encoded, "... structured tool output truncated for provider replay ..."),
+                },
+              }
+            }),
+          )
       return {
         structured,
         content:

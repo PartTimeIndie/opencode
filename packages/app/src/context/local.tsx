@@ -27,6 +27,7 @@ import {
   toSessionModelRef,
 } from "./local-model"
 import { classifyAgentSelectionReadback, type SelectionModelSnapshot } from "./local-selection-ack"
+import { sessionSelectionHandoff, type SessionSelectionHandoffSnapshot } from "./session-selection-handoff"
 
 export type ModelKey = { providerID: string; modelID: string; variant?: string }
 
@@ -217,13 +218,18 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       return { key, guard }
     }
 
+    // The server's ModelV2.Ref accepts an explicit `chain: null` for a firm direct
+    // selection; the generated SDK type still types `chain` as an object only.
+    type SessionModelWire = Parameters<
+      ReturnType<typeof sdk>["client"]["v2"]["session"]["switchModel"]
+    >[0]["model"]
     const persistModel = (sessionID: string, selection: State, previous: State | undefined) => {
       const model = toSessionModelRef(selection, models.chain.list())
       if (!model) return
       const protectedSelection = protectSelection(sessionID, selection, previous)
       const client = sdk().client
       const task = () =>
-        client.v2.session.switchModel({ sessionID, model }, { throwOnError: true }).then(
+        client.v2.session.switchModel({ sessionID, model: model as SessionModelWire }, { throwOnError: true }).then(
           (response) => {
             acknowledgeSelection(protectedSelection.key, protectedSelection.guard)
             return response
@@ -242,7 +248,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const model = toSessionModelRef(selection, models.chain.list())
       const client = sdk().client
       const task = async () => {
-        await client.v2.session.switchAgent({ sessionID, agent: name, model })
+        await client.v2.session.switchAgent({ sessionID, agent: name, model: model as SessionModelWire })
       }
       return queueSelectionWrite(sessionID, task)
     }
@@ -335,13 +341,24 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       if (!session) return store.draft ?? freshTabState()
       const current = saved.session[session] ?? handoff.get(handoffKey(serverSDK().scope, sdk().directory, session))
       const protectedSelection = selectionReadback.has(sessionKey(session))
+      // A committed handoff keeps its confirmed agent name until the canonical
+      // record advances past the handoff baseline; a canonically newer external
+      // switch always wins over the optimistic snapshot. The canonical read stays
+      // conditional so selection timing behavior without a handoff is unchanged.
+      let sessionAgent: string | undefined
+      const handoffEntry = sessionSelectionHandoff.entry(serverSDK().scope, sdk().directory, session)
+      if (protectedSelection) {
+        sessionAgent = undefined
+      } else if (handoffEntry?.phase === "committed") {
+        const info = sync().session.get(session)
+        sessionAgent =
+          (info?.time.updated ?? 0) <= (handoffEntry.baselineUpdatedAt ?? 0) ? handoffEntry.snapshot.agent : info?.agent
+      } else {
+        sessionAgent = sync().session.get(session)?.agent
+      }
       const restored = reconcileRestoredSelection({
         persisted: current,
-        // The session's agent lives server-side; the persisted copy only
-        // remembers local model nuances. A handoff or another window can
-        // change the server agent (e.g. plan -> build), so the authoritative
-        // record wins over the stale persisted agent name.
-        sessionAgent: protectedSelection ? undefined : sync().session.get(session)?.agent,
+        sessionAgent,
       })
       if (restored) return restored
       const createdEmpty = tabs.store.some(
@@ -496,6 +513,59 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       models.selection.setVariant(restored.selection.model!, restored.selection.variant ?? null)
     }
 
+    // A confirmed handoff committed by any provider of this session (handoff
+    // popup, dock, another route) reaches every mounted LocalProvider here, so
+    // the composer shows the confirmed agent/chain without a second mutation.
+    const appliedHandoffGeneration = new Map<string, number>()
+    const handoffSnapshotConfirmed = (session: string, snapshot: SessionSelectionHandoffSnapshot) => {
+      const info = sync().session.get(session)
+      if (!info || info.agent !== snapshot.agent) return false
+      if (snapshot.chainID) return info.model?.chain?.id === snapshot.chainID
+      if (!snapshot.model) return false
+      return info.model?.providerID === snapshot.model.providerID && info.model?.id === snapshot.model.modelID
+    }
+    const applyHandoffSelection = (session: string, snapshot: SessionSelectionHandoffSnapshot) => {
+      const restored = resolveRestoredSessionSelection({
+        previous: saved.session[session],
+        model: {
+          providerID: snapshot.model?.providerID ?? "",
+          modelID: snapshot.model?.modelID ?? "",
+          variant: snapshot.variant ?? null,
+          chain: snapshot.chainID ? { id: snapshot.chainID } : null,
+        },
+        force: true,
+        hasChain: (chainID) => !!models.chain.find(chainID),
+        isValidModel: validModel,
+      })
+      if (!restored || restored.action === "skip") return
+      setSaved("session", session, { agent: snapshot.agent, ...restored.selection })
+      if (restored.selection.chainID) {
+        models.chain.select(restored.selection.chainID)
+        return
+      }
+      models.chain.select(undefined)
+      models.selection.setModel(restored.selection.model)
+      models.selection.setVariant(restored.selection.model!, restored.selection.variant ?? null)
+    }
+    createEffect(() => {
+      const session = id()
+      if (!session) return
+      const entry = sessionSelectionHandoff.entry(serverSDK().scope, sdk().directory, session)
+      if (!entry) return
+      if (appliedHandoffGeneration.get(session) === entry.generation) return
+      if (entry.phase === "pending" || entry.phase === "failed") return
+      if (entry.phase === "uncertain" && !handoffSnapshotConfirmed(session, entry.snapshot)) return
+      appliedHandoffGeneration.set(session, entry.generation)
+      applyHandoffSelection(session, entry.snapshot)
+    })
+
+    // Picker mutations are rejected centrally while this route's session has a
+    // handoff in flight; the composer additionally disables the controls.
+    const selectionLocked = () => {
+      const session = id()
+      return !!session && sessionSelectionHandoff.busy(serverSDK().scope, sdk().directory, session)
+    }
+
     const acknowledgeSelection = (key: string, guard: NonNullable<ReturnType<typeof selectionReadback.get>>) => {
       if (selectionReadback.get(key) !== guard) return
       guard.acknowledged = true
@@ -553,6 +623,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         return pickAgent(scope()?.agent ?? store.current)
       },
       set(name: string | undefined) {
+        if (selectionLocked()) return
         const item = pickAgent(name)
         if (!item) {
           setStore("current", undefined)
@@ -697,6 +768,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         model.set({ providerID: entry.provider.id, modelID: entry.id })
       },
       set(item: ModelKey | undefined, options?: { recent?: boolean }) {
+        if (selectionLocked()) return
         const previous = clone(persistedScope())
         const next = {
           ...(persistedScope() ?? { agent: agent.current()?.name }),
@@ -727,6 +799,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         current: selectedChain,
         selected: () => scope()?.chainID,
         set(chainID: string | undefined) {
+          if (selectionLocked()) return
           const chain = models.chain.find(chainID)
           const previous = clone(persistedScope())
           const next = {
@@ -775,6 +848,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return Object.keys(item.variants)
         },
         set(value: string | undefined, options?: { remember?: boolean }) {
+          if (selectionLocked()) return
           const previous = clone(persistedScope())
           const next = {
             ...(persistedScope() ?? { agent: agent.current()?.name }),
@@ -820,6 +894,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       selection: {
         snapshot,
         applyTemporary(next: Partial<State>) {
+          if (selectionLocked()) return
           setStore("temporary", {
             ...(persistedScope() ?? { agent: agent.current()?.name }),
             ...next,
@@ -850,6 +925,31 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         reset() {
           setStore("draft", undefined)
           setStore("temporary", undefined)
+        },
+        handoff: {
+          busy() {
+            const session = id()
+            if (!session) return false
+            return sessionSelectionHandoff.busy(serverSDK().scope, sdk().directory, session)
+          },
+          begin(sessionID: string, snapshot: SessionSelectionHandoffSnapshot) {
+            return sessionSelectionHandoff.begin(
+              serverSDK().scope,
+              sdk().directory,
+              sessionID,
+              snapshot,
+              sync().session.get(sessionID)?.time.updated,
+            )
+          },
+          commit(sessionID: string, snapshot: SessionSelectionHandoffSnapshot) {
+            sessionSelectionHandoff.commit(serverSDK().scope, sdk().directory, sessionID, snapshot)
+          },
+          fail(sessionID: string) {
+            sessionSelectionHandoff.fail(serverSDK().scope, sdk().directory, sessionID)
+          },
+          uncertain(sessionID: string) {
+            sessionSelectionHandoff.uncertain(serverSDK().scope, sdk().directory, sessionID)
+          },
         },
         promote(dir: string, session: string) {
           const next = clone(store.temporary ? persistedScope() : remembered(snapshot()))

@@ -20,6 +20,7 @@ export function retainedOutputs(messages: ReadonlyArray<Message>) {
 }
 import { ConfigSkillGroups } from "../config/skill-groups"
 import type { SkillV2 } from "../skill"
+import type { SkillPolicy } from "./policy"
 
 export type Entry = { type: "skill" | "group"; name: string; title?: string; description: string }
 export type Catalog = { revision: string; root: Entry[]; groups: Record<string, Entry[]>; issues: string[] }
@@ -39,11 +40,20 @@ export function renderEntries(entries: ReadonlyArray<Entry>) {
     .join("\n")
 }
 
-export function project(skills: ReadonlyArray<SkillV2.Info>, config?: ConfigSkillGroups.Info): Catalog {
+export function project(
+  skills: ReadonlyArray<SkillV2.Info>,
+  config?: ConfigSkillGroups.Info,
+  policies?: ReadonlyMap<string, SkillPolicy.Resolved>,
+): Catalog {
   const visible = [
     ...new Map(
       skills
-        .filter((skill) => !skill.disableModelInvocation && skill.description !== undefined)
+        .filter((skill) => {
+          const policy = policies?.get(skill.name)
+          // Without resolved policy this is the legacy default: raw manual flag hides.
+          const shown = policy ? policy.visible.value : !skill.disableModelInvocation
+          return shown && skill.description !== undefined
+        })
         .map((skill) => [skill.name, skill]),
     ).values(),
   ].sort((a, b) => compare(a, b))

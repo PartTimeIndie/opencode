@@ -1,4 +1,5 @@
 import { assertBrowserTargetURL } from "./browser-target"
+import { createBrowserTransferGuard } from "./browser-transfer-guard"
 
 type BrowserStatus = {
   browser?: {
@@ -23,6 +24,7 @@ type Input = {
   readonly status: () => Promise<BrowserStatus>
   /** Injectable seam for tests; production resolves the exact Electron webContents. */
   readonly webContentsForId?: (id: number) => WebContentsAdapter | undefined
+  readonly transferGuard?: ReturnType<typeof createBrowserTransferGuard>
 }
 
 type Target = {
@@ -45,6 +47,13 @@ export function createBrowserAutomation(input: Input) {
   const directEvidence = new Map<number, Evidence>()
   const evidenceUnsubscribers = new Map<number, () => void>()
   const resolveWebContents = input.webContentsForId
+  const transferGuard = input.transferGuard ?? createBrowserTransferGuard()
+  transferGuard.onReserve((id) => {
+    const unsubscribe = evidenceUnsubscribers.get(id)
+    evidenceUnsubscribers.delete(id)
+    directEvidence.delete(id)
+    unsubscribe?.()
+  })
 
   const activeWebContents = async (timeout = 10_000, expectedOrigin?: string) => {
     const deadline = Date.now() + timeout
@@ -54,6 +63,7 @@ export function createBrowserAutomation(input: Input) {
       if (!current || current.mode !== "webview" || !url || !isHttpUrl(url))
         throw new Error("The active Browser Dock tab is not an HTTP(S) desktop webview")
       if (current.webContentsID !== undefined) {
+        transferGuard.assertAccessible(current.webContentsID)
         const contents = resolveWebContents
           ? resolveWebContents(current.webContentsID)
           : await resolveElectronWebContents(current.webContentsID)
@@ -84,7 +94,7 @@ export function createBrowserAutomation(input: Input) {
     assertBrowserTargetURL(contents.getURL(), origin)
   }
 
-  return {
+  const automation = {
     async snapshot(action: {
       screenshot?: boolean
       maxTextChars?: number
@@ -125,6 +135,21 @@ export function createBrowserAutomation(input: Input) {
       await assertStillActive(contents, resolved.origin)
       return { url: contents.getURL(), title: await webContentsTitle(contents), waited: action.text ? `text ${JSON.stringify(action.text)}` : action.ref ?? action.selector ?? "domcontentloaded" }
     },
+  }
+
+  const guarded = async <T>(run: () => Promise<T>): Promise<T> => {
+    const release = transferGuard.beginAction()
+    try {
+      return await run()
+    } finally {
+      release()
+    }
+  }
+  return {
+    snapshot: (action: Parameters<typeof automation.snapshot>[0]) => guarded(() => automation.snapshot(action)),
+    click: (action: Parameters<typeof automation.click>[0]) => guarded(() => automation.click(action)),
+    type: (action: Parameters<typeof automation.type>[0]) => guarded(() => automation.type(action)),
+    wait: (action: Parameters<typeof automation.wait>[0]) => guarded(() => automation.wait(action)),
   }
 }
 
@@ -229,7 +254,10 @@ function ensureDirectEvidence(contents: WebContentsAdapter, evidence: Map<number
   if (evidence.has(contents.id)) return
   const entry = { console: [], network: [] }
   evidence.set(contents.id, entry)
-  unsubscribers.set(contents.id, contents.subscribeEvidence((kind, value) => push(entry[kind], value)))
+  unsubscribers.set(contents.id, contents.subscribeEvidence((kind, value) => {
+    if (evidence.get(contents.id) !== entry) return
+    push(entry[kind], value)
+  }))
 }
 
 function cleanupInactiveDirectEvidence(activeID: number, evidence: Map<number, Evidence>, unsubscribers: Map<number, () => void>) {

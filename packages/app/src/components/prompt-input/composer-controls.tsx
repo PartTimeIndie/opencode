@@ -52,6 +52,7 @@ export type ComposerAgentControlState = {
   options: string[]
   current: string
   open: boolean
+  disabled?: boolean
   style: JSX.CSSProperties | undefined
   onOpenChange: (open: boolean) => void
   onSelect: (value: string | undefined) => void
@@ -64,6 +65,7 @@ export type ComposerModelControlState = {
   paid: boolean
   error: boolean
   retrying: boolean
+  disabled?: boolean
   onRetry: () => void
   title: string
   keybind: string
@@ -240,7 +242,9 @@ export function ComposerAgentControl(props: { state: ComposerAgentControlState }
           data-action="prompt-agent"
           data-mobile-touch-target
           type="button"
-          class="flex h-7 min-w-0 max-w-[175px] items-center gap-1.5 rounded px-2 text-[13px] font-[440] leading-5 text-v2-text-text-faint hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none"
+          disabled={props.state.disabled}
+          aria-disabled={props.state.disabled ? "true" : undefined}
+          class="flex h-7 min-w-0 max-w-[175px] items-center gap-1.5 rounded px-2 text-[13px] font-[440] leading-5 text-v2-text-text-faint hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
           style={props.state.style}
         >
           <Icon name="sliders" size="small" class="shrink-0 text-v2-icon-icon-muted" />
@@ -261,6 +265,7 @@ export function ComposerAgentControl(props: { state: ComposerAgentControlState }
                     aria-selected={agent === props.state.current}
                     class="flex h-8 min-w-0 flex-1 items-center gap-2 px-3 text-left text-[13px] text-v2-text-text-base focus-visible:outline-none"
                     onClick={() => {
+                      if (props.state.disabled) return
                       props.state.onSelect(agent)
                       props.state.onOpenChange(false)
                     }}
@@ -280,6 +285,7 @@ export function ComposerAgentControl(props: { state: ComposerAgentControlState }
                     title={`Configure ${agent}`}
                     onClick={(event) => {
                       event.stopPropagation()
+                      if (props.state.disabled) return
                       props.state.onOpenChange(false)
                       props.state.onConfigure(agent)
                     }}
@@ -297,6 +303,7 @@ export function ComposerAgentControl(props: { state: ComposerAgentControlState }
             data-mobile-touch-target
             class="flex h-8 w-full items-center gap-2 rounded px-3 text-left text-[13px] text-v2-text-text-base hover:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none"
             onClick={() => {
+              if (props.state.disabled) return
               props.state.onOpenChange(false)
               props.state.onCreate()
             }}
@@ -438,6 +445,7 @@ export function ComposerModelControl(props: { state: ComposerModelControlState }
               size="normal"
               class="min-w-0 max-w-[220px] justify-start text-[13px] font-[440] leading-5 text-v2-text-text-faint group"
               style={props.state.style}
+              aria-disabled={props.state.disabled ? "true" : undefined}
               onClick={props.state.onUnpaidClick}
             >
               <Show when={props.state.providerID}>
@@ -465,6 +473,8 @@ export function ComposerModelControl(props: { state: ComposerModelControlState }
               style: props.state.style,
               class:
                 "min-w-0 max-w-[220px] justify-start text-[13px] font-[440] leading-5 text-v2-text-text-faint group",
+              disabled: props.state.disabled,
+              "aria-disabled": props.state.disabled ? "true" : undefined,
               "data-action": "prompt-model",
               "data-mobile-touch-target": "",
             }}

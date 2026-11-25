@@ -58,11 +58,13 @@ export type ServerSessionExecutionView = { phase: "admission_missing" | "admitte
   phase: "activity"
   activity: { id: string; status: string; closed_seq: number | null; last_error: string | null; reason: string | null; turn_completion_state: "running" | "ready" | "done" | null; turn_completion_result: "done" | "incomplete" | "unknown" | "skipped" | null }
   questions: Array<{ id: string; state: string }>
-  assistants: Array<{ seq: number; data: unknown }>
+  assistants: Array<{ id: string; seq: number; data: unknown }>
   laterInputs: number[]
+  laterAdmissions: string[]
 }
 export type ServerPluginHost = {
   readonly version: string
+  readonly signal?: AbortSignal
   media: { register(adapters: import("./media.js").MediaAdapters): Promise<void> }
   fanout: {
     register(input: { id: string; configKey: string; agentID: string; agentAliases?: string[]; commands: string[]; tools: string[]; resultSchema: Record<string, unknown> }): Promise<void>
@@ -71,9 +73,32 @@ export type ServerPluginHost = {
     completion: {
       register(policy: import("./completion.js").CompletionPolicy): Promise<void>
     }
+    goalOwnership: {
+      /** Register that this plugin's goal lifecycle owns continuation for a session. */
+      register(policy: (input: { sessionID: string }) => boolean | Promise<boolean>): Promise<void>
+      /** Clear only the completed Goal run; a replacement run remains untouched. */
+      clear?(input: { sessionID: string; runID: string; condition: string }): Promise<void>
+      /** Run/revision-bound status CAS, scoped to this plugin's Session location. */
+      project?(input: { sessionID: string; runID: string; condition: string; expectedStatus?: string; status: string }): Promise<boolean>
+    }
+    /** Admit a plugin-generated prompt. The host attests it as non-interactive. */
+    prompt(input: { sessionID: string; text: string; format?: Record<string, unknown>; expectedLatestInputID?: string | null; goal?: { condition: string; runID: string; expectedStatus?: string; status: string } }): Promise<{ id: string; goalStatus?: string }>
+    /** Snapshot the durable inbox head, including unpromoted inputs. */
+    admissionHead?(input: { sessionID: string }): Promise<{ id: string | null }>
+    /** Durable transport provenance of an admitted input; missing rows are "unknown". */
+    inputOrigin(input: { sessionID: string; inputID: string }): Promise<"interactive" | "plugin" | "unknown">
     exists(sessionID: string): Promise<boolean>
     execution: {
       read(input: { sessionID: string; messageID: string; activityID?: string; followContinuations?: boolean }): Promise<ServerSessionExecutionView>
+      /** Observe an exact native Main task receipt. Both Sessions must be in this plugin's location. Never starts or resumes work. */
+      readMainTask?(input: {
+        parentSessionID: string
+        sessionID: string
+        messageID: string
+        dispatchDigest: string
+        placementIdentity: string
+        activityID?: string
+      }): Promise<ServerSessionExecutionView | { phase: "task_binding_mismatch" }>
     }
     links: {
       get(sessionID: string): Promise<ServerSessionLink | undefined>

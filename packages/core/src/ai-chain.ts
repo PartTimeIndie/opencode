@@ -198,6 +198,10 @@ export function chainStepFailureEligible(
 ): boolean {
   if (isAbortError(error)) return false
   const candidates = [...errorCandidates(error)]
+  // Keep the HTTP error classification, but never renew a format correction
+  // through even an explicitly broad model-chain fallback policy.
+  if (candidates.some((candidate) => candidate !== null && typeof candidate === "object" &&
+    "structuredOutputCorrectionAttempted" in candidate && candidate.structuredOutputCorrectionAttempted === true)) return false
   const statuses = candidates.map(statusCodeOf).filter((status) => status !== undefined)
   const message = candidates.map(failureMessage).join("\n")
   if (
@@ -218,6 +222,13 @@ export function chainStepFailureEligible(
   if (statuses.some((status) => status === 402 || status === 408 || status === 429 || status >= 500)) return true
   if (transientChainFailure.test(message)) return true
   return false
+}
+
+// Fallback eligibility is broader than retry eligibility: a retired model or
+// exhausted account quota may be replaced but cannot recover on the same step.
+export function chainStepRetryEligible(error: unknown) {
+  if (!chainStepFailureEligible(error) || isQuotaExceededFailure(error)) return false
+  return !unavailableChainStep.test([...errorCandidates(error)].map(failureMessage).join("\n"))
 }
 
 export function failureMessageForNormalization(error: unknown) {
@@ -249,6 +260,11 @@ export function isQuotaExceededFailure(error: unknown) {
     })
   )
     return true
+  // Do not let generic provider prose override Z.AI's typed native 1302 rate limit.
+  if (candidates.some((candidate) => {
+    const detail = candidate as { _tag?: unknown; providerMetadata?: { zai?: { code?: unknown } } } | undefined
+    return detail?._tag === "RateLimit" && detail.providerMetadata?.zai?.code === "1302"
+  })) return false
   // A bare 402 without a quota payload is not period quota: OpenRouter uses 402
   // for payment-required rejections that stay retryable for non-OpenRouter models.
   // Only 402 with an explicit quota signal counts as exhausted quota.

@@ -4,6 +4,7 @@ import path from "path"
 import { Effect, Layer, Schema } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
+import { ConfigAgent } from "@opencode-ai/core/config/agent"
 import { ConfigAgentPlugin } from "@opencode-ai/core/config/plugin/agent"
 import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
 import { ConfigMigrateV1 } from "@opencode-ai/core/v1/config/migrate"
@@ -17,6 +18,19 @@ import { testEffect } from "../lib/effect"
 const it = testEffect(Layer.mergeAll(AgentV2.locationLayer, FSUtil.defaultLayer))
 const decode = Schema.decodeUnknownSync(Config.Info)
 
+test("inherit overrides only named fields and explicit remains an opt-in replacement", () => {
+  const base = { mode: "inherit", entries: {
+    bash: { permission: "deny" },
+    read: { visible: true, permission: "allow", delegable: false },
+    orchestrator: { visible: true, permission: "ask" },
+  } } as const
+  const merged = ConfigAgent.mergeTools(base, { mode: "inherit", entries: { read: { permission: "ask" } } })
+  expect(merged).toEqual({ mode: "inherit", entries: { ...base.entries, read: { ...base.entries.read, permission: "ask" } } })
+  expect(ConfigAgent.mergeTools(base, { mode: "inherit" })).toEqual(base)
+  expect(ConfigAgent.mergeTools(base, { mode: "explicit", entries: {} })).toEqual({ mode: "explicit", entries: {} })
+  expect(base.entries.read.permission).toBe("allow")
+})
+
 test("decodes and migrates a V1 agent tool budget", () => {
   const info = Schema.decodeUnknownSync(ConfigAgentV1.Info)({
     tool_budget: { read: 4, grep: 2, glob: 1 },
@@ -27,10 +41,40 @@ test("decodes and migrates a V1 agent tool budget", () => {
 })
 
 describe("ConfigAgentPlugin.Plugin", () => {
+  it.effect("inherits global tools with sparse project overrides and preserves restrictions", () =>
+    Effect.gen(function* () {
+      const agents = yield* AgentV2.Service
+      const config = Config.Service.of({ entries: () => Effect.succeed([
+        new Config.Document({ type: "document", info: decode({ agents: { build: { tools: {
+          mode: "inherit", entries: {
+            bash: { visible: false, permission: "deny" },
+            read: { visible: true, permission: "allow", delegable: false },
+            orchestrator: { visible: true, permission: "ask" },
+          },
+        } } } }) }),
+        new Config.Document({ type: "document", info: decode({ agents: { build: { tools: {
+          mode: "inherit", entries: { read: { permission: "ask" } },
+        } } } }) }),
+      ]) })
+      yield* ConfigAgentPlugin.Plugin.effect.pipe(
+        Effect.provideService(Config.Service, config), Effect.provideService(AgentV2.Service, agents),
+      )
+      const build = yield* agents.get(AgentV2.ID.make("build"))
+      expect(build?.tools).toEqual({ mode: "inherit", entries: {
+        bash: { visible: false, permission: "deny" },
+        read: { visible: true, permission: "ask", delegable: false },
+        orchestrator: { visible: true, permission: "ask" },
+      } })
+      expect(PermissionV2.evaluate("bash", "*", build?.permissions ?? []).effect).toBe("deny")
+    }),
+  )
   test("built-in base guidance routes coordination requests to session_send", () => {
+    // Conscious contract change: the confirmed short role prompt keeps the
+    // session_send routing, exact-ID rule and the no-chat-reading boundary,
+    // but no longer names the session_read tool literally.
     expect(AgentPlugin.BUILD_SYSTEM).toContain("session_send")
     expect(AgentPlugin.BUILD_SYSTEM).toContain("never guess IDs")
-    expect(AgentPlugin.BUILD_SYSTEM).toContain("session_read")
+    expect(AgentPlugin.BUILD_SYSTEM).toContain("read another chat without a separate explicit request")
   })
 
   test("only scoped config, agent markdown, and referenced prompt changes invalidate agent policy", () => {

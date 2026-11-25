@@ -1,3 +1,17 @@
+import { Option, Schema } from "effect"
+
+const zaiErrorBody = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Struct({
+  error: Schema.Struct({ code: Schema.Union([Schema.String, Schema.Number]) }),
+})))
+
+/** Z.AI business codes are read from the JSON envelope, never from translated prose. */
+export function zaiRateLimitCode(body: unknown) {
+  const decoded = Option.getOrUndefined(zaiErrorBody(body))
+  const code = String(decoded?.error.code)
+  if (code === "1302" || code === "1308" || code === "1310") return code
+  return undefined
+}
+
 /** Account quota is terminal; an explicit minute token window is not. */
 export function isQuotaExceeded(message: string) {
   if (

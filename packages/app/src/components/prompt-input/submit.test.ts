@@ -697,6 +697,8 @@ describe("prompt submit worktree selection", () => {
     beforeSubmit?: Parameters<typeof createPromptSubmit>[0]["beforeSubmit"]
     working?: () => boolean
     forceSteer?: () => boolean
+    shouldQueue?: () => boolean
+    onQueue?: Parameters<typeof createPromptSubmit>[0]["onQueue"]
     info?: () => {
       id: string
       agent?: string
@@ -719,6 +721,8 @@ describe("prompt submit worktree selection", () => {
       setMode: () => undefined,
       setPopover: () => undefined,
       forceSteer: options?.forceSteer,
+      shouldQueue: options?.shouldQueue,
+      onQueue: options?.onQueue,
       onSubmit: () => undefined,
     })
 
@@ -862,6 +866,70 @@ describe("prompt submit worktree selection", () => {
     decision.resolve(true)
     await sending
     expect(sentPrompts).toHaveLength(0)
+  })
+
+  test("commits toolbar receipt only after durable manual prompt admission", async () => {
+    params = { id: "session-1" }
+    const gate = Promise.withResolvers<void>()
+    promptAdmissionPromise = gate.promise
+    let committed = 0
+    const submit = createExistingSessionSubmit({ beforeSubmit: async (context) => {
+      expect(context.standardAppend).toBe(true)
+      return { commit() { committed++ } }
+    } })
+    const sending = submit.handleSubmit({ preventDefault() {} } as Event)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(committed).toBe(0)
+    await submit.handleSubmit({ preventDefault() {} } as Event)
+    expect(sentPrompts).toHaveLength(1)
+    gate.resolve()
+    await sending
+    expect(committed).toBe(1)
+  })
+
+  test("failed admission and late selection failure never commit toolbar receipt", async () => {
+    params = { id: "session-1" }
+    let committed = 0
+    const gate = Promise.withResolvers<void>()
+    promptAdmissionPromise = gate.promise
+    const submit = createExistingSessionSubmit({ beforeSubmit: async () => ({ commit() { committed++ } }) })
+    const sending = submit.handleSubmit({ preventDefault() {} } as Event)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    gate.reject(new Error("admission rejected"))
+    await sending
+    expect(committed).toBe(0)
+    promptAdmissionPromise = undefined
+    selectionPersistencePromise = Promise.reject(new Error("selection rejected"))
+    await submit.handleSubmit({ preventDefault() {} } as Event)
+    expect(committed).toBe(0)
+  })
+
+  test("explicit local Queue accepts the receipt without changing delivery", async () => {
+    params = { id: "session-1" }
+    let committed = 0
+    let queued = 0
+    const submit = createExistingSessionSubmit({
+      working: () => true,
+      shouldQueue: () => true,
+      onQueue() { queued++ },
+      beforeSubmit: async () => ({ commit() { committed++ } }),
+    })
+    await submit.handleSubmit({ preventDefault() {} } as Event)
+    expect(queued).toBe(1)
+    expect(committed).toBe(1)
+    expect(admittedPrompts).toHaveLength(0)
+  })
+
+  test("Resume excludes standard append and programmatic submit skips the hook", async () => {
+    params = { id: "session-1" }
+    const eligible: boolean[] = []
+    const submit = createExistingSessionSubmit({ beforeSubmit: async (context) => {
+      eligible.push(context.standardAppend)
+      return true
+    } })
+    await submit.handleSubmit({ preventDefault() {} } as Event, { resume: true })
+    await submit.submitText({ text: "Continue", delivery: "steer" })
+    expect(eligible).toEqual([false])
   })
 
   test("reads the latest worktree accessor value per submit", async () => {

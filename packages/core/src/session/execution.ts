@@ -3,6 +3,7 @@ export * as SessionExecution from "./execution"
 import { Context, Effect, Layer } from "effect"
 import { SessionRunner } from "./runner/index"
 import { SessionSchema } from "./schema"
+import type { SessionRunCoordinator } from "./run-coordinator"
 
 export interface Interface {
   /** Explicitly drain one Session, making at least one provider attempt. */
@@ -21,6 +22,8 @@ export interface Interface {
   readonly wait: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   /** Cancel one active tool call owned by this process. Idle or missing calls return false. */
   readonly cancelTool: (sessionID: SessionSchema.ID, callID: string) => Effect.Effect<boolean>
+  /** Only real execution owners supply this guard. Missing support must fail closed. */
+  readonly withIdle?: SessionRunCoordinator.Interface["withIdle"]
 }
 
 /** Routes execution from a Session ID to the runner owned by that Session's Location. */

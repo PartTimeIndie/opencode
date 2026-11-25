@@ -9,11 +9,14 @@ import type { Transport, TransportRuntime } from "./transport"
 import { WebSocketExecutor } from "./transport"
 import type { Protocol } from "./protocol"
 import { applyCachePolicy } from "../cache-policy"
+import { RequestRuntimeContext } from "../runtime-context"
+import { StructuredOutputTransport } from "../structured-output-transport"
 import * as ProviderShared from "../protocols/shared"
 import type { LLMError, LLMEvent, PreparedRequestOf, ProtocolID, ProviderOptions } from "../schema"
 import {
   GenerationOptions,
   HttpOptions,
+  InvalidRequestReason,
   LLMRequest,
   LLMResponse,
   Model,
@@ -38,6 +41,9 @@ export interface Route<Body, Prepared = unknown> {
   readonly id: string
   readonly provider?: ProviderID
   readonly protocol: ProtocolID
+  readonly runtimeContext?: "late-system"
+  readonly jsonSchema?: true
+  readonly structuredToolChoice?: (request: LLMRequest) => "named" | "auto"
   readonly endpoint: Endpoint<Body>
   readonly auth: AuthDef
   readonly transport: Transport<Body, Prepared, unknown>
@@ -266,6 +272,9 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
       id: routeInput.id,
       provider: routeInput.provider === undefined ? undefined : ProviderID.make(routeInput.provider),
       protocol: protocol.id,
+      runtimeContext: protocol.runtimeContext,
+      jsonSchema: protocol.jsonSchema,
+      structuredToolChoice: protocol.structuredToolChoice,
       endpoint: routeInput.endpoint,
       auth: routeInput.auth ?? Auth.none,
       transport: routeInput.transport,
@@ -363,8 +372,26 @@ export function make<Body, Prepared, Frame, Event, State>(
 // validated provider body plus transport-private prepared data, but does not
 // execute transport.
 const compile = Effect.fn("LLM.compile")(function* (request: LLMRequest) {
-  const resolved = applyCachePolicy(resolveRequestOptions(request))
+  const normalized = yield* Effect.try({
+    try: () => StructuredOutputTransport.normalize(request),
+    catch: (error) => new LLMErrorClass({
+      module: "LLM",
+      method: "compile",
+      reason: new InvalidRequestReason({ message: error instanceof Error ? error.message : "Invalid structured-output transport" }),
+    }),
+  })
+  const resolved = applyCachePolicy(resolveRequestOptions(normalized))
   const route = resolved.model.route
+
+  if (resolved.responseFormat?.type === "json" && !route.jsonSchema)
+    return yield* new LLMErrorClass({
+      module: "LLM",
+      method: "compile",
+      reason: new InvalidRequestReason({ message: "Route does not support native JSON Schema output; use a result tool" }),
+    })
+
+  const contextError = RequestRuntimeContext.validate(resolved)
+  if (contextError) return yield* contextError
 
   const body = yield* route.body
     .from(resolved)

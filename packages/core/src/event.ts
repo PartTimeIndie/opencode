@@ -351,6 +351,85 @@ export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
 }
 
+type AtomicPublication = {
+  readonly db: Database.Interface["db"]
+  readonly pending: Array<Effect.Effect<void>>
+  transaction?: unknown
+  owner?: number
+  active: boolean
+}
+class PublicationScope extends Context.Service<PublicationScope, AtomicPublication>()("EventV2.PublicationScope") {}
+
+/** Commit related projections and their events together. Observers (including
+ * sync transports) see nothing until the outer transaction commits. A failed or
+ * interrupted operation discards its queued notifications, not just its rows.
+ * This does not grant execution authority to any of the created Sessions.
+ */
+export const atomic = <A, E, R>(db: Database.Interface["db"], operation: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const inherited = yield* Effect.serviceOption(PublicationScope)
+    if (inherited._tag === "Some") {
+      yield* publicationScope(db)
+    }
+    // A plain outer SQL transaction has no publication owner. Flushing from its
+    // savepoint would announce rows which the outer transaction can still undo.
+    if (inherited._tag === "None" && (yield* Effect.serviceOption(db.$client.transactionService))._tag === "Some")
+      return yield* Effect.die("Atomic publication must own the outer database transaction")
+    const scope: AtomicPublication = { db, pending: [], active: true }
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const result = yield* db.transaction(
+          () => Effect.gen(function* () {
+            const transaction = yield* Effect.serviceOption(db.$client.transactionService)
+            if (transaction._tag === "None") return yield* Effect.die("Atomic publication has no database transaction")
+            scope.transaction = transaction.value
+            scope.owner = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.id))
+            return yield* restore(operation.pipe(Effect.provideService(PublicationScope, scope)))
+          }),
+          { behavior: "immediate" },
+        ).pipe(
+          restore,
+          Effect.catchTag("SqlError", Effect.die),
+          Effect.ensuring(Effect.sync(() => { scope.active = false })),
+        )
+        if (inherited._tag === "Some") {
+          // A released savepoint is not a committed batch. Its parent owns
+          // delivery; a failed savepoint never contributes notifications.
+          inherited.value.pending.push(...scope.pending)
+          return result
+        }
+        // Rows are committed. Observer defects do not imply rollback. Explicit
+        // cancellation stops remaining advisory delivery; durable event replay
+        // is authoritative, and consumers must reconcile after reconnecting.
+        yield* restore(Effect.forEach(scope.pending, (notification) => notification.pipe(
+          Effect.catchCauseIf((cause) => !Cause.hasInterrupts(cause),
+            (cause) => Effect.logError("Atomic event observer failed", { cause })),
+        ), { discard: true }))
+        return result
+      }),
+    )
+  })
+
+const publicationScope = (db: Database.Interface["db"]) => Effect.gen(function* () {
+  const scope = yield* Effect.serviceOption(PublicationScope)
+  if (scope._tag === "None") return undefined
+  if (!scope.value.active || scope.value.db !== db)
+    return yield* Effect.die("Event transaction scope is closed or belongs to another database")
+  const owner = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.id))
+  if (scope.value.owner !== owner)
+    return yield* Effect.die("Atomic publication is sequential and cannot be delegated to inherited fibers")
+  const transaction = yield* Effect.serviceOption(db.$client.transactionService)
+  if (transaction._tag === "None" || transaction.value !== scope.value.transaction)
+    return yield* Effect.die("Event publication must use its owning atomic transaction, not a plain nested savepoint")
+  return scope.value
+})
+
+const afterCommit = (db: Database.Interface["db"], notification: Effect.Effect<void>) => Effect.gen(function* () {
+  const scope = yield* publicationScope(db)
+  if (!scope) return yield* notification
+  scope.pending.push(notification)
+})
+
 export const layerWith = (options?: LayerOptions) =>
   Layer.effect(
     Service,
@@ -413,13 +492,13 @@ export const layerWith = (options?: LayerOptions) =>
       const hydrateCheckpoint = (checkpoint: SerializedCheckpoint) =>
         Effect.gen(function* () {
           const adapter = checkpointAdapters.get(checkpoint.baseline.adapter)
-          if (!adapter?.hydrate || checkpoint.baseline.version !== adapter.version) return checkpoint
+          if (!adapter?.hydrate) return checkpoint
           const baseline = yield* adapter.hydrate({
             aggregateID: checkpoint.aggregateID,
             seq: checkpoint.seq,
             baseline: checkpoint.baseline,
           })
-          if (baseline.adapter !== adapter.id || baseline.version !== adapter.version)
+          if (baseline.adapter !== adapter.id || baseline.version !== checkpoint.baseline.version)
             return yield* Effect.die(
               new InvalidSyncEventError({
                 type: CheckpointCapability,
@@ -460,6 +539,7 @@ export const layerWith = (options?: LayerOptions) =>
         commit?: (seq: number) => Effect.Effect<void>,
       ) {
         return Effect.gen(function* () {
+          yield* publicationScope(db)
           const definition = event.version === undefined
             ? registry.get(event.type)
             : syncRegistry.get(versionedType(event.type, event.version)) ?? registry.get(event.type)
@@ -608,11 +688,11 @@ export const layerWith = (options?: LayerOptions) =>
                     )
                     .pipe(Effect.orDie)
                   if (committed) {
-                    yield* Effect.forEach(
+                    yield* afterCommit(db, Effect.forEach(
                       synchronized.get(committed.aggregateID) ?? [],
                       (pubsub) => PubSub.publish(pubsub, undefined),
                       { discard: true },
-                    )
+                    ))
                   }
                   return committed
                 }),
@@ -636,12 +716,13 @@ export const layerWith = (options?: LayerOptions) =>
             const committed = yield* commitSyncEvent(event as Payload, undefined, options?.commit)
             if (committed) {
               event = { ...event, seq: committed.seq }
-              yield* Effect.forEach(syncHandlers, (sync) => observe(event as Payload, "sync", sync), { discard: true })
-              yield* notify(event as Payload, true)
+              yield* afterCommit(db, Effect.forEach(syncHandlers, (sync) => observe(event as Payload, "sync", sync), { discard: true }).pipe(
+                Effect.andThen(notify(event as Payload, true)),
+              ))
               return event
             }
           }
-          yield* notify(event as Payload, options?.isolateListeners === true)
+          yield* afterCommit(db, notify(event as Payload, options?.isolateListeners === true))
           return event
         })
       }
@@ -715,7 +796,7 @@ export const layerWith = (options?: LayerOptions) =>
               strictOwner: options?.strictOwner,
             })
             if (committed && options?.publish) {
-              yield* notify({ ...payload, seq: committed.seq }, true)
+              yield* afterCommit(db, notify({ ...payload, seq: committed.seq }, true))
             }
           }
         })
@@ -1068,6 +1149,7 @@ export const layerWith = (options?: LayerOptions) =>
         options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
       ) {
         return Effect.gen(function* () {
+          yield* publicationScope(db)
           if (input.version !== CheckpointVersion)
             return yield* Effect.die(
               new InvalidSyncEventError({
@@ -1090,10 +1172,11 @@ export const layerWith = (options?: LayerOptions) =>
                 message: `Checkpoint adapter ${input.baseline.adapter}@${input.baseline.version} is unavailable`,
               }),
             )
-          const upgraded = input.baseline.version === adapter.version
-            ? input.baseline
+          const hydratedInput = yield* hydrateCheckpoint(input)
+          const upgraded = hydratedInput.baseline.version === adapter.version
+            ? hydratedInput.baseline
             : adapter.upgrade
-              ? yield* adapter.upgrade(input.baseline)
+              ? yield* adapter.upgrade(hydratedInput.baseline)
               : undefined
           if (!upgraded || upgraded.adapter !== adapter.id || upgraded.version !== adapter.version)
             return yield* Effect.die(
@@ -1145,7 +1228,7 @@ export const layerWith = (options?: LayerOptions) =>
                       sequence.seq >= input.seq &&
                       hydratedStored?.version === CheckpointVersion &&
                       hydratedStored.seq === input.seq &&
-                      [input.baselineHash, baselineHash].includes(hydratedStored.baselineHash) &&
+                      [input.baselineHash, hydratedInput.baselineHash, baselineHash].includes(hydratedStored.baselineHash) &&
                       hydratedStored.eventHash === input.eventHash
                     ) {
                       if (
@@ -1205,11 +1288,11 @@ export const layerWith = (options?: LayerOptions) =>
             )
             .pipe(Effect.orDie)
           if (!committed) return input.aggregateID
-          yield* Effect.forEach(
+          yield* afterCommit(db, Effect.forEach(
             synchronized.get(input.aggregateID) ?? [],
             (pubsub) => PubSub.publish(pubsub, undefined),
             { discard: true },
-          )
+          ))
           return input.aggregateID
         })
       }

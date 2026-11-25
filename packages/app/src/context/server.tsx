@@ -4,7 +4,7 @@ import { createStore, type SetStoreFunction, type Store } from "solid-js/store"
 import { Persist, persisted } from "@/utils/persist"
 import { ServerScope } from "@/utils/server-scope"
 import { readAppState, writeAppState } from "@/utils/app-state"
-import { directoryKey } from "@/utils/path-key"
+import { projectWorktreeKey } from "@/utils/path-key"
 
 type StoredProject = { worktree: string; expanded: boolean }
 type StoredServer = string | ServerConnection.HttpBase | ServerConnection.Http
@@ -45,7 +45,7 @@ function normalizeStoredProjects(value: unknown): StoredProject[] {
 function mergeStoredProjects(primary: StoredProject[], secondary: StoredProject[]) {
   const seen = new Set<string>()
   return [...primary, ...secondary].filter((project) => {
-    const key = directoryKey(project.worktree)
+    const key = projectWorktreeKey(project.worktree)
     if (seen.has(key)) return false
     seen.add(key)
     return true
@@ -106,31 +106,31 @@ export function createServerProjects<T extends ServerProjectState>(input: {
     list: current,
     open(directory: string) {
       const scope = input.scope()
-      const key = directoryKey(directory)
-      if (current().some((project) => directoryKey(project.worktree) === key)) return
+      const key = projectWorktreeKey(directory)
+      if (current().some((project) => projectWorktreeKey(project.worktree) === key)) return
       setStore("projects", scope, [{ worktree: directory, expanded: true }, ...current()])
     },
     close(directory: string) {
-      const key = directoryKey(directory)
+      const key = projectWorktreeKey(directory)
       setStore(
         "projects",
         input.scope(),
-        stored().filter((project) => directoryKey(project.worktree) !== key),
+        stored().filter((project) => projectWorktreeKey(project.worktree) !== key),
       )
     },
     expand(directory: string) {
-      const key = directoryKey(directory)
-      const index = stored().findIndex((project) => directoryKey(project.worktree) === key)
+      const key = projectWorktreeKey(directory)
+      const index = stored().findIndex((project) => projectWorktreeKey(project.worktree) === key)
       if (index !== -1) setStore("projects", input.scope(), index, "expanded", true)
     },
     collapse(directory: string) {
-      const key = directoryKey(directory)
-      const index = stored().findIndex((project) => directoryKey(project.worktree) === key)
+      const key = projectWorktreeKey(directory)
+      const index = stored().findIndex((project) => projectWorktreeKey(project.worktree) === key)
       if (index !== -1) setStore("projects", input.scope(), index, "expanded", false)
     },
     move(directory: string, toIndex: number) {
-      const key = directoryKey(directory)
-      const fromIndex = current().findIndex((project) => directoryKey(project.worktree) === key)
+      const key = projectWorktreeKey(directory)
+      const fromIndex = current().findIndex((project) => projectWorktreeKey(project.worktree) === key)
       if (fromIndex === -1 || fromIndex === toIndex) return
       const next = [...current()]
       const [item] = next.splice(fromIndex, 1)

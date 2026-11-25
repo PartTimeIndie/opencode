@@ -1,6 +1,6 @@
 import { expect } from "bun:test"
 import { createCerebras } from "@ai-sdk/cerebras"
-import { LLM, LLMEvent, Message, SystemPart } from "@opencode-ai/llm"
+import { LLM, LLMEvent, Message, SystemPart, ToolDefinition } from "@opencode-ai/llm"
 import { Effect, Stream } from "effect"
 import { SessionRunnerAISDK } from "@opencode-ai/core/session/runner/aisdk"
 import { it } from "./lib/effect"
@@ -9,9 +9,9 @@ import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 
 const image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
 
-function fixture() {
+function fixture(warning?: { type: "unsupported" | "compatibility"; feature: string }) {
   const bodies: string[] = []
-  const language = createCerebras({
+  const sdk = createCerebras({
     apiKey: "fixture-key",
     fetch: Object.assign(
       async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -30,12 +30,113 @@ function fixture() {
       { preconnect: fetch.preconnect },
     ),
   }).languageModel("qwen-fixture")
+  const language = warning ? new Proxy(sdk, {
+    get(target, key, receiver) {
+      if (key !== "doStream") return Reflect.get(target, key, receiver)
+      return async (options: Parameters<typeof target.doStream>[0]) => {
+        const result = await target.doStream(options)
+        return {
+          ...result,
+          stream: result.stream.pipeThrough(new TransformStream({
+            transform(part, controller) {
+              controller.enqueue(part.type === "stream-start" ? { ...part, warnings: [warning] } : part)
+            },
+          })),
+        }
+      }
+    },
+  }) : sdk
   return {
     bodies,
     language,
     model: SessionRunnerModel.fromAISDKModel(model("cerebras", "qwen-fixture"), language),
   }
 }
+
+it.effect("passes the requested JSON response schema to the SDK model", () =>
+  Effect.gen(function* () {
+    const input = fixture()
+    const captured: unknown[] = []
+    const language = new Proxy(input.language, {
+      get(target, key, receiver) {
+        if (key !== "doStream") return Reflect.get(target, key, receiver)
+        return (options: Parameters<typeof target.doStream>[0]) => {
+          captured.push(options.responseFormat)
+          return target.doStream(options)
+        }
+      },
+    })
+    const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] }
+    yield* SessionRunnerAISDK.stream(language, LLM.request({
+      model: input.model,
+      messages: [Message.user("Return an answer")],
+      responseFormat: { type: "json", schema },
+    })).pipe(Stream.runDrain)
+    expect(captured).toEqual([{ type: "json", schema }])
+  }),
+)
+
+it.effect("normalizes a tool response format to a named tool at the actual HTTP boundary", () =>
+  Effect.gen(function* () {
+    const input = fixture()
+    const tool = ToolDefinition.make({ name: "answer", description: "answer", inputSchema: { type: "object" } })
+    const events = yield* SessionRunnerAISDK.stream(input.language, LLM.request({
+      model: input.model,
+      messages: [Message.user("Return an answer")],
+      responseFormat: { type: "tool", tool },
+    })).pipe(Stream.runCollect)
+    expect(input.bodies).toHaveLength(1)
+    expect(JSON.parse(input.bodies[0] ?? "{}")).toMatchObject({
+      tools: [{ type: "function", function: { name: "answer", parameters: { type: "object" } } }],
+      tool_choice: { type: "function", function: { name: "answer" } },
+    })
+    expect(Array.from(events).filter(LLMEvent.is.providerError)).toHaveLength(0)
+  }),
+)
+
+it.effect("rejects conflicting tool response requirements before HTTP", () =>
+  Effect.gen(function* () {
+    const input = fixture()
+    const tool = ToolDefinition.make({ name: "answer", description: "answer", inputSchema: { type: "object" } })
+    const events = yield* SessionRunnerAISDK.stream(input.language, LLM.request({
+      model: input.model,
+      messages: [Message.user("Return an answer")],
+      toolChoice: "none",
+      responseFormat: { type: "tool", tool },
+    })).pipe(Stream.runCollect)
+    expect(input.bodies).toHaveLength(0)
+    expect(Array.from(events).filter(LLMEvent.is.providerError)).toHaveLength(1)
+  }),
+)
+
+for (const type of ["unsupported", "compatibility"] as const) {
+  it.effect(`stops the SDK stream when a ${type} warning discards the response schema`, () =>
+    Effect.gen(function* () {
+      const input = fixture({ type, feature: "responseFormat.schema" })
+      const events = Array.from(yield* SessionRunnerAISDK.stream(input.language, LLM.request({
+        model: input.model,
+        messages: [Message.user("Return JSON")],
+        responseFormat: { type: "json", schema: { type: "object" } },
+      })).pipe(Stream.runCollect))
+      expect(events.filter(LLMEvent.is.providerError)).toHaveLength(1)
+      expect(events.filter(LLMEvent.is.finish)).toHaveLength(0)
+      expect(events.filter(LLMEvent.is.textDelta)).toHaveLength(0)
+    }),
+  )
+}
+
+it.effect("keeps unrelated SDK warnings nonfatal", () =>
+  Effect.gen(function* () {
+    const input = fixture({ type: "unsupported", feature: "temperature" })
+    const events = Array.from(yield* SessionRunnerAISDK.stream(input.language, LLM.request({
+      model: input.model,
+      messages: [Message.user("Return JSON")],
+      responseFormat: { type: "json", schema: { type: "object" } },
+    })).pipe(Stream.runCollect))
+    expect(events.filter(LLMEvent.is.providerError)).toHaveLength(0)
+    expect(events.filter(LLMEvent.is.finish)).toHaveLength(1)
+  }),
+)
 
 it.effect("sends one leading system message through the real Cerebras SDK for a fresh chat", () =>
   Effect.gen(function* () {

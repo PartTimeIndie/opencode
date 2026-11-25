@@ -165,6 +165,7 @@ export class Assistant extends Schema.Class<Assistant>("Session.Message.Assistan
   type: Schema.Literal("assistant"),
   agent: Schema.String,
   model: SessionEvent.Step.Started.data.fields.model,
+  structuredOutputAttempt: SessionEvent.Step.Started.data.fields.structuredOutputAttempt,
   content: AssistantContent.pipe(Schema.Array),
   snapshot: Schema.Struct({
     start: Schema.String.pipe(Schema.optional),

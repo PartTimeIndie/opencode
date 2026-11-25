@@ -183,6 +183,9 @@ export class LLMError extends Schema.TaggedErrorClass<LLMError>()("LLM.Error", {
   module: Schema.String,
   method: Schema.String,
   reason: LLMErrorReason,
+  // Callers must not renew a logical assignment's format budget via fallback,
+  // even when the correction ends with a transport or provider error.
+  structuredOutputCorrectionAttempted: Schema.optional(Schema.Literal(true)),
 }) {
   override readonly cause = this.reason
 

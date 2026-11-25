@@ -5,8 +5,10 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { copyFile, mkdir, readFile, realpath, stat } from "node:fs/promises"
 import { constants, existsSync } from "node:fs"
 import { createHash } from "node:crypto"
+import { CrashActivity } from "../observability/crash-activity"
 
 type PackageManifest = {
+  name?: unknown
   exports?: Record<string, unknown>
   opencode?: { api?: unknown }
 }
@@ -76,7 +78,12 @@ export async function loadProviderPackage(spec: string, resolve: (specifier: str
   const canonicalRelative = path.relative(canonicalDirectory, canonicalTarget)
   if (canonicalRelative.startsWith(".." + path.sep) || canonicalRelative === ".." || path.isAbsolute(canonicalRelative))
     throw new Error(`Provider plugin ${spec} exports a file outside its package`)
-  const imported: unknown = await import(pathToFileURL(canonicalTarget).href)
+  const pluginID = typeof manifest.name === "string" ? manifest.name
+    : `local-${createHash("sha256").update(canonicalDirectory).digest("hex")}`
+  const imported: unknown = await CrashActivity.trackPromise(
+    { kind: "plugin", pluginID, name: "provider.import" },
+    () => import(pathToFileURL(canonicalTarget).href),
+  )
   const value = imported && typeof imported === "object" && "default" in imported ? imported.default : undefined
   if (
     !value ||

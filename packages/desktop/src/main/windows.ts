@@ -14,7 +14,7 @@ import { getStore } from "./store"
 import { PINCH_ZOOM_ENABLED_KEY } from "./store-keys"
 import { createUnresponsiveSampler } from "./unresponsive"
 import { isAllowedBrowserUrl } from "./url-policy"
-import { sidecarBrowserAuthorization } from "./browser-sidecar-auth"
+import { ownsSidecarLogin, sidecarBrowserAuthorization } from "./browser-sidecar-auth"
 import { pluginAssetTarget } from "./plugin-asset-url"
 import { rendererPermissionAllowed } from "./renderer-permissions"
 
@@ -85,7 +85,7 @@ function iconsDir() {
   return app.isPackaged ? join(process.resourcesPath, "icons") : join(root, "../../resources/icons")
 }
 
-function iconPath() {
+export function iconPath() {
   const ext = process.platform === "win32" ? "ico" : "png"
   return join(iconsDir(), `icon.${ext}`)
 }
@@ -518,7 +518,7 @@ function wireBrowserSidecarAuthorization(browserSession: Session) {
     callback({ requestHeaders: details.requestHeaders })
   })
   app.on("login", (event, contents, request, authInfo, callback) => {
-    if (contents.session !== browserSession || authInfo.isProxy) return
+    if (!ownsSidecarLogin(contents, browserSession, authInfo.isProxy)) return
     if (!sidecarBrowserAuthorization(request.url, pluginAssetServer)) return
     event.preventDefault()
     callback(pluginAssetServer?.username ?? "opencode", pluginAssetServer?.password ?? "")

@@ -19,16 +19,20 @@ describe("session-goal command control", () => {
     expect(parseSessionGoalControl("status")).toEqual({ type: "status" })
   })
 
-  test("produces idempotent set and clear patches while status stays read-only", () => {
+  test("atomically replaces text, run and old status even for the same goal text", () => {
     const set = parseSessionGoalControl("set ship it")
     const clear = parseSessionGoalControl("clear")
     const status = parseSessionGoalControl("status")
 
     const firstSetPatch = set && sessionGoalMetadataPatch(set)
     const secondSetPatch = set && sessionGoalMetadataPatch(set)
-    expect(firstSetPatch).toEqual({ set: { [SessionGoalMetadataKey]: "ship it" } })
-    expect(secondSetPatch).toEqual(firstSetPatch)
-    expect(clear && sessionGoalMetadataPatch(clear)).toEqual({ unset: [SessionGoalMetadataKey] })
+    expect(firstSetPatch).toEqual({
+      set: { [SessionGoalMetadataKey]: "ship it", "opencode.session.goal_run": expect.any(String) },
+      unset: ["opencode.session.goal_status"],
+    })
+    expect(secondSetPatch).toMatchObject({ set: { [SessionGoalMetadataKey]: "ship it" } })
+    expect(secondSetPatch).not.toEqual(firstSetPatch)
+    expect(clear && sessionGoalMetadataPatch(clear)).toEqual({ unset: [SessionGoalMetadataKey, "opencode.session.goal_run", "opencode.session.goal_status"] })
     expect(status && sessionGoalMetadataPatch(status)).toBeUndefined()
   })
 

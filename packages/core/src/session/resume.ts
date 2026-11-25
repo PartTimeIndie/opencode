@@ -23,20 +23,83 @@ export const DEFAULT_MAX_DELAY_MS = 30_000
 // Longer provider deadlines settle as deferred, never as an earlier retry.
 export const MAX_AUTO_RETRY_WAIT_MS = 300_000
 export const DEFAULT_AUTO_RESUME_ATTEMPTS = 3
+// A short-term account throttle (for example Z.AI code 1302 on HTTP 429) outlives
+// the transport budget when parallel sessions share one account: five attempts
+// with a 30 s cap give up after roughly a minute. Plan quota never reaches this
+// schedule because it settles as retryability "none" on the same model.
+export const THROTTLE_RETRY_ATTEMPTS = 8
+export const THROTTLE_MAX_DELAY_MS = 60_000
+
+/**
+ * Implementation-task chain passes. A native task child advances its model chain on
+ * every eligible provider failure and may run that chain at most this many times per
+ * activity before it fails visibly. Ordinary sessions never use this state.
+ */
+export const MAX_CHAIN_PASSES = 2
+// Only the visible failure record is capped; the lane itself is bounded by passes × steps.
+export const MAX_RECORDED_CHAIN_ATTEMPTS = 16
+
+export type ChainPass = {
+  /** Identity of the chain this pass belongs to (id and ordered steps); a changed binding starts over. */
+  readonly chain: string
+  /** 1-based pass over the chain. */
+  readonly pass: number
+  /** A clean retryable provider failure was observed in the current pass. */
+  readonly retryable: boolean
+  /** A full repeat would revisit a model whose quota is exhausted. */
+  readonly quotaBlocked?: true
+  /** Latest wait the retryable failures of this pass asked for before the chain may run again. */
+  readonly delayMs: number
+  /** Failed attempts in order, each `provider/model:code`. */
+  readonly attempts: ReadonlyArray<string>
+}
 
 /** One shared allowance per activity; successful tool turns do not reset it. */
 export function recoveryBudget() {
   let attempt = 0
+  let chainPass: ChainPass | undefined
+  const current = (chain: string) => (chainPass?.chain === chain ? chainPass : undefined)
   return {
-    next: () => (attempt < DEFAULT_AUTO_RETRY_ATTEMPTS ? ++attempt : undefined),
+    next: (code?: SessionFailure.Code) =>
+      attempt < (code === undefined ? DEFAULT_AUTO_RETRY_ATTEMPTS : retryBudget(code)) ? ++attempt : undefined,
+    chainPass: () => chainPass,
+    // Records one failed chain step of the task lane. A different chain (the user
+    // switched the selection) starts a fresh first pass instead of inheriting the old one.
+    observeChainFailure: (
+      chain: string,
+      failure: { readonly retryable: boolean; readonly delayMs: number; readonly attempt: string },
+    ): ChainPass => {
+      const previous = current(chain)
+      chainPass = {
+        chain,
+        pass: previous?.pass ?? 1,
+        retryable: (previous?.retryable ?? false) || failure.retryable,
+        ...(previous?.quotaBlocked || !failure.retryable ? { quotaBlocked: true as const } : {}),
+        delayMs: failure.retryable ? Math.max(previous?.delayMs ?? 0, failure.delayMs) : (previous?.delayMs ?? 0),
+        attempts: [...(previous?.attempts ?? []), failure.attempt].slice(-MAX_RECORDED_CHAIN_ATTEMPTS),
+      }
+      return chainPass
+    },
+    // The one additional full pass: same chain, counted from its first step again.
+    restartChainPass: (chain: string): ChainPass => {
+      const previous = current(chain)
+      chainPass = {
+        chain,
+        pass: (previous?.pass ?? 1) + 1,
+        retryable: false,
+        delayMs: 0,
+        attempts: previous?.attempts ?? [],
+      }
+      return chainPass
+    },
   }
 }
 
-const autoRetry = (maxAttempts = DEFAULT_AUTO_RETRY_ATTEMPTS): Policy => ({
+const autoRetry = (maxAttempts = DEFAULT_AUTO_RETRY_ATTEMPTS, maxDelayMs = DEFAULT_MAX_DELAY_MS): Policy => ({
   action: "auto-retry",
   maxAttempts,
   baseDelayMs: DEFAULT_BASE_DELAY_MS,
-  maxDelayMs: DEFAULT_MAX_DELAY_MS,
+  maxDelayMs,
 })
 
 const autoResume = (maxAttempts = DEFAULT_AUTO_RESUME_ATTEMPTS): Policy => ({
@@ -55,7 +118,7 @@ const terminal: Policy = {
 
 const policies: Record<SessionFailure.Code, Policy> = {
   "provider.transport": autoRetry(),
-  "provider.rate-limit": autoRetry(),
+  "provider.rate-limit": autoRetry(THROTTLE_RETRY_ATTEMPTS, THROTTLE_MAX_DELAY_MS),
   "provider.auth": terminal,
   "provider.context-overflow": autoResume(1),
   "provider.content-policy": terminal,

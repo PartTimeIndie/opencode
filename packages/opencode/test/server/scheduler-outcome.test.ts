@@ -733,6 +733,24 @@ describe("scheduled app job outcome", () => {
     ).toEqual({ status: "pending", phase: "promoted", runId })
   })
 
+  for (const status of ["interrupted", "failed", "completed"] as const) {
+    test(`fails an explicitly bound ${status} legacy activity without a closing sequence`, async () => {
+      expect(
+        await runOutcome({
+          promotedSeq: 11,
+          storedActivityID: "activity_legacy_bound",
+          resultContract: ScheduledJob.resultContractMarker,
+          activities: [{ id: "activity_legacy_bound", status, openedSeq: 10, closedSeq: null }],
+        }),
+      ).toEqual({
+        status: "failed",
+        runId,
+        activityID: "activity_legacy_bound",
+        error: "Scheduled app session ended without a closing sequence.",
+      })
+    })
+  }
+
   test("trusts a persisted same-session activity after recovery shifts its sequence window", async () => {
     expect(
       await runOutcome({

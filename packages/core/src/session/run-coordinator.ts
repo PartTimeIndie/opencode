@@ -1,14 +1,16 @@
 export * as SessionRunCoordinator from "./run-coordinator"
 
-import { Cause, Context, Deferred, Effect, Exit, Fiber, FiberSet, Layer, Scope } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, FiberSet, Layer, Schema, Scope } from "effect"
 import { SessionRunner } from "./runner"
 import { logFailure } from "./logging"
 import { SessionSchema } from "./schema"
 
-export type Mode = "run" | "wake"
+export type Mode = "run" | "wake" | "recovery"
+
+export class Busy extends Schema.TaggedErrorClass<Busy>()("SessionRunCoordinator.Busy", {}) {}
 
 /** Why one drain generation should run. Explicit runs dominate advisory wakes when demands coalesce. */
-type Demand = { readonly _tag: "run" | "wake"; readonly seq?: number }
+type Demand = { readonly _tag: Mode; readonly seq?: number }
 
 /**
  * Runs at most one drain chain per key while allowing different keys to drain concurrently.
@@ -29,6 +31,8 @@ type Demand = { readonly _tag: "run" | "wake"; readonly seq?: number }
 export interface Coordinator<Key, A, E> {
   /** Starts or joins one explicit drain generation. */
   readonly run: (key: Key) => Effect.Effect<A, E>
+  /** A crash handoff never joins, queues behind, or supersedes human work/stops. */
+  readonly recover: (key: Key) => Effect.Effect<void, E>
   /** Starts an explicit drain while idle or joins the current ownership chain without forcing a successor. */
   readonly runOrJoin: (key: Key) => Effect.Effect<A, E>
   /** Coalesces one wake-up after durable work is recorded. */
@@ -43,6 +47,8 @@ export interface Coordinator<Key, A, E> {
   readonly awaitIdle: (key: Key) => Effect.Effect<void, E>
   /** Requests interruption immediately without waiting for drain or tool/provider cleanup. */
   readonly interrupt: (key: Key, seq?: number) => Effect.Effect<void>
+  /** Run a host transaction only while idle; exclude every new drain until it finishes. */
+  readonly withIdle: <B, E2, R>(key: Key, operation: Effect.Effect<B, E2, R>) => Effect.Effect<B, E2 | Busy, R>
 }
 
 /** One Session's process-local execution lane: one active demand and at most one coalesced follow-up. */
@@ -77,6 +83,8 @@ export const make = <Key, A, E>(options: {
   Effect.gen(function* () {
     const active = new Map<Key, Entry<A, E>>()
     const interruptSeq = new Map<Key, number>()
+    const recoveryStopped = new Set<Key>()
+    const idleLocks = new Map<Key, Deferred.Deferred<void>>()
     const report = yield* FiberSet.makeRuntime<never, void, never>()
     const fork = yield* FiberSet.makeRuntime<never, void, never>()
     const shutdown = Deferred.makeUnsafe<void>()
@@ -87,6 +95,9 @@ export const make = <Key, A, E>(options: {
         Deferred.doneUnsafe(shutdown, Effect.void)
         active.clear()
         interruptSeq.clear()
+        recoveryStopped.clear()
+        for (const lock of idleLocks.values()) Deferred.doneUnsafe(lock, Effect.void)
+        idleLocks.clear()
       }),
     )
 
@@ -166,35 +177,43 @@ export const make = <Key, A, E>(options: {
       }
     }
 
-    const wake = (key: Key, seq?: number) =>
-      Effect.sync(() => {
-        if (closed) return
-        if (!isAfterInterrupt(key, seq)) return
-        const entry = active.get(key)
-        if (entry !== undefined) {
-          if (!acceptsWake(entry, seq)) return
-          entry.pending = coalesce(entry.pending, { _tag: "wake", seq })
-          return
-        }
+    const wake = (key: Key, seq?: number): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        const lock = idleLocks.get(key)
+        if (lock) return Deferred.await(lock).pipe(Effect.andThen(wake(key, seq)))
+        return Effect.sync(() => {
+          if (closed) return
+          if (!isAfterInterrupt(key, seq)) return
+          const entry = active.get(key)
+          if (entry !== undefined) {
+            if (!acceptsWake(entry, seq)) return
+            entry.pending = coalesce(entry.pending, { _tag: "wake", seq })
+            return
+          }
 
-        const next = makeEntry({ _tag: "wake", seq })
-        active.set(key, next)
-        start(key, next, next.current)
+          const next = makeEntry({ _tag: "wake", seq })
+          active.set(key, next)
+          start(key, next, next.current)
+        })
       })
 
-    const queueContinuation = (key: Key) =>
-      Effect.sync(() => {
-        // A continuation is explicit new work, not an unsequenced advisory wake.
-        // A previous stop boundary must not permanently disable future continuations.
-        if (closed) return
-        const entry = active.get(key)
-        if (entry !== undefined) {
-          entry.pending = coalesce(entry.pending, { _tag: "run" })
-          return
-        }
-        const next = makeEntry({ _tag: "run" })
-        active.set(key, next)
-        start(key, next, next.current)
+    const queueContinuation = (key: Key): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        const lock = idleLocks.get(key)
+        if (lock) return Deferred.await(lock).pipe(Effect.andThen(queueContinuation(key)))
+        return Effect.sync(() => {
+          // A continuation is explicit new work, not an unsequenced advisory wake.
+          // A previous stop boundary must not permanently disable future continuations.
+          if (closed) return
+          const entry = active.get(key)
+          if (entry !== undefined) {
+            entry.pending = coalesce(entry.pending, { _tag: "run" })
+            return
+          }
+          const next = makeEntry({ _tag: "run" })
+          active.set(key, next)
+          start(key, next, next.current)
+        })
       })
 
     const awaitIdle = (key: Key): Effect.Effect<void, E> =>
@@ -220,17 +239,14 @@ export const make = <Key, A, E>(options: {
 
     const interrupt = (key: Key, seq?: number): Effect.Effect<void> =>
       Effect.suspend(() => {
+        recoveryStopped.add(key)
         const entry = active.get(key)
         const latest = interruptSeq.get(key)
         if (seq !== undefined && latest !== undefined && seq <= latest)
           return entry?.stopping && entry.owner !== undefined ? interruptOwner(entry.owner) : Effect.void
         if (seq !== undefined) interruptSeq.set(key, seq)
         if (entry?.owner === undefined) return Effect.void
-        if (
-          seq !== undefined &&
-          entry.current.seq !== undefined &&
-          entry.current.seq > seq
-        ) {
+        if (seq !== undefined && entry.current.seq !== undefined && entry.current.seq > seq) {
           if (entry.pending?._tag === "wake") suppressPendingAtOrBefore(entry, seq)
           return Effect.void
         }
@@ -245,11 +261,37 @@ export const make = <Key, A, E>(options: {
         return interruptOwner(entry.owner)
       })
 
-    return { run, runOrJoin, wake, queueContinuation, awaitIdle, interrupt }
+    const withIdle: Coordinator<Key, A, E>["withIdle"] = (key, operation) =>
+      Effect.acquireUseRelease(
+        Effect.suspend(() => {
+          if (closed || active.has(key) || idleLocks.has(key)) return Effect.fail(new Busy())
+          const lock = Deferred.makeUnsafe<void>()
+          idleLocks.set(key, lock)
+          return Effect.succeed(lock)
+        }),
+        () => operation,
+        (lock) =>
+          Effect.sync(() => {
+            if (idleLocks.get(key) === lock) idleLocks.delete(key)
+            Deferred.doneUnsafe(lock, Effect.void)
+          }),
+      )
+
+    const recover = (key: Key): Effect.Effect<void, E> => Effect.uninterruptibleMask((restore) => {
+      if (closed || active.has(key) || idleLocks.has(key) || recoveryStopped.has(key)) return Effect.void
+      const next = makeEntry({ _tag: "recovery" })
+      active.set(key, next)
+      start(key, next, next.current)
+      return restore(awaitRun(next.done)).pipe(Effect.asVoid)
+    })
+
+    return { run, recover, runOrJoin, wake, queueContinuation, awaitIdle, interrupt, withIdle }
 
     function run(key: Key): Effect.Effect<A, E> {
       return Effect.uninterruptibleMask((restore) => {
         if (closed) return Effect.interrupt
+        const lock = idleLocks.get(key)
+        if (lock) return restore(Deferred.await(lock).pipe(Effect.andThen(run(key))))
         const entry = active.get(key)
         if (entry !== undefined) {
           if (entry.stopping) {
@@ -273,6 +315,8 @@ export const make = <Key, A, E>(options: {
     function runOrJoin(key: Key): Effect.Effect<A, E> {
       return Effect.uninterruptibleMask((restore) => {
         if (closed) return Effect.interrupt
+        const lock = idleLocks.get(key)
+        if (lock) return restore(Deferred.await(lock).pipe(Effect.andThen(runOrJoin(key))))
         const entry = active.get(key)
         if (entry !== undefined) {
           if (entry.stopping) {

@@ -1169,6 +1169,515 @@ test("automatic compaction continues from complete current history and durable o
   expect(published).not.toContain(SessionEvent.Prompted.type)
 })
 
+const commandCarryModel = () =>
+  Model.make({
+    id: "model",
+    provider: "provider",
+    route: route.with({ limits: { context: 100_000, output: 1_000 } }),
+  })
+
+const commandCarryHarness = (overrides?: {
+  readonly commandNames?: Effect.Effect<ReadonlySet<string>>
+  readonly entries?: readonly { readonly seq: number; readonly message: SessionMessage.Message }[]
+}) => {
+  const published: string[] = []
+  let recent = ""
+  const compaction = SessionCompaction.make({
+    config: [{ type: "document", path: "test", info: { compaction: { keep: { tokens: 1, turns: 1 } } } }],
+    commandNames: overrides?.commandNames,
+    loadCurrent: () => Effect.succeed({ entries: overrides?.entries ?? [], todos: [] }),
+    events: {
+      publish: (definition: { readonly type: string }, data: unknown) =>
+        Effect.sync(() => {
+          published.push(definition.type)
+          if (definition.type === SessionEvent.Compaction.Ended.type)
+            recent = (data as { readonly recent?: string }).recent ?? ""
+          return { seq: 99 }
+        }),
+    } as never,
+    llm: {
+      stream: () =>
+        Stream.make(
+          LLMEvent.textStart({ id: "text" }),
+          LLMEvent.textDelta({ id: "text", text: "summary" }),
+          LLMEvent.textEnd({ id: "text" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ),
+    },
+  })
+  return { compaction, published, recent: () => recent }
+}
+
+test("compaction carries the active slash-command workflow into the checkpoint recent", async () => {
+  const workflow = [
+    "/multi-agent-review",
+    "",
+    "Run the reviewer fanout, then ask the user which findings to implement before editing.",
+  ].join("\n")
+  const entries = [
+    {
+      seq: 1,
+      message: new SessionMessage.User({
+        id: SessionMessage.ID.make("msg_command_carry_old"),
+        type: "user" as const,
+        text: "Older unrelated history ".repeat(400),
+        time: { created: DateTime.makeUnsafe(1) },
+      }),
+    },
+    {
+      seq: 2,
+      message: new SessionMessage.User({
+        id: SessionMessage.ID.make("msg_command_carry_invoke"),
+        type: "user" as const,
+        text: workflow,
+        time: { created: DateTime.makeUnsafe(2) },
+      }),
+    },
+    {
+      seq: 3,
+      message: new SessionMessage.Assistant({
+        id: SessionMessage.ID.make("msg_command_carry_assistant"),
+        type: "assistant" as const,
+        agent: "build",
+        model: { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") },
+        content: [
+          new SessionMessage.AssistantReasoning({
+            type: "reasoning",
+            id: "reasoning-command-carry",
+            text: "Reviewers finished; awaiting the user's finding selection",
+          }),
+        ],
+        time: { created: DateTime.makeUnsafe(3), completed: DateTime.makeUnsafe(4) },
+      }),
+    },
+    {
+      seq: 5,
+      message: new SessionMessage.User({
+        id: SessionMessage.ID.make("msg_command_carry_steer"),
+        type: "user" as const,
+        text: "continue",
+        time: { created: DateTime.makeUnsafe(5) },
+      }),
+    },
+  ]
+  const { compaction, recent } = commandCarryHarness({
+    commandNames: Effect.succeed(new Set(["multi-agent-review"])),
+    entries,
+  })
+  const model = commandCarryModel()
+  expect(
+    await Effect.runPromise(
+      compaction.compactAfterOverflow({
+        sessionID: SessionSchema.ID.make("ses_command_carry"),
+        model,
+        request: LLM.request({ model, messages: [], tools: [] }),
+        entries: [],
+      }),
+    ),
+  ).toBe(true)
+  const checkpoint = recent()
+  expect(checkpoint).toContain("[durable-command-invocation]")
+  expect(checkpoint).toContain("/multi-agent-review")
+  expect(checkpoint).toContain("ask the user which findings to implement before editing")
+  expect(checkpoint).toContain("continue")
+})
+
+test("compaction carries a durable command block forward from an earlier checkpoint", async () => {
+  const carried = [
+    "[durable-command-invocation]",
+    "The slash-command workflow below stays active across this checkpoint; continue following it, including its required user questions.",
+    "/visual-qa-testing",
+    "Verify the rendered toolbar at desktop and mobile viewports and report console errors.",
+    "[/durable-command-invocation]",
+  ].join("\n")
+  const entries = [
+    {
+      seq: 1,
+      message: new SessionMessage.Compaction({
+        id: SessionMessage.ID.make("msg_command_carry_checkpoint"),
+        type: "compaction" as const,
+        reason: "auto",
+        summary: "Earlier review summary",
+        recent: `${carried}\n\n[User]: continue the review`,
+        time: { created: DateTime.makeUnsafe(1) },
+      }),
+    },
+    {
+      seq: 2,
+      message: new SessionMessage.User({
+        id: SessionMessage.ID.make("msg_command_carry_after_checkpoint"),
+        type: "user" as const,
+        text: "continue",
+        time: { created: DateTime.makeUnsafe(2) },
+      }),
+    },
+  ]
+  const { compaction, recent } = commandCarryHarness({
+    commandNames: Effect.succeed(new Set(["visual-qa-testing"])),
+    entries,
+  })
+  const model = commandCarryModel()
+  expect(
+    await Effect.runPromise(
+      compaction.compactAfterOverflow({
+        sessionID: SessionSchema.ID.make("ses_command_carry_forward"),
+        model,
+        request: LLM.request({ model, messages: [], tools: [] }),
+        entries: [],
+      }),
+    ),
+  ).toBe(true)
+  const checkpoint = recent()
+  expect(checkpoint).toContain("[durable-command-invocation]")
+  expect(checkpoint).toContain("/visual-qa-testing")
+  expect(checkpoint).toContain("Verify the rendered toolbar at desktop and mobile viewports")
+})
+
+test("compaction reserves the command carry footprint from the retained tail", async () => {
+  const invocation = [
+    "/multi-agent-review",
+    "",
+    "review step ".repeat(300),
+    "RAWTAIL9Z",
+  ].join("\n")
+  const entries = [
+    {
+      seq: 1,
+      message: new SessionMessage.User({
+        id: SessionMessage.ID.make("msg_command_reserve_invoke"),
+        type: "user" as const,
+        text: invocation,
+        time: { created: DateTime.makeUnsafe(1) },
+      }),
+    },
+    {
+      seq: 2,
+      message: new SessionMessage.Assistant({
+        id: SessionMessage.ID.make("msg_command_reserve_assistant"),
+        type: "assistant" as const,
+        agent: "build",
+        model: { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") },
+        content: [
+          new SessionMessage.AssistantText({
+            type: "text",
+            id: "text-command-reserve",
+            text: "assistant filler ".repeat(875),
+          }),
+        ],
+        time: { created: DateTime.makeUnsafe(2), completed: DateTime.makeUnsafe(3) },
+      }),
+    },
+    {
+      seq: 4,
+      message: new SessionMessage.User({
+        id: SessionMessage.ID.make("msg_command_reserve_steer"),
+        type: "user" as const,
+        text: "continue",
+        time: { created: DateTime.makeUnsafe(4) },
+      }),
+    },
+  ]
+  const reserved = commandCarryHarness({
+    commandNames: Effect.succeed(new Set(["multi-agent-review"])),
+    entries,
+  })
+  const reservedModel = commandCarryModel()
+  expect(
+    await Effect.runPromise(
+      reserved.compaction.compactAfterOverflow({
+        sessionID: SessionSchema.ID.make("ses_command_reserve"),
+        model: reservedModel,
+        request: LLM.request({ model: reservedModel, messages: [], tools: [] }),
+        contextEstimateTokens: 200_000,
+        keepTokens: 5_000,
+        keepTurns: false,
+        entries: [],
+      }),
+    ),
+  ).toBe(true)
+  const reservedRecent = reserved.recent()
+  expect(reservedRecent).toContain("[durable-command-invocation]")
+  expect(reservedRecent).toContain("/multi-agent-review")
+  // The reserved tail no longer holds the raw invocation message; it survives
+  // through the carry block instead.
+  expect(reservedRecent).not.toContain("[User]: /multi-agent-review")
+
+  const unreserved = commandCarryHarness({ entries })
+  const unreservedModel = commandCarryModel()
+  expect(
+    await Effect.runPromise(
+      unreserved.compaction.compactAfterOverflow({
+        sessionID: SessionSchema.ID.make("ses_command_reserve_unreserved"),
+        model: unreservedModel,
+        request: LLM.request({ model: unreservedModel, messages: [], tools: [] }),
+        contextEstimateTokens: 200_000,
+        keepTokens: 5_000,
+        keepTurns: false,
+        entries: [],
+      }),
+    ),
+  ).toBe(true)
+  expect(unreserved.recent()).toContain("[User]: /multi-agent-review")
+  expect(unreserved.recent()).not.toContain("[durable-command-invocation]")
+})
+
+test("compaction bounds the carried command context to its budget", async () => {  const oversized = [
+    "/multi-agent-review",
+    "Filler ".repeat(3_000),
+    "SENTINEL_TAIL_MARKER beyond the carry budget",
+  ].join("\n")
+  const { compaction, recent } = commandCarryHarness({
+    commandNames: Effect.succeed(new Set(["multi-agent-review"])),
+    entries: [
+      {
+        seq: 1,
+        message: new SessionMessage.User({
+          id: SessionMessage.ID.make("msg_command_carry_oversized"),
+          type: "user" as const,
+          text: oversized,
+          time: { created: DateTime.makeUnsafe(1) },
+        }),
+      },
+      {
+        seq: 2,
+        message: new SessionMessage.User({
+          id: SessionMessage.ID.make("msg_command_carry_bound_steer"),
+          type: "user" as const,
+          text: "continue",
+          time: { created: DateTime.makeUnsafe(2) },
+        }),
+      },
+    ],
+  })
+  const model = commandCarryModel()
+  expect(
+    await Effect.runPromise(
+      compaction.compactAfterOverflow({
+        sessionID: SessionSchema.ID.make("ses_command_carry_bound"),
+        model,
+        request: LLM.request({ model, messages: [], tools: [] }),
+        entries: [],
+      }),
+    ),
+  ).toBe(true)
+  const checkpoint = recent()
+  expect(checkpoint).toContain("[durable-command-invocation]")
+  expect(checkpoint).toContain("[Earlier command text omitted because it exceeds the compaction carry budget.]")
+  expect(checkpoint).not.toContain("SENTINEL_TAIL_MARKER")
+})
+
+test("compaction without command names keeps checkpoints unchanged", async () => {
+  const { compaction, recent } = commandCarryHarness({
+    entries: [
+      {
+        seq: 1,
+        message: new SessionMessage.User({
+          id: SessionMessage.ID.make("msg_command_carry_disabled"),
+          type: "user" as const,
+          text: "/multi-agent-review workflow",
+          time: { created: DateTime.makeUnsafe(1) },
+        }),
+      },
+    ],
+  })
+  const model = commandCarryModel()
+  expect(
+    await Effect.runPromise(
+      compaction.compactAfterOverflow({
+        sessionID: SessionSchema.ID.make("ses_command_carry_disabled"),
+        model,
+        request: LLM.request({ model, messages: [], tools: [] }),
+        contextEstimateTokens: 200_000,
+        entries: [],
+      }),
+    ),
+  ).toBe(true)
+  expect(recent()).not.toContain("[durable-command-invocation]")
+})
+
+test("durable command context prefers the newest command reference and reports its source", () => {
+  const carried = [
+    "[durable-command-invocation]",
+    "/visual-qa-testing",
+    "Verify the rendered toolbar.",
+    "[/durable-command-invocation]",
+  ].join("\n")
+  const checkpoint = new SessionMessage.Compaction({
+    id: SessionMessage.ID.make("msg_command_context_checkpoint"),
+    type: "compaction" as const,
+    reason: "auto",
+    summary: "summary",
+    recent: carried,
+    time: { created: DateTime.makeUnsafe(2) },
+  })
+  const names = new Set(["multi-agent-review", "visual-qa-testing"])
+  const invocation = new SessionMessage.User({
+    id: SessionMessage.ID.make("msg_command_context_invoke"),
+    type: "user" as const,
+    text: "/multi-agent-review review the change",
+    time: { created: DateTime.makeUnsafe(1) },
+  })
+  const steer = new SessionMessage.User({
+    id: SessionMessage.ID.make("msg_command_context_steer"),
+    type: "user" as const,
+    text: "continue",
+    time: { created: DateTime.makeUnsafe(3) },
+  })
+  const beforeCheckpoint = SessionCompaction.durableCommandContext(
+    [
+      { seq: 1, message: invocation },
+      { seq: 2, message: checkpoint },
+    ],
+    names,
+  )
+  expect(beforeCheckpoint.fresh).toBe(false)
+  expect(beforeCheckpoint.text).toContain("/visual-qa-testing")
+  const afterCheckpoint = SessionCompaction.durableCommandContext(
+    [
+      { seq: 1, message: invocation },
+      { seq: 2, message: checkpoint },
+      { seq: 3, message: steer },
+      {
+        seq: 4,
+        message: new SessionMessage.User({
+          id: SessionMessage.ID.make("msg_command_context_reinvoke"),
+          type: "user" as const,
+          text: "also /multi-agent-review the follow-up",
+          time: { created: DateTime.makeUnsafe(4) },
+        }),
+      },
+    ],
+    names,
+  )
+  expect(afterCheckpoint.fresh).toBe(true)
+  expect(afterCheckpoint.text).toContain("/multi-agent-review")
+  expect(SessionCompaction.durableCommandContext([{ seq: 1, message: steer }], names).text).toBe("")
+})
+
+test("durable command context keeps a carried workflow when a newer message mentions another command", () => {
+  const carried = [
+    "[durable-command-invocation]",
+    "The slash-command workflow below stays active across this checkpoint; continue following it, including its required user questions.",
+    "/multi-agent-review",
+    "Ask the user which findings to implement before editing.",
+    "[/durable-command-invocation]",
+  ].join("\n")
+  const checkpoint = new SessionMessage.Compaction({
+    id: SessionMessage.ID.make("msg_command_context_multi_checkpoint"),
+    type: "compaction" as const,
+    reason: "auto",
+    summary: "summary",
+    recent: carried,
+    time: { created: DateTime.makeUnsafe(1) },
+  })
+  const mention = new SessionMessage.User({
+    id: SessionMessage.ID.make("msg_command_context_mention"),
+    type: "user" as const,
+    text: "should we also run /visual-qa-testing after this?",
+    time: { created: DateTime.makeUnsafe(2) },
+  })
+  const context = SessionCompaction.durableCommandContext(
+    [
+      { seq: 1, message: checkpoint },
+      { seq: 2, message: mention },
+    ],
+    new Set(["multi-agent-review", "visual-qa-testing"]),
+  )
+  expect(context.fresh).toBe(true)
+  expect(context.text).toContain("Ask the user which findings to implement before editing")
+  expect(context.text).toContain("/visual-qa-testing")
+})
+
+test("durable command context carries the completed skill contract from the skill tool result", () => {
+  const contract = [
+    '<skill_content name="multi-agent-review">',
+    "# Skill: multi-agent-review",
+    "",
+    "Ask the user a blocking question before implementing any finding.",
+    "</skill_content>",
+  ].join("\n")
+  const assistant = new SessionMessage.Assistant({
+    id: SessionMessage.ID.make("msg_command_context_skill_result"),
+    type: "assistant" as const,
+    agent: "build",
+    model: { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") },
+    content: [
+      new SessionMessage.AssistantTool({
+        type: "tool",
+        id: "call_skill_contract",
+        name: "skill",
+        time: { created: DateTime.makeUnsafe(1) },
+        state: new SessionMessage.ToolStateCompleted({
+          status: "completed",
+          input: { name: "multi-agent-review" },
+          content: [{ type: "text" as const, text: contract }],
+          structured: {},
+          outputPaths: [],
+        }),
+      }),
+    ],
+    time: { created: DateTime.makeUnsafe(1), completed: DateTime.makeUnsafe(2) },
+  })
+  const steer = new SessionMessage.User({
+    id: SessionMessage.ID.make("msg_command_context_skill_steer"),
+    type: "user" as const,
+    text: "continue",
+    time: { created: DateTime.makeUnsafe(3) },
+  })
+  const context = SessionCompaction.durableCommandContext(
+    [
+      { seq: 1, message: assistant },
+      { seq: 2, message: steer },
+    ],
+    new Set(["multi-agent-review"]),
+  )
+  expect(context.fresh).toBe(true)
+  expect(context.text).toContain("Ask the user a blocking question before implementing any finding")
+  // A skill tool result for a non-carry skill stays ignored.
+  const other = SessionCompaction.durableCommandContext([{ seq: 1, message: assistant }], new Set(["other-skill"]))
+  expect(other.text).toBe("")
+})
+
+test("durable command context re-carries blocks byte-identical across compaction generations", () => {
+  const names = new Set(["multi-agent-review"])
+  const invocation = new SessionMessage.User({
+    id: SessionMessage.ID.make("msg_command_context_idempotent"),
+    type: "user" as const,
+    text: [
+      "/multi-agent-review",
+      "",
+      "Fan out reviewers, ask the user which findings to implement, then verify. ",
+      "QUESTION_SENTINEL near the end of the workflow".repeat(20),
+    ].join("\n"),
+    time: { created: DateTime.makeUnsafe(1) },
+  })
+  const first = SessionCompaction.durableCommandContext([{ seq: 1, message: invocation }], names)
+  expect(first.fresh).toBe(true)
+  const firstBlock = /\[durable-command-invocation\]\n([\s\S]*?)\n\[\/durable-command-invocation\]/.exec(
+    first.text,
+  )?.[1]
+  expect(firstBlock).toBeDefined()
+  const checkpoint = new SessionMessage.Compaction({
+    id: SessionMessage.ID.make("msg_command_context_idempotent_checkpoint"),
+    type: "compaction" as const,
+    reason: "auto",
+    summary: "summary",
+    recent: first.text,
+    time: { created: DateTime.makeUnsafe(2) },
+  })
+  const second = SessionCompaction.durableCommandContext([{ seq: 1, message: checkpoint }], names)
+  expect(second.text).toBe(first.text)
+  const third = SessionCompaction.durableCommandContext(
+    [
+      { seq: 1, message: checkpoint },
+      { seq: 2, message: checkpoint },
+    ],
+    names,
+  )
+  // The newest checkpoint wins and re-emits the same carried blocks.
+  expect(third.text).toBe(first.text)
+})
+
 test("unlimited history still attempts a real provider compaction when the model budget overflows", async () => {
   let providerCalls = 0
   const compaction = SessionCompaction.make({

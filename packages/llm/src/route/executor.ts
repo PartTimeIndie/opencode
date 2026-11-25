@@ -23,7 +23,7 @@ import {
   UnknownProviderReason,
 } from "../schema"
 import { isContextOverflow } from "../provider-error"
-import { isQuotaExceeded } from "../provider-quota"
+import { isQuotaExceeded, zaiRateLimitCode } from "../provider-quota"
 
 export interface Interface {
   readonly execute: (
@@ -41,6 +41,7 @@ export interface Interface {
 export type ExecuteOptions = {
   readonly retries?: number
   readonly responseHeadersTimeoutMs?: number
+  readonly provider?: string
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM/RequestExecutor") {}
@@ -244,6 +245,7 @@ const responseHttp = (input: {
 
 const statusReason = (input: {
   readonly status: number
+  readonly provider?: string | undefined
   readonly message: string
   readonly retryAfterMs?: number | undefined
   readonly rateLimit?: HttpRateLimitDetails | undefined
@@ -275,11 +277,15 @@ const statusReason = (input: {
     })
   }
   if (input.status === 429) {
-    if (isQuotaExceeded(body)) {
+    const zaiCode = ["zhipuai", "zhipuai-coding-plan", "zai", "zai-coding-plan"].includes(input.provider ?? "")
+      ? zaiRateLimitCode(body)
+      : undefined
+    if (zaiCode === "1308" || zaiCode === "1310" || (zaiCode === undefined && isQuotaExceeded(body))) {
       return new QuotaExceededReason({ message: input.message, http: input.http })
     }
     return new RateLimitReason({
       message: input.message,
+      ...(zaiCode === "1302" ? { providerMetadata: { zai: { code: zaiCode } } } : {}),
       retryAfterMs: input.retryAfterMs,
       rateLimit: input.rateLimit,
       http: input.http,
@@ -310,7 +316,7 @@ const statusReason = (input: {
 }
 
 const statusError =
-  (request: HttpClientRequest.HttpClientRequest, redactedNames: ReadonlyArray<string | RegExp>) =>
+  (request: HttpClientRequest.HttpClientRequest, redactedNames: ReadonlyArray<string | RegExp>, provider?: string) =>
   (response: HttpClientResponse.HttpClientResponse) =>
     Effect.gen(function* () {
       if (response.status < 400) return response
@@ -324,6 +330,7 @@ const statusError =
         method: "execute",
         reason: statusReason({
           status: response.status,
+          provider,
           message: providerMessage(response.status, details),
           retryAfterMs: retryAfter,
           rateLimit,
@@ -412,20 +419,20 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient> = Layer.e
   Service,
   Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
-    const executeOnce = (request: HttpClientRequest.HttpClientRequest, timeoutMs = RESPONSE_HEADERS_TIMEOUT_MS) =>
+    const executeOnce = (request: HttpClientRequest.HttpClientRequest, options?: ExecuteOptions) =>
       Effect.gen(function* () {
         const redactedNames = yield* Headers.CurrentRedactedNames
         return yield* http
           .execute(request)
           .pipe(
-            Effect.timeout(timeoutMs),
+            Effect.timeout(options?.responseHeadersTimeoutMs ?? RESPONSE_HEADERS_TIMEOUT_MS),
             Effect.mapError(toHttpError(redactedNames)),
-            Effect.flatMap(statusError(request, redactedNames)),
+            Effect.flatMap(statusError(request, redactedNames, options?.provider)),
           )
       })
     return Service.of({
       execute: (request, options) =>
-        retryStatusFailures(executeOnce(request, options?.responseHeadersTimeoutMs), options?.retries),
+        retryStatusFailures(executeOnce(request, options), options?.retries),
     })
   }),
 )

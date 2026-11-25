@@ -271,7 +271,7 @@ describe("QuestionV2", () => {
       expect(yield* service.list()).toEqual([])
       expect(published.map((event) => [event.type, event.data])).toEqual([
         [QuestionV2.Event.Requested.type, request],
-        [QuestionV2.Event.Replied.type, { sessionID, requestID: request.id, answers: [["One"]] }],
+        [QuestionV2.Event.Replied.type, { sessionID, requestID: request.id, answers: [["One"]], source: "user" }],
       ])
     }),
   )

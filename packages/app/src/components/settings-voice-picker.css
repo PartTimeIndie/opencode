@@ -1,0 +1,29 @@
+[data-voice-picker] [data-component="select-v2"] {
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  min-height: 32px;
+}
+
+[data-voice-picker] [data-slot="select-v2-value-text"] {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+  padding: 6px 8px;
+}
+
+[data-slot="select-v2-content"].settings-voice-menu {
+  max-width: min(23rem, calc(100vw - 24px));
+}
+
+.settings-voice-menu [data-component="menu-v2-item"] {
+  height: auto;
+  min-height: 28px;
+  padding: 6px 12px;
+}
+
+.settings-voice-menu [data-slot="menu-v2-item-content"] {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}

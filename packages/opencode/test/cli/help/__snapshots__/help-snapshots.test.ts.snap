@@ -396,8 +396,10 @@ exports[`opencode CLI help-text snapshots every documented command emits stable 
 database tools
 
 Commands:
-  opencode db [query]     open an interactive sqlite3 shell or run a query                 [default]
-  opencode db path        print the database path
+  opencode db [query]        open an interactive sqlite3 shell or run a query              [default]
+  opencode db path           print the database path
+  opencode db legacy-retire  cancel stuck removed-orchestrator tasks and release their
+                             slots/reservations
 
 Positionals:
   query  SQL query to execute                                                               [string]

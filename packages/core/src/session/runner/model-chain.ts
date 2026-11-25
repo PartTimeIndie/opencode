@@ -10,6 +10,18 @@ export function configuredModelRef(current: ModelV2.Ref | undefined, configured:
   })
 }
 
+// Retry only once on a clean first attempt. A later chain step may still use
+// the remaining activity-wide recovery budget after this attempt fails.
+export function shouldRetryChainStep(input: {
+  hasFallback: boolean
+  attempt: number
+  retryable: boolean
+  deferred: boolean
+  replayBarrier: boolean
+}) {
+  return input.hasFallback && input.attempt === 0 && input.retryable && !input.deferred && !input.replayBarrier
+}
+
 export function nextModel(model: ModelV2.Ref): ModelV2.Ref | undefined {
   if (!model.chain) return
   const active = model.chain.active ?? 0
@@ -75,4 +87,12 @@ export function overrideModel(current: ModelV2.Ref | undefined, model: ModelV2.R
       steps: chain.steps.map((item, index) => (index === active ? step : item)),
     },
   }
+}
+
+// A firm direct selection (`chain: null`) is sticky for the rest of the Session: a
+// prompt model without any chain decision only echoes a possibly stale picker
+// state. Only an explicit decision — `chain: null` for a direct model or a chain —
+// may replace it.
+export function keepsFirmSelection(current: ModelV2.Ref | undefined, requested: ModelV2.Ref | undefined) {
+  return current?.chain === null && requested?.chain === undefined
 }

@@ -30,6 +30,7 @@ export type Event =
   | EventSessionNextPromptHeld
   | EventSessionNextPromptReleased
   | EventSessionNextPromptPromoted
+  | EventSessionNextSkillSelectionMutation
   | EventSessionNextInterruptRequested
   | EventSessionNextContextUpdated
   | EventSessionNextSynthetic
@@ -64,10 +65,15 @@ export type Event =
   | EventSessionNextCompactionStarted
   | EventSessionNextCompactionDelta
   | EventSessionNextCompactionEnded
-  | EventSessionRunnerSettled
+  | EventSessionAgentPolicyRebound
+  | EventSessionNextForkMessageImported
+  | EventSessionNextForkEpochImported
+  | EventSessionNextForkHistoryBoundaryImported
+  | EventSessionNextForkAttachmentsImported
+  | EventReferenceUpdated
   | EventPermissionV2Asked
   | EventPermissionV2Replied
-  | EventReferenceUpdated
+  | EventSessionRunnerSettled
   | EventSurfaceAsked
   | EventSurfaceReplied
   | EventSurfaceDismissed
@@ -97,6 +103,7 @@ export type Event =
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
   | EventProjectUpdated
+  | EventProjectDirectoryIconUpdated
   | EventSessionStatus
   | EventSessionIdle
   | EventVcsBranchUpdated
@@ -240,10 +247,72 @@ export type Session = {
     }
     permissionLayers: Array<PermissionV2Ruleset>
     source: {
-      type: "spawn_agent" | "task"
+      type: "spawn_agent" | "task" | "orchestrator"
       sessionID: string
       agent: string
     }
+    executionPlacement?: {
+      version: 1
+      directory: string
+      checkout: string
+      identity: string
+    }
+    mainWriteConsent?: {
+      version: 1
+      permissionID: string
+      inputID: string
+      dispatchDigest: string
+      placementIdentity: string
+    }
+    readOnly?: boolean
+    readOnlyInputID?: string
+    mirrorWorkspace?: {
+      version: 1
+      directory: string
+      taskID: string
+      inputID: string
+      dispatchDigest: string
+      sourcePlacement: {
+        version: 1
+        directory: string
+        checkout: string
+        identity: string
+      }
+      basis: {
+        version: 1
+        workspaceID: string
+        sourceSessionID: string
+        sourceDirectory: string
+        commit: string
+        files: Array<{
+          path: string
+          mode: number
+          bytes: number
+          sha256: string
+          uri: string
+        }>
+        deletedPaths: Array<string>
+      }
+      basisDigest: string
+    }
+    taskContext?: "fork" | "fresh"
+    cacheTools?: Array<{
+      name: string
+      description: string
+      inputSchema: {
+        [key: string]: unknown
+      }
+      outputSchema?: {
+        [key: string]: unknown
+      }
+      cache?: LlmCacheHint
+      metadata?: {
+        [key: string]: unknown
+      }
+      native?: {
+        [key: string]: unknown
+      }
+    }>
   }
   time: {
     created: number
@@ -267,11 +336,13 @@ export type Session = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -743,6 +814,27 @@ export type Prompt = {
   }
   system?: string
   format?: PromptOutputFormat
+  subtask?: {
+    command: string
+    description: string
+    agent: string
+    model?: {
+      id: string
+      providerID: string
+      variant?: string
+      chain?: {
+        id: string
+        name: string
+        steps: Array<{
+          id: string
+          providerID: string
+          variant?: string
+        }>
+        active?: number
+      } | null
+    }
+    workspace?: "mirror" | "main" | "readonly"
+  }
 }
 
 export type Pty = {
@@ -1021,6 +1113,7 @@ export type GlobalEvent = {
           messageID: string
           prompt: Prompt
           delivery: "steer" | "queue"
+          origin?: "interactive" | "plugin"
         }
       }
     | {
@@ -1051,6 +1144,23 @@ export type GlobalEvent = {
           messageID: string
           prompt: Prompt
           timeCreated: number
+        }
+      }
+    | {
+        id: string
+        type: "session.next.skill_selection.mutation"
+        properties: {
+          timestamp: number
+          sessionID: string
+          mutation: "selected" | "forgotten" | "renewal_declined"
+          name?: string
+          generation?: number
+          origin?: SessionNextSkillSelectionOrigin
+          selectedAt?: number
+          limits?: SessionNextSkillSelectionLimits
+          operationID?: string
+          boundMessageID?: string
+          receiptInputID?: string
         }
       }
     | {
@@ -1126,6 +1236,7 @@ export type GlobalEvent = {
             } | null
           }
           snapshot?: string
+          structuredOutputAttempt?: SessionStructuredOutputAttempt
         }
       }
     | {
@@ -1480,11 +1591,13 @@ export type GlobalEvent = {
                 exists: boolean
                 bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
                 sha256?: string
+                mode?: number
               }
               actual: {
                 exists: boolean
                 bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
                 sha256?: string
+                mode?: number
               }
               message: string
             }>
@@ -1526,11 +1639,13 @@ export type GlobalEvent = {
                 exists: boolean
                 bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
                 sha256?: string
+                mode?: number
               }
               actual: {
                 exists: boolean
                 bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
                 sha256?: string
+                mode?: number
               }
               message: string
             }>
@@ -1658,10 +1773,163 @@ export type GlobalEvent = {
       }
     | {
         id: string
-        type: "session.runner.settled"
+        type: "session.agent_policy.rebound"
         properties: {
           sessionID: string
-          status: "completed" | "error" | "interrupted"
+          timestamp: number
+          previousInputID: string
+          agentPolicy: {
+            tools: {
+              mode: "inherit" | "explicit"
+              entries: {
+                [key: string]: {
+                  visible: boolean
+                  delegable?: boolean
+                  permission: "allow" | "ask" | "deny"
+                  scope?: {
+                    mode: "global" | "projects"
+                    projects?: Array<string>
+                  }
+                  projectPermissions?: {
+                    [key: string]: "allow" | "ask" | "deny"
+                  }
+                }
+              }
+            }
+            permissionLayers: Array<PermissionV2Ruleset>
+            source: {
+              type: "spawn_agent" | "task" | "orchestrator"
+              sessionID: string
+              agent: string
+            }
+            executionPlacement?: {
+              version: 1
+              directory: string
+              checkout: string
+              identity: string
+            }
+            mainWriteConsent?: {
+              version: 1
+              permissionID: string
+              inputID: string
+              dispatchDigest: string
+              placementIdentity: string
+            }
+            readOnly?: boolean
+            readOnlyInputID?: string
+            mirrorWorkspace?: {
+              version: 1
+              directory: string
+              taskID: string
+              inputID: string
+              dispatchDigest: string
+              sourcePlacement: {
+                version: 1
+                directory: string
+                checkout: string
+                identity: string
+              }
+              basis: {
+                version: 1
+                workspaceID: string
+                sourceSessionID: string
+                sourceDirectory: string
+                commit: string
+                files: Array<{
+                  path: string
+                  mode: number
+                  bytes: number
+                  sha256: string
+                  uri: string
+                }>
+                deletedPaths: Array<string>
+              }
+              basisDigest: string
+            }
+            taskContext?: "fork" | "fresh"
+            cacheTools?: Array<{
+              name: string
+              description: string
+              inputSchema: {
+                [key: string]: unknown
+              }
+              outputSchema?: {
+                [key: string]: unknown
+              }
+              cache?: LlmCacheHint
+              metadata?: {
+                [key: string]: unknown
+              }
+              native?: {
+                [key: string]: unknown
+              }
+            }>
+          }
+        }
+      }
+    | {
+        id: string
+        type: "session.next.fork.message-imported"
+        properties: {
+          sessionID: string
+          sourceSessionID: string
+          sourceMessageID: string
+          timestamp: number
+          message: SessionMessage
+        }
+      }
+    | {
+        id: string
+        type: "session.next.fork.epoch-imported"
+        properties: {
+          sessionID: string
+          sourceSessionID: string
+          throughSeq: number
+          baseline: string
+          baselineSeq: number
+          agent: string
+          snapshot: {
+            [key: string]:
+              | unknown
+              | {
+                  value: unknown
+                  removed?: unknown | null
+                }
+          }
+        }
+      }
+    | {
+        id: string
+        type: "session.next.fork.history-boundary-imported"
+        properties: {
+          sessionID: string
+          sourceSessionID: string
+          throughSeq: number
+          dispatchDigest?: string
+        }
+      }
+    | {
+        id: string
+        type: "session.next.fork.attachments-imported"
+        properties: {
+          sessionID: string
+          attachments: Array<{
+            id: string
+            messageID?: string
+            mime: string
+            filename?: string
+            sizeBytes: number
+            sha256: string
+            storagePath: string
+            createdAt: number
+          }>
+        }
+      }
+    | {
+        id: string
+        type: "reference.updated"
+        properties: {
+          [key: string]: unknown
         }
       }
     | {
@@ -1690,9 +1958,10 @@ export type GlobalEvent = {
       }
     | {
         id: string
-        type: "reference.updated"
+        type: "session.runner.settled"
         properties: {
-          [key: string]: unknown
+          sessionID: string
+          status: "completed" | "error" | "interrupted"
         }
       }
     | {
@@ -1718,6 +1987,7 @@ export type GlobalEvent = {
           sessionID: string
           requestID: string
           answers: Array<QuestionV2Answer>
+          source?: "user" | "main" | "recommended"
         }
       }
     | {
@@ -2000,6 +2270,17 @@ export type GlobalEvent = {
             initialized?: number
           }
           sandboxes: Array<string>
+          sessionDirectories?: Array<string>
+        }
+      }
+    | {
+        id: string
+        type: "project.directoryIcon.updated"
+        properties: {
+          directory: string
+          icon?: {
+            override: string
+          }
         }
       }
     | {
@@ -2097,6 +2378,7 @@ export type GlobalEvent = {
     | SyncEventSessionNextPromptHeld
     | SyncEventSessionNextPromptReleased
     | SyncEventSessionNextPromptPromoted
+    | SyncEventSessionNextSkillSelectionMutation
     | SyncEventSessionNextInterruptRequested
     | SyncEventSessionNextContextUpdated
     | SyncEventSessionNextSynthetic
@@ -2127,6 +2409,11 @@ export type GlobalEvent = {
     | SyncEventSessionNextActivityFailed
     | SyncEventSessionNextCompactionStarted
     | SyncEventSessionNextCompactionEnded
+    | SyncEventSessionAgentPolicyRebound
+    | SyncEventSessionNextForkMessageImported
+    | SyncEventSessionNextForkEpochImported
+    | SyncEventSessionNextForkHistoryBoundaryImported
+    | SyncEventSessionNextForkAttachmentsImported
 }
 
 /**
@@ -2285,6 +2572,12 @@ export type AgentConfig = {
           }
         }
       }
+  skills?: {
+    [key: string]: {
+      visible?: boolean
+      invocation?: "allow" | "ask" | "manual" | "deny"
+    }
+  }
   disable?: boolean
   disabled?: boolean
   description?: string
@@ -2343,6 +2636,12 @@ export type AgentConfig = {
               [key: string]: "allow" | "ask" | "deny"
             }
           }
+        }
+      }
+    | {
+        [key: string]: {
+          visible?: boolean
+          invocation?: "allow" | "ask" | "manual" | "deny"
         }
       }
     | boolean
@@ -2609,12 +2908,44 @@ export type Config = {
     }
   }
   skill_invocation?: {
-    manual: Array<string>
+    manual?: Array<string>
+    entries?: {
+      [key: string]: {
+        visible?: boolean
+        invocation?: "allow" | "ask" | "manual" | "deny"
+      }
+    }
+    selection_memory?: {
+      enabled: boolean
+      minutes: number
+      messages: number
+    }
   }
   logging?: ConfigV2Logging
   maintenance?: ConfigV2Maintenance
   vision?: ConfigV2Vision
   project_icon_generation?: ConfigV2ProjectIconGeneration
+  delegation?: {
+    ordinaryQuestions?: boolean
+    preferences?: Array<{
+      topic: string
+      selections: Array<{
+        agent?: string
+        model?: string
+        variant?: string
+        chain?: string
+      }>
+    }>
+    rules?: Array<{
+      topic?: string
+      allowed: Array<{
+        agent?: string
+        model?: string
+        variant?: string
+        chain?: string
+      }>
+    }>
+  }
   multi_agent?: {
     unlimited?: boolean
     max_threads?: number
@@ -2740,7 +3071,7 @@ export type Config = {
     }
   }
   experimental?: {
-    session_orchestrator?: boolean
+    tool_live_progress?: boolean
     disable_paste_summary?: boolean
     batch_tool?: boolean
     openTelemetry?: boolean
@@ -2838,12 +3169,44 @@ export type ConfigUpdate = {
     }
   }
   skill_invocation?: {
-    manual: Array<string>
+    manual?: Array<string>
+    entries?: {
+      [key: string]: {
+        visible?: boolean
+        invocation?: "allow" | "ask" | "manual" | "deny"
+      }
+    }
+    selection_memory?: {
+      enabled: boolean
+      minutes: number
+      messages: number
+    }
   }
   logging?: ConfigV2Logging
   maintenance?: ConfigV2Maintenance
   vision?: ConfigV2Vision
   project_icon_generation?: ConfigV2ProjectIconGeneration
+  delegation?: {
+    ordinaryQuestions?: boolean
+    preferences?: Array<{
+      topic: string
+      selections: Array<{
+        agent?: string
+        model?: string
+        variant?: string
+        chain?: string
+      }>
+    }>
+    rules?: Array<{
+      topic?: string
+      allowed: Array<{
+        agent?: string
+        model?: string
+        variant?: string
+        chain?: string
+      }>
+    }>
+  }
   multi_agent?: {
     unlimited?: boolean
     max_threads?: number
@@ -2969,7 +3332,7 @@ export type ConfigUpdate = {
     }
   }
   experimental?: {
-    session_orchestrator?: boolean
+    tool_live_progress?: boolean
     disable_paste_summary?: boolean
     batch_tool?: boolean
     openTelemetry?: boolean
@@ -2977,6 +3340,22 @@ export type ConfigUpdate = {
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
+  }
+  skill_policy?: {
+    global?: {
+      [key: string]: {
+        visible?: boolean
+        invocation?: "allow" | "ask" | "manual" | "deny"
+      }
+    }
+    agents?: {
+      [key: string]: {
+        [key: string]: {
+          visible?: boolean
+          invocation?: "allow" | "ask" | "manual" | "deny"
+        }
+      }
+    }
   }
 }
 
@@ -3219,11 +3598,13 @@ export type GlobalSession = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -3507,6 +3888,7 @@ export type VcsGitBranch = {
   name: string
   current: boolean
   remote: boolean
+  ref?: string
   upstream?: string
   tracking?: string
   hash?: string
@@ -3550,6 +3932,92 @@ export type VcsGitSnapshot = {
   stashes: Array<VcsGitStash>
   conflicts: Array<VcsGitConflict>
   operation: VcsGitOperation
+}
+
+export type VcsGitHistoryRequest = {
+  selector?: "all" | "head" | "branch"
+  ref?: string
+  firstParent?: boolean
+  limit?: number
+  cursor?: string
+}
+
+export type VcsGitHistoryCommit = {
+  hash: string
+  short: string
+  parents: Array<string>
+  author: string
+  email: string
+  date: string
+  refs: Array<string>
+  subject: string
+  body: string
+  bodyTruncated: boolean
+  boundary: "none" | "shallow" | "missing"
+}
+
+export type VcsGitHistoryPage = {
+  commits: Array<VcsGitHistoryCommit>
+  hasMore: boolean
+  selector: "all" | "head" | "branch"
+  firstParent: boolean
+  headOid?: string
+  refLabels: Array<{
+    hash: string
+    label: string
+  }>
+  nextCursor?: string
+}
+
+export type VcsGitHistoryInvalidError = {
+  name: "VcsGitHistoryError"
+  data: {
+    message: string
+    code:
+      "invalid_ref" | "invalid_cursor" | "history_unavailable" | "shallow_changed" | "output_limit" | "process_failed"
+    recovery: "refresh" | "retry" | "change-selection" | "none"
+  }
+}
+
+export type VcsGitHistoryStaleError = {
+  name: "VcsGitHistoryError"
+  data: {
+    message: string
+    code:
+      "invalid_ref" | "invalid_cursor" | "history_unavailable" | "shallow_changed" | "output_limit" | "process_failed"
+    recovery: "refresh" | "retry" | "change-selection" | "none"
+  }
+}
+
+export type VcsGitHistoryLimitError = {
+  name: "VcsGitHistoryError"
+  data: {
+    message: string
+    code:
+      "invalid_ref" | "invalid_cursor" | "history_unavailable" | "shallow_changed" | "output_limit" | "process_failed"
+    recovery: "refresh" | "retry" | "change-selection" | "none"
+  }
+}
+
+export type VcsGitHistoryProcessError = {
+  name: "VcsGitHistoryError"
+  data: {
+    message: string
+    code:
+      "invalid_ref" | "invalid_cursor" | "history_unavailable" | "shallow_changed" | "output_limit" | "process_failed"
+    recovery: "refresh" | "retry" | "change-selection" | "none"
+  }
+}
+
+export type VcsGitCommitMessageRequest = {
+  hash?: string
+  cursor?: string
+}
+
+export type VcsGitCommitMessagePage = {
+  text: string
+  truncated: boolean
+  nextCursor?: string
 }
 
 export type VcsDiscoveredRepo = {
@@ -3769,6 +4237,7 @@ export type Project = {
     initialized?: number
   }
   sandboxes: Array<string>
+  sessionDirectories?: Array<string>
 }
 
 export type ProjectNotFoundError = {
@@ -3776,6 +4245,39 @@ export type ProjectNotFoundError = {
   projectID: string
   message: string
 }
+
+export type ProjectDirectoryIcon = {
+  directory: string
+  icon: {
+    override: string
+  }
+}
+
+export type ProjectDirectoryIcons = Array<ProjectDirectoryIcon>
+
+export type ProjectDirectoryIconInput = {
+  directory: string
+  url?: string
+}
+
+export type ProjectDirectoryIconUpdate = {
+  directory: string
+  icon?: {
+    override: string
+  }
+}
+
+export type ProjectResolveDirectoriesInput = {
+  directories: Array<string>
+}
+
+export type ProjectResolvedDirectory = {
+  directory: string
+  real: string
+  exists: boolean
+}
+
+export type ProjectResolvedDirectories = Array<ProjectResolvedDirectory>
 
 export type PtyNotFoundError = {
   _tag: "PtyNotFoundError"
@@ -3945,11 +4447,13 @@ export type Session1 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4033,11 +4537,13 @@ export type Session2 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4121,11 +4627,13 @@ export type Session3 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4216,11 +4724,13 @@ export type Session4 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4304,11 +4814,13 @@ export type Session5 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4319,6 +4831,18 @@ export type Session5 = {
       error?: string
     }
   }
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
+export type UnknownError1 = {
+  _tag: "UnknownError"
+  message: string
+  ref?: string
 }
 
 export type Session6 = {
@@ -4392,11 +4916,13 @@ export type Session6 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4480,11 +5006,13 @@ export type Session7 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4568,11 +5096,13 @@ export type Session8 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4656,11 +5186,13 @@ export type Session9 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4750,11 +5282,13 @@ export type Session10 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -4887,13 +5421,7 @@ export type SessionLocationUnavailableError = {
   message: string
 }
 
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
-}
-
-export type UnknownError1 = {
+export type UnknownError2 = {
   _tag: "UnknownError"
   message: string
   ref?: string
@@ -5020,10 +5548,72 @@ export type Session11 = {
     }
     permissionLayers: Array<PermissionV2Ruleset>
     source: {
-      type: "spawn_agent" | "task"
+      type: "spawn_agent" | "task" | "orchestrator"
       sessionID: string
       agent: string
     }
+    executionPlacement?: {
+      version: 1
+      directory: string
+      checkout: string
+      identity: string
+    }
+    mainWriteConsent?: {
+      version: 1
+      permissionID: string
+      inputID: string
+      dispatchDigest: string
+      placementIdentity: string
+    }
+    readOnly?: boolean
+    readOnlyInputID?: string
+    mirrorWorkspace?: {
+      version: 1
+      directory: string
+      taskID: string
+      inputID: string
+      dispatchDigest: string
+      sourcePlacement: {
+        version: 1
+        directory: string
+        checkout: string
+        identity: string
+      }
+      basis: {
+        version: 1
+        workspaceID: string
+        sourceSessionID: string
+        sourceDirectory: string
+        commit: string
+        files: Array<{
+          path: string
+          mode: number
+          bytes: number
+          sha256: string
+          uri: string
+        }>
+        deletedPaths: Array<string>
+      }
+      basisDigest: string
+    }
+    taskContext?: "fork" | "fresh"
+    cacheTools?: Array<{
+      name: string
+      description: string
+      inputSchema: {
+        [key: string]: unknown
+      }
+      outputSchema?: {
+        [key: string]: unknown
+      }
+      cache?: LlmCacheHint1
+      metadata?: {
+        [key: string]: unknown
+      }
+      native?: {
+        [key: string]: unknown
+      }
+    }>
   }
   time: {
     created: number
@@ -5047,11 +5637,13 @@ export type Session11 = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -5140,6 +5732,11 @@ export type PermissionV2Rule = {
 
 export type PermissionV2Ruleset = Array<PermissionV2Rule>
 
+export type LlmCacheHint = {
+  type: "ephemeral" | "persistent"
+  ttlSeconds?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
 export type LocationRef = {
   directory: string
   workspaceID?: string
@@ -5156,6 +5753,7 @@ export type PromptFileAttachment = {
   mime: string
   name?: string
   description?: string
+  unpack?: boolean
   source?: PromptSource
 }
 
@@ -5175,6 +5773,31 @@ export type PromptOutputFormatJsonSchema = {
 }
 
 export type PromptOutputFormat = PromptOutputFormatText | PromptOutputFormatJsonSchema
+
+export type SessionNextSkillSelectionOrigin = {
+  kind: "input" | "chat_send" | "command" | "renewal"
+  id: string
+  seq: number
+}
+
+export type SessionNextSkillSelectionLimits = {
+  minutes: number
+  messages: number
+}
+
+export type SessionStructuredOutputAttempt = {
+  version: 1
+  inputID: string
+  inputDigest: string
+  schemaDigest: string
+  model: {
+    id: string
+    providerID: string
+    variant?: string
+  }
+  mode: "tool" | "json"
+  phase: "initial" | "correction"
+}
 
 export type SessionTokenMeasurement = {
   version: 1
@@ -5222,6 +5845,343 @@ export type SessionNextRetryError = {
     [key: string]: string
   }
 }
+
+export type SessionMessageAgentSwitched = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+  }
+  type: "agent-switched"
+  agent: string
+}
+
+export type SessionMessageModelSwitched = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+  }
+  type: "model-switched"
+  model: {
+    id: string
+    providerID: string
+    variant?: string
+    chain?: {
+      id: string
+      name: string
+      steps: Array<{
+        id: string
+        providerID: string
+        variant?: string
+      }>
+      active?: number
+    } | null
+  }
+}
+
+export type SessionMessageUser = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+  }
+  text: string
+  files?: Array<PromptFileAttachment>
+  agents?: Array<PromptAgentAttachment>
+  format?: PromptOutputFormat
+  type: "user"
+}
+
+export type SessionMessageSynthetic = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+  }
+  sessionID: string
+  text: string
+  type: "synthetic"
+}
+
+export type SessionMessageSystem = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+  }
+  type: "system"
+  text: string
+}
+
+export type SessionMessageShell = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+    completed?: number
+  }
+  type: "shell"
+  callID: string
+  command: string
+  output: string
+}
+
+export type SessionMessageAssistantText = {
+  type: "text"
+  id: string
+  text: string
+}
+
+export type SessionMessageAssistantReasoning = {
+  type: "reasoning"
+  id: string
+  text: string
+  providerMetadata?: {
+    [key: string]: {
+      [key: string]: unknown
+    }
+  }
+}
+
+export type SessionMessageToolStatePending = {
+  status: "pending"
+  input: string
+}
+
+export type SessionMessageToolStateRunning = {
+  status: "running"
+  input: {
+    [key: string]: unknown
+  }
+  structured: {
+    [key: string]: unknown
+  }
+  content: Array<ToolTextContent | ToolFileContent>
+}
+
+export type SessionMessageToolStateCompleted = {
+  status: "completed"
+  input: {
+    [key: string]: unknown
+  }
+  attachments?: Array<PromptFileAttachment>
+  content: Array<ToolTextContent | ToolFileContent>
+  outputPaths?: Array<string>
+  structured: {
+    [key: string]: unknown
+  }
+  result?: unknown
+}
+
+export type SessionMessageToolStateError = {
+  status: "error"
+  input: {
+    [key: string]: unknown
+  }
+  content: Array<ToolTextContent | ToolFileContent>
+  structured: {
+    [key: string]: unknown
+  }
+  error: SessionErrorUnknown
+  failure?: {
+    code:
+      | "provider.transport"
+      | "provider.rate-limit"
+      | "provider.auth"
+      | "provider.context-overflow"
+      | "provider.content-policy"
+      | "provider.invalid-request"
+      | "provider.invalid-response"
+      | "tool.defect"
+      | "permission.denied"
+      | "user.stop"
+      | "owner.interrupted"
+      | "owner.shutdown"
+      | "lease.stale"
+      | "rollback.requested"
+      | "internal.defect"
+      | "resource.exhausted"
+    message: string
+    cause?: {
+      raw?: string
+      detail?: string
+    }
+    providerRef?: string
+    resetAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    httpStatus?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    retryability: "auto-retry" | "resume" | "none"
+    remediation: "retry" | "resume" | "report" | "continue"
+  }
+  result?: unknown
+  interruption?: SessionToolInterruption
+}
+
+export type SessionMessageAssistantTool = {
+  type: "tool"
+  id: string
+  name: string
+  provider?: {
+    executed: boolean
+    metadata?: {
+      [key: string]: {
+        [key: string]: unknown
+      }
+    }
+    resultMetadata?: {
+      [key: string]: {
+        [key: string]: unknown
+      }
+    }
+  }
+  state:
+    | SessionMessageToolStatePending
+    | SessionMessageToolStateRunning
+    | SessionMessageToolStateCompleted
+    | SessionMessageToolStateError
+  time: {
+    created: number
+    ran?: number
+    completed?: number
+    pruned?: number
+  }
+}
+
+export type SessionMessageAssistantCustom = {
+  type: "custom"
+  id: string
+  kind: string
+  data: unknown
+  title?: string
+  fallback?: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time?: {
+    start: number
+    end?: number
+  }
+}
+
+export type SessionMessageAssistant = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+    completed?: number
+  }
+  type: "assistant"
+  agent: string
+  model: {
+    id: string
+    providerID: string
+    variant?: string
+    chain?: {
+      id: string
+      name: string
+      steps: Array<{
+        id: string
+        providerID: string
+        variant?: string
+      }>
+      active?: number
+    } | null
+  }
+  structuredOutputAttempt?: SessionStructuredOutputAttempt
+  content: Array<
+    | SessionMessageAssistantText
+    | SessionMessageAssistantReasoning
+    | SessionMessageAssistantTool
+    | SessionMessageAssistantCustom
+  >
+  snapshot?: {
+    start?: string
+    end?: string
+  }
+  structured?: unknown
+  finish?: string
+  cost?: number
+  tokens?: {
+    input: number
+    output: number
+    reasoning: number
+    cache: {
+      read: number
+      write: number
+    }
+  }
+  tokenMeasurement?: SessionTokenMeasurement
+  error?: SessionErrorUnknown
+  failure?: {
+    code:
+      | "provider.transport"
+      | "provider.rate-limit"
+      | "provider.auth"
+      | "provider.context-overflow"
+      | "provider.content-policy"
+      | "provider.invalid-request"
+      | "provider.invalid-response"
+      | "tool.defect"
+      | "permission.denied"
+      | "user.stop"
+      | "owner.interrupted"
+      | "owner.shutdown"
+      | "lease.stale"
+      | "rollback.requested"
+      | "internal.defect"
+      | "resource.exhausted"
+    message: string
+    cause?: {
+      raw?: string
+      detail?: string
+    }
+    providerRef?: string
+    resetAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    httpStatus?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    retryability: "auto-retry" | "resume" | "none"
+    remediation: "retry" | "resume" | "report" | "continue"
+  }
+}
+
+export type SessionMessageCompaction = {
+  type: "compaction"
+  reason: "auto" | "manual"
+  summary: string
+  recent: string
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+  }
+}
+
+export type SessionMessage =
+  | SessionMessageAgentSwitched
+  | SessionMessageModelSwitched
+  | SessionMessageUser
+  | SessionMessageSynthetic
+  | SessionMessageSystem
+  | SessionMessageShell
+  | SessionMessageAssistant
+  | SessionMessageCompaction
 
 export type PermissionV2Source = {
   type: "tool"
@@ -5688,6 +6648,14 @@ export type QuestionV2Info = {
   filePath?: string
   emojis?: Array<string>
   form?: ControlFormDefinition
+  chatSend?: {
+    /**
+     * Exact text sent into the session chat verbatim, including slash commands
+     */
+    text: string
+    label?: string
+    description?: string
+  }
   context?: string
   content?: string
   markdown?: string
@@ -6092,6 +7060,7 @@ export type SyncEventSessionNextPromptAdmitted = {
       messageID: string
       prompt: Prompt
       delivery: "steer" | "queue"
+      origin?: "interactive" | "plugin"
     }
   }
 }
@@ -6143,6 +7112,30 @@ export type SyncEventSessionNextPromptPromoted = {
       messageID: string
       prompt: Prompt
       timeCreated: number
+    }
+  }
+}
+
+export type SyncEventSessionNextSkillSelectionMutation = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.skill_selection.mutation.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      mutation: "selected" | "forgotten" | "renewal_declined"
+      name?: string
+      generation?: number
+      origin?: SessionNextSkillSelectionOrigin
+      selectedAt?: number
+      limits?: SessionNextSkillSelectionLimits
+      operationID?: string
+      boundMessageID?: string
+      receiptInputID?: string
     }
   }
 }
@@ -6260,6 +7253,7 @@ export type SyncEventSessionNextStepStarted = {
         } | null
       }
       snapshot?: string
+      structuredOutputAttempt?: SessionStructuredOutputAttempt
     }
   }
 }
@@ -6686,11 +7680,13 @@ export type SyncEventSessionNextRevertMarked = {
             exists: boolean
             bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
             sha256?: string
+            mode?: number
           }
           actual: {
             exists: boolean
             bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
             sha256?: string
+            mode?: number
           }
           message: string
         }>
@@ -6746,11 +7742,13 @@ export type SyncEventSessionNextRevertCleaned = {
             exists: boolean
             bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
             sha256?: string
+            mode?: number
           }
           actual: {
             exists: boolean
             bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
             sha256?: string
+            mode?: number
           }
           message: string
         }>
@@ -6917,6 +7915,195 @@ export type SyncEventSessionNextCompactionEnded = {
   }
 }
 
+export type SyncEventSessionAgentPolicyRebound = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.agent_policy.rebound.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      sessionID: string
+      timestamp: number
+      previousInputID: string
+      agentPolicy: {
+        tools: {
+          mode: "inherit" | "explicit"
+          entries: {
+            [key: string]: {
+              visible: boolean
+              delegable?: boolean
+              permission: "allow" | "ask" | "deny"
+              scope?: {
+                mode: "global" | "projects"
+                projects?: Array<string>
+              }
+              projectPermissions?: {
+                [key: string]: "allow" | "ask" | "deny"
+              }
+            }
+          }
+        }
+        permissionLayers: Array<PermissionV2Ruleset>
+        source: {
+          type: "spawn_agent" | "task" | "orchestrator"
+          sessionID: string
+          agent: string
+        }
+        executionPlacement?: {
+          version: 1
+          directory: string
+          checkout: string
+          identity: string
+        }
+        mainWriteConsent?: {
+          version: 1
+          permissionID: string
+          inputID: string
+          dispatchDigest: string
+          placementIdentity: string
+        }
+        readOnly?: boolean
+        readOnlyInputID?: string
+        mirrorWorkspace?: {
+          version: 1
+          directory: string
+          taskID: string
+          inputID: string
+          dispatchDigest: string
+          sourcePlacement: {
+            version: 1
+            directory: string
+            checkout: string
+            identity: string
+          }
+          basis: {
+            version: 1
+            workspaceID: string
+            sourceSessionID: string
+            sourceDirectory: string
+            commit: string
+            files: Array<{
+              path: string
+              mode: number
+              bytes: number
+              sha256: string
+              uri: string
+            }>
+            deletedPaths: Array<string>
+          }
+          basisDigest: string
+        }
+        taskContext?: "fork" | "fresh"
+        cacheTools?: Array<{
+          name: string
+          description: string
+          inputSchema: {
+            [key: string]: unknown
+          }
+          outputSchema?: {
+            [key: string]: unknown
+          }
+          cache?: LlmCacheHint
+          metadata?: {
+            [key: string]: unknown
+          }
+          native?: {
+            [key: string]: unknown
+          }
+        }>
+      }
+    }
+  }
+}
+
+export type SyncEventSessionNextForkMessageImported = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.fork.message-imported.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      sessionID: string
+      sourceSessionID: string
+      sourceMessageID: string
+      timestamp: number
+      message: SessionMessage
+    }
+  }
+}
+
+export type SyncEventSessionNextForkEpochImported = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.fork.epoch-imported.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      sessionID: string
+      sourceSessionID: string
+      throughSeq: number
+      baseline: string
+      baselineSeq: number
+      agent: string
+      snapshot: {
+        [key: string]:
+          | unknown
+          | {
+              value: unknown
+              removed?: unknown | null
+            }
+      }
+    }
+  }
+}
+
+export type SyncEventSessionNextForkHistoryBoundaryImported = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.fork.history-boundary-imported.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      sessionID: string
+      sourceSessionID: string
+      throughSeq: number
+      dispatchDigest?: string
+    }
+  }
+}
+
+export type SyncEventSessionNextForkAttachmentsImported = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.fork.attachments-imported.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      sessionID: string
+      attachments: Array<{
+        id: string
+        messageID?: string
+        mime: string
+        filename?: string
+        sizeBytes: number
+        sha256: string
+        storagePath: string
+        createdAt: number
+      }>
+    }
+  }
+}
+
 export type ConfigV2ReferenceGit = {
   repository: string
   branch?: string
@@ -7017,6 +8204,7 @@ export type ConfigV2MultiAgentReviewer = {
 
 export type ConfigV2MultiAgentSkill = {
   reviewers?: Array<ConfigV2MultiAgentReviewer>
+  result_recovery?: boolean
 }
 
 export type PolicyEffect = "allow" | "deny"
@@ -7050,6 +8238,11 @@ export type ConfigV2OptimizationSnapshot = {
   }
   overrides: Array<string>
   warnings: Array<string>
+}
+
+export type ProjectInvalidIconError = {
+  _tag: "Project.InvalidIconError"
+  message: string
 }
 
 export type ProjectDirectories = Array<{
@@ -7129,6 +8322,12 @@ export type AgentV2Info = {
     glob?: number
   }
   permissions: PermissionV2Ruleset
+  skills?: {
+    [key: string]: {
+      visible?: boolean
+      invocation?: "allow" | "ask" | "manual" | "deny"
+    }
+  }
 }
 
 export type SessionV2Info = {
@@ -7206,10 +8405,72 @@ export type SessionV2Info = {
     }
     permissionLayers: Array<PermissionV2Ruleset>
     source: {
-      type: "spawn_agent" | "task"
+      type: "spawn_agent" | "task" | "orchestrator"
       sessionID: string
       agent: string
     }
+    executionPlacement?: {
+      version: 1
+      directory: string
+      checkout: string
+      identity: string
+    }
+    mainWriteConsent?: {
+      version: 1
+      permissionID: string
+      inputID: string
+      dispatchDigest: string
+      placementIdentity: string
+    }
+    readOnly?: boolean
+    readOnlyInputID?: string
+    mirrorWorkspace?: {
+      version: 1
+      directory: string
+      taskID: string
+      inputID: string
+      dispatchDigest: string
+      sourcePlacement: {
+        version: 1
+        directory: string
+        checkout: string
+        identity: string
+      }
+      basis: {
+        version: 1
+        workspaceID: string
+        sourceSessionID: string
+        sourceDirectory: string
+        commit: string
+        files: Array<{
+          path: string
+          mode: number
+          bytes: number
+          sha256: string
+          uri: string
+        }>
+        deletedPaths: Array<string>
+      }
+      basisDigest: string
+    }
+    taskContext?: "fork" | "fresh"
+    cacheTools?: Array<{
+      name: string
+      description: string
+      inputSchema: {
+        [key: string]: unknown
+      }
+      outputSchema?: {
+        [key: string]: unknown
+      }
+      cache?: LlmCacheHint
+      metadata?: {
+        [key: string]: unknown
+      }
+      native?: {
+        [key: string]: unknown
+      }
+    }>
   }
   revert?: {
     messageID: string
@@ -7226,11 +8487,13 @@ export type SessionV2Info = {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       actual: {
         exists: boolean
         bytes?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         sha256?: string
+        mode?: number
       }
       message: string
     }>
@@ -7253,343 +8516,8 @@ export type SessionInputAdmitted = {
   delivery: "steer" | "queue"
   timeCreated: number
   promotedSeq?: number
+  origin?: "interactive" | "plugin"
 }
-
-export type SessionMessageAgentSwitched = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-  }
-  type: "agent-switched"
-  agent: string
-}
-
-export type SessionMessageModelSwitched = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-  }
-  type: "model-switched"
-  model: {
-    id: string
-    providerID: string
-    variant?: string
-    chain?: {
-      id: string
-      name: string
-      steps: Array<{
-        id: string
-        providerID: string
-        variant?: string
-      }>
-      active?: number
-    } | null
-  }
-}
-
-export type SessionMessageUser = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-  }
-  text: string
-  files?: Array<PromptFileAttachment>
-  agents?: Array<PromptAgentAttachment>
-  format?: PromptOutputFormat
-  type: "user"
-}
-
-export type SessionMessageSynthetic = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-  }
-  sessionID: string
-  text: string
-  type: "synthetic"
-}
-
-export type SessionMessageSystem = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-  }
-  type: "system"
-  text: string
-}
-
-export type SessionMessageShell = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-    completed?: number
-  }
-  type: "shell"
-  callID: string
-  command: string
-  output: string
-}
-
-export type SessionMessageAssistantText = {
-  type: "text"
-  id: string
-  text: string
-}
-
-export type SessionMessageAssistantReasoning = {
-  type: "reasoning"
-  id: string
-  text: string
-  providerMetadata?: {
-    [key: string]: {
-      [key: string]: unknown
-    }
-  }
-}
-
-export type SessionMessageToolStatePending = {
-  status: "pending"
-  input: string
-}
-
-export type SessionMessageToolStateRunning = {
-  status: "running"
-  input: {
-    [key: string]: unknown
-  }
-  structured: {
-    [key: string]: unknown
-  }
-  content: Array<ToolTextContent | ToolFileContent>
-}
-
-export type SessionMessageToolStateCompleted = {
-  status: "completed"
-  input: {
-    [key: string]: unknown
-  }
-  attachments?: Array<PromptFileAttachment>
-  content: Array<ToolTextContent | ToolFileContent>
-  outputPaths?: Array<string>
-  structured: {
-    [key: string]: unknown
-  }
-  result?: unknown
-}
-
-export type SessionMessageToolStateError = {
-  status: "error"
-  input: {
-    [key: string]: unknown
-  }
-  content: Array<ToolTextContent | ToolFileContent>
-  structured: {
-    [key: string]: unknown
-  }
-  error: SessionErrorUnknown
-  failure?: {
-    code:
-      | "provider.transport"
-      | "provider.rate-limit"
-      | "provider.auth"
-      | "provider.context-overflow"
-      | "provider.content-policy"
-      | "provider.invalid-request"
-      | "provider.invalid-response"
-      | "tool.defect"
-      | "permission.denied"
-      | "user.stop"
-      | "owner.interrupted"
-      | "owner.shutdown"
-      | "lease.stale"
-      | "rollback.requested"
-      | "internal.defect"
-      | "resource.exhausted"
-    message: string
-    cause?: {
-      raw?: string
-      detail?: string
-    }
-    providerRef?: string
-    resetAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    httpStatus?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    retryability: "auto-retry" | "resume" | "none"
-    remediation: "retry" | "resume" | "report" | "continue"
-  }
-  result?: unknown
-  interruption?: SessionToolInterruption
-}
-
-export type SessionMessageAssistantTool = {
-  type: "tool"
-  id: string
-  name: string
-  provider?: {
-    executed: boolean
-    metadata?: {
-      [key: string]: {
-        [key: string]: unknown
-      }
-    }
-    resultMetadata?: {
-      [key: string]: {
-        [key: string]: unknown
-      }
-    }
-  }
-  state:
-    | SessionMessageToolStatePending
-    | SessionMessageToolStateRunning
-    | SessionMessageToolStateCompleted
-    | SessionMessageToolStateError
-  time: {
-    created: number
-    ran?: number
-    completed?: number
-    pruned?: number
-  }
-}
-
-export type SessionMessageAssistantCustom = {
-  type: "custom"
-  id: string
-  kind: string
-  data: unknown
-  title?: string
-  fallback?: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time?: {
-    start: number
-    end?: number
-  }
-}
-
-export type SessionMessageAssistant = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-    completed?: number
-  }
-  type: "assistant"
-  agent: string
-  model: {
-    id: string
-    providerID: string
-    variant?: string
-    chain?: {
-      id: string
-      name: string
-      steps: Array<{
-        id: string
-        providerID: string
-        variant?: string
-      }>
-      active?: number
-    } | null
-  }
-  content: Array<
-    | SessionMessageAssistantText
-    | SessionMessageAssistantReasoning
-    | SessionMessageAssistantTool
-    | SessionMessageAssistantCustom
-  >
-  snapshot?: {
-    start?: string
-    end?: string
-  }
-  structured?: unknown
-  finish?: string
-  cost?: number
-  tokens?: {
-    input: number
-    output: number
-    reasoning: number
-    cache: {
-      read: number
-      write: number
-    }
-  }
-  tokenMeasurement?: SessionTokenMeasurement
-  error?: SessionErrorUnknown
-  failure?: {
-    code:
-      | "provider.transport"
-      | "provider.rate-limit"
-      | "provider.auth"
-      | "provider.context-overflow"
-      | "provider.content-policy"
-      | "provider.invalid-request"
-      | "provider.invalid-response"
-      | "tool.defect"
-      | "permission.denied"
-      | "user.stop"
-      | "owner.interrupted"
-      | "owner.shutdown"
-      | "lease.stale"
-      | "rollback.requested"
-      | "internal.defect"
-      | "resource.exhausted"
-    message: string
-    cause?: {
-      raw?: string
-      detail?: string
-    }
-    providerRef?: string
-    resetAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    httpStatus?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    retryability: "auto-retry" | "resume" | "none"
-    remediation: "retry" | "resume" | "report" | "continue"
-  }
-}
-
-export type SessionMessageCompaction = {
-  type: "compaction"
-  reason: "auto" | "manual"
-  summary: string
-  recent: string
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  time: {
-    created: number
-  }
-}
-
-export type SessionMessage =
-  | SessionMessageAgentSwitched
-  | SessionMessageModelSwitched
-  | SessionMessageUser
-  | SessionMessageSynthetic
-  | SessionMessageSystem
-  | SessionMessageShell
-  | SessionMessageAssistant
-  | SessionMessageCompaction
 
 export type ModelV2Info = {
   id: string
@@ -7872,6 +8800,14 @@ export type SkillV2Info = {
   requestedCapabilities?: Array<string>
   location: string
   content: string
+  effective?: {
+    visible: boolean
+    invocation: "allow" | "ask" | "manual" | "deny"
+    sources: {
+      visible: string
+      invocation: string
+    }
+  }
 }
 
 export type SkillV2ResolveInput = {
@@ -7899,6 +8835,11 @@ export type SurfaceBlockingRequest = {
   revision: number
   actions: Array<SurfaceActionMetadata>
   tool?: QuestionV2Tool
+  delegatedFrom?: {
+    sessionID: string
+    requestID: string
+  }
+  delegatedTo?: string
   mode: "blocking"
   /**
    * Questions to ask
@@ -7914,6 +8855,11 @@ export type SurfaceControlRequest = {
   revision: number
   actions: Array<SurfaceActionMetadata>
   tool?: QuestionV2Tool
+  delegatedFrom?: {
+    sessionID: string
+    requestID: string
+  }
+  delegatedTo?: string
   mode: "interactive" | "passive"
   surface: ControlPartData
 }
@@ -8072,6 +9018,11 @@ export type EventModelsDevRefreshed = {
   properties: {
     [key: string]: unknown
   }
+}
+
+export type LlmCacheHint1 = {
+  type: "ephemeral" | "persistent"
+  ttlSeconds?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
 export type EventSessionCreated = {
@@ -8283,6 +9234,7 @@ export type EventSessionNextPromptAdmitted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    origin?: "interactive" | "plugin"
   }
 }
 
@@ -8316,6 +9268,24 @@ export type EventSessionNextPromptPromoted = {
     messageID: string
     prompt: Prompt
     timeCreated: number
+  }
+}
+
+export type EventSessionNextSkillSelectionMutation = {
+  id: string
+  type: "session.next.skill_selection.mutation"
+  properties: {
+    timestamp: number
+    sessionID: string
+    mutation: "selected" | "forgotten" | "renewal_declined"
+    name?: string
+    generation?: number
+    origin?: SessionNextSkillSelectionOrigin
+    selectedAt?: number
+    limits?: SessionNextSkillSelectionLimits
+    operationID?: string
+    boundMessageID?: string
+    receiptInputID?: string
   }
 }
 
@@ -8397,6 +9367,7 @@ export type EventSessionNextStepStarted = {
       } | null
     }
     snapshot?: string
+    structuredOutputAttempt?: SessionStructuredOutputAttempt
   }
 }
 
@@ -8769,11 +9740,13 @@ export type EventSessionNextRevertMarked = {
           exists: boolean
           bytes?: number | "NaN" | "Infinity" | "-Infinity"
           sha256?: string
+          mode?: number
         }
         actual: {
           exists: boolean
           bytes?: number | "NaN" | "Infinity" | "-Infinity"
           sha256?: string
+          mode?: number
         }
         message: string
       }>
@@ -8817,11 +9790,13 @@ export type EventSessionNextRevertCleaned = {
           exists: boolean
           bytes?: number | "NaN" | "Infinity" | "-Infinity"
           sha256?: string
+          mode?: number
         }
         actual: {
           exists: boolean
           bytes?: number | "NaN" | "Infinity" | "-Infinity"
           sha256?: string
+          mode?: number
         }
         message: string
       }>
@@ -8956,12 +9931,297 @@ export type EventSessionNextCompactionEnded = {
   }
 }
 
-export type EventSessionRunnerSettled = {
+export type EventSessionAgentPolicyRebound = {
   id: string
-  type: "session.runner.settled"
+  type: "session.agent_policy.rebound"
   properties: {
     sessionID: string
-    status: "completed" | "error" | "interrupted"
+    timestamp: number
+    previousInputID: string
+    agentPolicy: {
+      tools: {
+        mode: "inherit" | "explicit"
+        entries: {
+          [key: string]: {
+            visible: boolean
+            delegable?: boolean
+            permission: "allow" | "ask" | "deny"
+            scope?: {
+              mode: "global" | "projects"
+              projects?: Array<string>
+            }
+            projectPermissions?: {
+              [key: string]: "allow" | "ask" | "deny"
+            }
+          }
+        }
+      }
+      permissionLayers: Array<PermissionV2Ruleset>
+      source: {
+        type: "spawn_agent" | "task" | "orchestrator"
+        sessionID: string
+        agent: string
+      }
+      executionPlacement?: {
+        version: 1
+        directory: string
+        checkout: string
+        identity: string
+      }
+      mainWriteConsent?: {
+        version: 1
+        permissionID: string
+        inputID: string
+        dispatchDigest: string
+        placementIdentity: string
+      }
+      readOnly?: boolean
+      readOnlyInputID?: string
+      mirrorWorkspace?: {
+        version: 1
+        directory: string
+        taskID: string
+        inputID: string
+        dispatchDigest: string
+        sourcePlacement: {
+          version: 1
+          directory: string
+          checkout: string
+          identity: string
+        }
+        basis: {
+          version: 1
+          workspaceID: string
+          sourceSessionID: string
+          sourceDirectory: string
+          commit: string
+          files: Array<{
+            path: string
+            mode: number
+            bytes: number
+            sha256: string
+            uri: string
+          }>
+          deletedPaths: Array<string>
+        }
+        basisDigest: string
+      }
+      taskContext?: "fork" | "fresh"
+      cacheTools?: Array<{
+        name: string
+        description: string
+        inputSchema: {
+          [key: string]: unknown
+        }
+        outputSchema?: {
+          [key: string]: unknown
+        }
+        cache?: LlmCacheHint1
+        metadata?: {
+          [key: string]: unknown
+        }
+        native?: {
+          [key: string]: unknown
+        }
+      }>
+    }
+  }
+}
+
+export type SessionMessageToolStateError1 = {
+  status: "error"
+  input: {
+    [key: string]: unknown
+  }
+  content: Array<ToolTextContent | ToolFileContent>
+  structured: {
+    [key: string]: unknown
+  }
+  error: SessionErrorUnknown
+  failure?: {
+    code:
+      | "provider.transport"
+      | "provider.rate-limit"
+      | "provider.auth"
+      | "provider.context-overflow"
+      | "provider.content-policy"
+      | "provider.invalid-request"
+      | "provider.invalid-response"
+      | "tool.defect"
+      | "permission.denied"
+      | "user.stop"
+      | "owner.interrupted"
+      | "owner.shutdown"
+      | "lease.stale"
+      | "rollback.requested"
+      | "internal.defect"
+      | "resource.exhausted"
+    message: string
+    cause?: {
+      raw?: string
+      detail?: string
+    }
+    providerRef?: string
+    resetAt?: number | "NaN" | "Infinity" | "-Infinity"
+    httpStatus?: number | "NaN" | "Infinity" | "-Infinity"
+    retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity"
+    retryability: "auto-retry" | "resume" | "none"
+    remediation: "retry" | "resume" | "report" | "continue"
+  }
+  result?: unknown
+  interruption?: SessionToolInterruption
+}
+
+export type SessionMessageAssistant1 = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    created: number
+    completed?: number
+  }
+  type: "assistant"
+  agent: string
+  model: {
+    id: string
+    providerID: string
+    variant?: string
+    chain?: {
+      id: string
+      name: string
+      steps: Array<{
+        id: string
+        providerID: string
+        variant?: string
+      }>
+      active?: number
+    } | null
+  }
+  structuredOutputAttempt?: SessionStructuredOutputAttempt
+  content: Array<
+    | SessionMessageAssistantText
+    | SessionMessageAssistantReasoning
+    | SessionMessageAssistantTool
+    | SessionMessageAssistantCustom
+  >
+  snapshot?: {
+    start?: string
+    end?: string
+  }
+  structured?: unknown
+  finish?: string
+  cost?: number
+  tokens?: {
+    input: number
+    output: number
+    reasoning: number
+    cache: {
+      read: number
+      write: number
+    }
+  }
+  tokenMeasurement?: SessionTokenMeasurement
+  error?: SessionErrorUnknown
+  failure?: {
+    code:
+      | "provider.transport"
+      | "provider.rate-limit"
+      | "provider.auth"
+      | "provider.context-overflow"
+      | "provider.content-policy"
+      | "provider.invalid-request"
+      | "provider.invalid-response"
+      | "tool.defect"
+      | "permission.denied"
+      | "user.stop"
+      | "owner.interrupted"
+      | "owner.shutdown"
+      | "lease.stale"
+      | "rollback.requested"
+      | "internal.defect"
+      | "resource.exhausted"
+    message: string
+    cause?: {
+      raw?: string
+      detail?: string
+    }
+    providerRef?: string
+    resetAt?: number | "NaN" | "Infinity" | "-Infinity"
+    httpStatus?: number | "NaN" | "Infinity" | "-Infinity"
+    retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity"
+    retryability: "auto-retry" | "resume" | "none"
+    remediation: "retry" | "resume" | "report" | "continue"
+  }
+}
+
+export type EventSessionNextForkMessageImported = {
+  id: string
+  type: "session.next.fork.message-imported"
+  properties: {
+    sessionID: string
+    sourceSessionID: string
+    sourceMessageID: string
+    timestamp: number
+    message: SessionMessage
+  }
+}
+
+export type EventSessionNextForkEpochImported = {
+  id: string
+  type: "session.next.fork.epoch-imported"
+  properties: {
+    sessionID: string
+    sourceSessionID: string
+    throughSeq: number
+    baseline: string
+    baselineSeq: number
+    agent: string
+    snapshot: {
+      [key: string]:
+        | unknown
+        | {
+            value: unknown
+            removed?: unknown | null
+          }
+    }
+  }
+}
+
+export type EventSessionNextForkHistoryBoundaryImported = {
+  id: string
+  type: "session.next.fork.history-boundary-imported"
+  properties: {
+    sessionID: string
+    sourceSessionID: string
+    throughSeq: number
+    dispatchDigest?: string
+  }
+}
+
+export type EventSessionNextForkAttachmentsImported = {
+  id: string
+  type: "session.next.fork.attachments-imported"
+  properties: {
+    sessionID: string
+    attachments: Array<{
+      id: string
+      messageID?: string
+      mime: string
+      filename?: string
+      sizeBytes: number
+      sha256: string
+      storagePath: string
+      createdAt: number
+    }>
+  }
+}
+
+export type EventReferenceUpdated = {
+  id: string
+  type: "reference.updated"
+  properties: {
+    [key: string]: unknown
   }
 }
 
@@ -8991,11 +10251,12 @@ export type EventPermissionV2Replied = {
   }
 }
 
-export type EventReferenceUpdated = {
+export type EventSessionRunnerSettled = {
   id: string
-  type: "reference.updated"
+  type: "session.runner.settled"
   properties: {
-    [key: string]: unknown
+    sessionID: string
+    status: "completed" | "error" | "interrupted"
   }
 }
 
@@ -9178,6 +10439,14 @@ export type QuestionV2Info1 = {
   filePath?: string
   emojis?: Array<string>
   form?: ControlFormDefinition
+  chatSend?: {
+    /**
+     * Exact text sent into the session chat verbatim, including slash commands
+     */
+    text: string
+    label?: string
+    description?: string
+  }
   context?: string
   content?: string
   markdown?: string
@@ -9244,6 +10513,7 @@ export type EventSurfaceReplied = {
     sessionID: string
     requestID: string
     answers: Array<QuestionV2Answer>
+    source?: "user" | "main" | "recommended"
   }
 }
 
@@ -9498,6 +10768,18 @@ export type EventProjectUpdated = {
       initialized?: number
     }
     sandboxes: Array<string>
+    sessionDirectories?: Array<string>
+  }
+}
+
+export type EventProjectDirectoryIconUpdated = {
+  id: string
+  type: "project.directoryIcon.updated"
+  properties: {
+    directory: string
+    icon?: {
+      override: string
+    }
   }
 }
 
@@ -10908,6 +12190,86 @@ export type VcsGitResponses = {
 
 export type VcsGitResponse = VcsGitResponses[keyof VcsGitResponses]
 
+export type VcsGitHistoryData = {
+  body?: VcsGitHistoryRequest
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/vcs/git/history"
+}
+
+export type VcsGitHistoryErrors = {
+  /**
+   * VcsGitHistoryInvalidError | InvalidRequestError
+   */
+  400: VcsGitHistoryInvalidError | InvalidRequestError
+  /**
+   * VcsGitHistoryStaleError
+   */
+  409: VcsGitHistoryStaleError
+  /**
+   * VcsGitHistoryLimitError
+   */
+  413: VcsGitHistoryLimitError
+  /**
+   * VcsGitHistoryProcessError
+   */
+  502: VcsGitHistoryProcessError
+}
+
+export type VcsGitHistoryError = VcsGitHistoryErrors[keyof VcsGitHistoryErrors]
+
+export type VcsGitHistoryResponses = {
+  /**
+   * Git history page
+   */
+  200: VcsGitHistoryPage
+}
+
+export type VcsGitHistoryResponse = VcsGitHistoryResponses[keyof VcsGitHistoryResponses]
+
+export type VcsGitCommitMessageData = {
+  body?: VcsGitCommitMessageRequest
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/vcs/git/commit-message"
+}
+
+export type VcsGitCommitMessageErrors = {
+  /**
+   * VcsGitHistoryInvalidError | InvalidRequestError
+   */
+  400: VcsGitHistoryInvalidError | InvalidRequestError
+  /**
+   * VcsGitHistoryStaleError
+   */
+  409: VcsGitHistoryStaleError
+  /**
+   * VcsGitHistoryLimitError
+   */
+  413: VcsGitHistoryLimitError
+  /**
+   * VcsGitHistoryProcessError
+   */
+  502: VcsGitHistoryProcessError
+}
+
+export type VcsGitCommitMessageError = VcsGitCommitMessageErrors[keyof VcsGitCommitMessageErrors]
+
+export type VcsGitCommitMessageResponses = {
+  /**
+   * Git commit message chunk
+   */
+  200: VcsGitCommitMessagePage
+}
+
+export type VcsGitCommitMessageResponse = VcsGitCommitMessageResponses[keyof VcsGitCommitMessageResponses]
+
 export type VcsGitDiscoverData = {
   body?: never
   path?: never
@@ -11541,9 +12903,9 @@ export type ProjectUpdateData = {
 
 export type ProjectUpdateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | Project.InvalidIconError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ProjectInvalidIconError | InvalidRequestError
   /**
    * ProjectNotFoundError
    */
@@ -11660,6 +13022,90 @@ export type ProjectDirectoriesResponses = {
 }
 
 export type ProjectDirectoriesResponse = ProjectDirectoriesResponses[keyof ProjectDirectoriesResponses]
+
+export type ProjectDirectoryIconsData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/project/directory-icons"
+}
+
+export type ProjectDirectoryIconsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProjectDirectoryIconsError = ProjectDirectoryIconsErrors[keyof ProjectDirectoryIconsErrors]
+
+export type ProjectDirectoryIconsResponses = {
+  /**
+   * Directory icons
+   */
+  200: ProjectDirectoryIcons
+}
+
+export type ProjectDirectoryIconsResponse = ProjectDirectoryIconsResponses[keyof ProjectDirectoryIconsResponses]
+
+export type ProjectDirectoryIconData = {
+  body?: ProjectDirectoryIconInput
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/project/directory-icon"
+}
+
+export type ProjectDirectoryIconErrors = {
+  /**
+   * BadRequest | Project.InvalidIconError | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | ProjectInvalidIconError | InvalidRequestError
+}
+
+export type ProjectDirectoryIconError = ProjectDirectoryIconErrors[keyof ProjectDirectoryIconErrors]
+
+export type ProjectDirectoryIconResponses = {
+  /**
+   * Stored directory icon, or the directory alone once cleared
+   */
+  200: ProjectDirectoryIconUpdate
+}
+
+export type ProjectDirectoryIconResponse = ProjectDirectoryIconResponses[keyof ProjectDirectoryIconResponses]
+
+export type ProjectResolveData = {
+  body?: ProjectResolveDirectoriesInput
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/project/resolve"
+}
+
+export type ProjectResolveErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProjectResolveError = ProjectResolveErrors[keyof ProjectResolveErrors]
+
+export type ProjectResolveResponses = {
+  /**
+   * Resolved directories in request order
+   */
+  200: ProjectResolvedDirectories
+}
+
+export type ProjectResolveResponse = ProjectResolveResponses[keyof ProjectResolveResponses]
 
 export type ExperimentalProjectCopyGenerateNameData = {
   body?: {
@@ -12323,6 +13769,52 @@ export type PluginServicesSessionPolicyResponses = {
 export type PluginServicesSessionPolicyResponse =
   PluginServicesSessionPolicyResponses[keyof PluginServicesSessionPolicyResponses]
 
+export type PluginServicesSessionGoalData = {
+  body?: {
+    sessionID: string
+    action: "pause" | "resume"
+    runID?: string
+    operationID: string
+    expectedRevision?: number
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/app/host/session-goal"
+}
+
+export type PluginServicesSessionGoalErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type PluginServicesSessionGoalError = PluginServicesSessionGoalErrors[keyof PluginServicesSessionGoalErrors]
+
+export type PluginServicesSessionGoalResponses = {
+  /**
+   * Success
+   */
+  200: {
+    ok: true
+    data: unknown
+  }
+}
+
+export type PluginServicesSessionGoalResponse =
+  PluginServicesSessionGoalResponses[keyof PluginServicesSessionGoalResponses]
+
 export type PluginServicesCallData = {
   body?: {
     caller: {
@@ -12640,6 +14132,55 @@ export type SessionUpdateResponses = {
 
 export type SessionUpdateResponse = SessionUpdateResponses[keyof SessionUpdateResponses]
 
+export type SessionAttentionStateData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query: {
+    directory?: string
+    workspace?: string
+    afterSeq: string
+  }
+  url: "/session/{sessionID}/attention-state"
+}
+
+export type SessionAttentionStateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionAttentionStateError = SessionAttentionStateErrors[keyof SessionAttentionStateErrors]
+
+export type SessionAttentionStateResponses = {
+  /**
+   * Durable session activity summary
+   */
+  200: {
+    sessionID: string
+    title: string
+    directory: string
+    archived: boolean
+    cursor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    count: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    lastFailureSeq?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    last?: {
+      id: string
+      status: string
+      closedSeq: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    working: boolean
+  }
+}
+
+export type SessionAttentionStateResponse = SessionAttentionStateResponses[keyof SessionAttentionStateResponses]
+
 export type SessionChildrenData = {
   body?: never
   path: {
@@ -12890,6 +14431,184 @@ export type SessionProtectionResponses = {
 }
 
 export type SessionProtectionResponse = SessionProtectionResponses[keyof SessionProtectionResponses]
+
+export type SessionDelegationPreferencesData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+    scope?: "global" | "project" | "session" | "task"
+    taskID?: string
+  }
+  url: "/session/{sessionID}/delegation-preferences"
+}
+
+export type SessionDelegationPreferencesErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * UnknownError
+   */
+  500: UnknownError1
+}
+
+export type SessionDelegationPreferencesError =
+  SessionDelegationPreferencesErrors[keyof SessionDelegationPreferencesErrors]
+
+export type SessionDelegationPreferencesResponses = {
+  /**
+   * Success
+   */
+  200: {
+    scope: "global" | "project" | "session" | "task"
+    value: {
+      ordinaryQuestions?: boolean
+      preferences?: Array<{
+        topic: string
+        selections: Array<{
+          agent?: string
+          model?: string
+          variant?: string
+          chain?: string
+        }>
+      }>
+      rules?: Array<{
+        topic?: string
+        allowed: Array<{
+          agent?: string
+          model?: string
+          variant?: string
+          chain?: string
+        }>
+      }>
+    }
+    revision?: number
+    version?: string
+    taskID?: string
+    changed?: boolean
+  }
+}
+
+export type SessionDelegationPreferencesResponse =
+  SessionDelegationPreferencesResponses[keyof SessionDelegationPreferencesResponses]
+
+export type SessionPatchDelegationPreferencesData = {
+  body: {
+    scope?: "global" | "project" | "session" | "task"
+    taskID?: string
+    expectedRevision?: number
+    expectedVersion?: string
+    patch: {
+      ordinaryQuestions?: boolean | null
+      preferences?: Array<{
+        topic: string
+        selections: Array<{
+          agent?: string
+          model?: string
+          variant?: string
+          chain?: string
+        }>
+      }> | null
+      rules?: Array<{
+        topic?: string
+        allowed: Array<{
+          agent?: string
+          model?: string
+          variant?: string
+          chain?: string
+        }>
+      }> | null
+    }
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/delegation-preferences"
+}
+
+export type SessionPatchDelegationPreferencesErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * UnknownError
+   */
+  500: UnknownError1
+}
+
+export type SessionPatchDelegationPreferencesError =
+  SessionPatchDelegationPreferencesErrors[keyof SessionPatchDelegationPreferencesErrors]
+
+export type SessionPatchDelegationPreferencesResponses = {
+  /**
+   * Success
+   */
+  200: {
+    scope: "global" | "project" | "session" | "task"
+    value: {
+      ordinaryQuestions?: boolean
+      preferences?: Array<{
+        topic: string
+        selections: Array<{
+          agent?: string
+          model?: string
+          variant?: string
+          chain?: string
+        }>
+      }>
+      rules?: Array<{
+        topic?: string
+        allowed: Array<{
+          agent?: string
+          model?: string
+          variant?: string
+          chain?: string
+        }>
+      }>
+    }
+    revision?: number
+    version?: string
+    taskID?: string
+    changed?: boolean
+  }
+}
+
+export type SessionPatchDelegationPreferencesResponse =
+  SessionPatchDelegationPreferencesResponses[keyof SessionPatchDelegationPreferencesResponses]
 
 export type SessionForkData = {
   body?: {
@@ -14454,7 +16173,7 @@ export type V2SessionPromptErrors = {
   /**
    * UnknownError
    */
-  500: UnknownError1
+  500: UnknownError2
 }
 
 export type V2SessionPromptError = V2SessionPromptErrors[keyof V2SessionPromptErrors]
@@ -14526,7 +16245,7 @@ export type V2SessionCommandErrors = {
   /**
    * UnknownError
    */
-  500: UnknownError1
+  500: UnknownError2
 }
 
 export type V2SessionCommandError = V2SessionCommandErrors[keyof V2SessionCommandErrors]
@@ -14895,7 +16614,7 @@ export type V2SessionSwitchModelErrors = {
   /**
    * UnknownError
    */
-  500: UnknownError1
+  500: UnknownError2
   /**
    * ServiceUnavailableError
    */
@@ -15068,6 +16787,184 @@ export type V2SessionSkillResponses = {
 
 export type V2SessionSkillResponse = V2SessionSkillResponses[keyof V2SessionSkillResponses]
 
+export type V2SessionSkillSelectionsData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/skill-selections"
+}
+
+export type V2SessionSkillSelectionsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * SessionLocationUnavailableError
+   */
+  410: SessionLocationUnavailableError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type V2SessionSkillSelectionsError = V2SessionSkillSelectionsErrors[keyof V2SessionSkillSelectionsErrors]
+
+export type V2SessionSkillSelectionsResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: {
+      sessionID: string
+      revision: number
+      serverNow: number
+      selections: Array<{
+        name: string
+        status:
+          | "active"
+          | "expired_time"
+          | "expired_messages"
+          | "forgotten"
+          | "renewal_declined"
+          | "missing"
+          | "origin_unverified"
+          | "state_unavailable"
+        generation: number
+        originKind: "input" | "chat_send" | "command" | "renewal"
+        selectedAt: number
+        expiresAt?: number
+        remainingMs: number
+        remainingMessages: number
+        limitMinutes: number
+        limitMessages: number
+        recognized: boolean
+      }>
+    }
+  }
+}
+
+export type V2SessionSkillSelectionsResponse =
+  V2SessionSkillSelectionsResponses[keyof V2SessionSkillSelectionsResponses]
+
+export type V2SessionSkillSelectionForgetData = {
+  body: {
+    name?: string
+    all?: boolean
+    expectedRevision: number
+    operationID: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/skill-selections/forget"
+}
+
+export type V2SessionSkillSelectionForgetErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * SessionLocationUnavailableError
+   */
+  410: SessionLocationUnavailableError
+}
+
+export type V2SessionSkillSelectionForgetError =
+  V2SessionSkillSelectionForgetErrors[keyof V2SessionSkillSelectionForgetErrors]
+
+export type V2SessionSkillSelectionForgetResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: {
+      revision: number
+      outcome: "forgotten" | "revision_conflict" | "duplicate_operation"
+    }
+  }
+}
+
+export type V2SessionSkillSelectionForgetResponse =
+  V2SessionSkillSelectionForgetResponses[keyof V2SessionSkillSelectionForgetResponses]
+
+export type V2SessionChatSendData = {
+  body: {
+    requestID: string
+    text: string
+    id: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/chat-send"
+}
+
+export type V2SessionChatSendErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * SessionLocationUnavailableError
+   */
+  410: SessionLocationUnavailableError
+}
+
+export type V2SessionChatSendError = V2SessionChatSendErrors[keyof V2SessionChatSendErrors]
+
+export type V2SessionChatSendResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: {
+      admitted: SessionInputAdmitted
+      selections: Array<string>
+    }
+  }
+}
+
+export type V2SessionChatSendResponse = V2SessionChatSendResponses[keyof V2SessionChatSendResponses]
+
 export type V2SessionCompactData = {
   body?: never
   path: {
@@ -15097,7 +16994,7 @@ export type V2SessionCompactErrors = {
   /**
    * UnknownError
    */
-  500: UnknownError1
+  500: UnknownError2
   /**
    * ServiceUnavailableError
    */
@@ -15120,7 +17017,9 @@ export type V2SessionActivityData = {
   path: {
     sessionID: string
   }
-  query?: never
+  query?: {
+    messageID?: string
+  }
   url: "/api/session/{sessionID}/activity"
 }
 
@@ -15155,6 +17054,7 @@ export type V2SessionActivityResponses = {
       activityID?: string
       activityStatus?: "running" | "recovering" | "completed" | "failed" | "interrupted"
       lastError?: string
+      turnCompletionResult?: "done" | "incomplete" | "unknown" | "skipped"
     }
   }
 }
@@ -15269,7 +17169,7 @@ export type V2SessionContextErrors = {
   /**
    * UnknownError
    */
-  500: UnknownError1
+  500: UnknownError2
 }
 
 export type V2SessionContextError = V2SessionContextErrors[keyof V2SessionContextErrors]
@@ -15325,7 +17225,7 @@ export type V2SessionMessagesErrors = {
   /**
    * UnknownError
    */
-  500: UnknownError1
+  500: UnknownError2
 }
 
 export type V2SessionMessagesError = V2SessionMessagesErrors[keyof V2SessionMessagesErrors]
@@ -16200,6 +18100,7 @@ export type V2SkillListData = {
       directory?: string
       workspace?: string
     }
+    agent?: string
   }
   url: "/api/skill"
 }
@@ -16265,6 +18166,48 @@ export type V2SkillResolveResponses = {
 }
 
 export type V2SkillResolveResponse = V2SkillResolveResponses[keyof V2SkillResolveResponses]
+
+export type V2SkillDiagnosticsData = {
+  body?: never
+  path?: never
+  query?: {
+    location?: {
+      directory?: string
+      workspace?: string
+    }
+    agent?: string
+  }
+  url: "/api/skill/diagnostics"
+}
+
+export type V2SkillDiagnosticsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2SkillDiagnosticsError = V2SkillDiagnosticsErrors[keyof V2SkillDiagnosticsErrors]
+
+export type V2SkillDiagnosticsResponses = {
+  /**
+   * Success
+   */
+  200: {
+    location: LocationInfo
+    data: Array<{
+      name: string
+      manualOnly: boolean
+      missingTools: Array<string>
+    }>
+  }
+}
+
+export type V2SkillDiagnosticsResponse = V2SkillDiagnosticsResponses[keyof V2SkillDiagnosticsResponses]
 
 export type V2EventSubscribeData = {
   body?: never

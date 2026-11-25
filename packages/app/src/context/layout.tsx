@@ -34,6 +34,8 @@ import {
   type DockItemRequest,
 } from "./layout-dock"
 import { useSessionRoute } from "@/context/session-route"
+import { useGlobal } from "./global"
+import { projectWorktreeKey } from "@/utils/path-key"
 
 export { createSessionKeyReader, ensureSessionKey, pruneSessionKeys }
 
@@ -103,7 +105,7 @@ export type StoredControlPanel = {
   data: unknown
 }
 
-export type LocalProject = Partial<Project> & { worktree: string; expanded: boolean }
+export type LocalProject = Partial<Project> & { worktree: string; expanded: boolean; aliases?: string[] }
 
 export type ReviewDiffStyle = "unified" | "split"
 
@@ -159,6 +161,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
   init: () => {
     const serverSdk = useServerSDK()
     const serverSync = useServerSync()
+    const global = useGlobal()
     const server = useServer()
     const platform = usePlatform()
     const params = useSessionRoute()
@@ -530,16 +533,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       return available[Math.floor(Math.random() * available.length)]
     }
 
-    function enrich(project: LocalProject): LocalProject {
-      const metadata = serverSync().data.project.find((x) => x.worktree === project.worktree)
-      return {
-        ...metadata,
-        ...project,
-        icon: metadata?.icon ? { ...project.icon, ...metadata.icon } : project.icon,
-        iconGeneration: metadata?.iconGeneration,
-      }
-    }
-
     const roots = createMemo(() => {
       const map = new Map<string, string>()
       for (const project of serverSync().data.project) {
@@ -594,7 +587,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       })
     })
 
-    const enriched = createMemo(() => server.projects.list().map(enrich))
+    const enriched = createMemo<LocalProject[]>(() => server.current ? global.createServerCtx(server.current).projects.list() : server.projects.list())
     const list = createMemo(() => {
       const projects = enriched()
       return projects.map((project) => {
@@ -825,23 +818,34 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       },
       projects: {
         list,
+        async register(directory: string) {
+          const current = server.current
+          if (!current) return
+          const root = await global.createServerCtx(current).projects.register(rootFor(directory))
+          if (root && server.current === current) void serverSync().project.loadSessions(root)
+          return root
+        },
         open(directory: string) {
           const root = rootFor(directory)
-          if (server.projects.list().find((x) => x.worktree === root)) return
+          if (server.projects.list().some((x) => projectWorktreeKey(x.worktree) === projectWorktreeKey(root))) return
           void serverSync().project.loadSessions(root)
           server.projects.open(root)
         },
         close(directory: string) {
-          server.projects.close(directory)
+          if (server.current) global.createServerCtx(server.current).projects.close(directory)
+          else server.projects.close(directory)
         },
         expand(directory: string) {
-          server.projects.expand(directory)
+          if (server.current) global.createServerCtx(server.current).projects.expand(directory)
+          else server.projects.expand(directory)
         },
         collapse(directory: string) {
-          server.projects.collapse(directory)
+          if (server.current) global.createServerCtx(server.current).projects.collapse(directory)
+          else server.projects.collapse(directory)
         },
         move(directory: string, toIndex: number) {
-          server.projects.move(directory, toIndex)
+          if (server.current) global.createServerCtx(server.current).projects.move(directory, toIndex)
+          else server.projects.move(directory, toIndex)
         },
       },
       sidebar: {

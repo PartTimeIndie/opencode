@@ -19,6 +19,9 @@ export type AgentToolEntry = {
 export type AgentToolPolicy = { mode: "inherit" | "explicit"; entries?: Record<string, AgentToolEntry> }
 export type AgentCompletionPolicy = { mode: "inherit" | "custom"; prompt?: string; files?: string[] }
 
+export type SkillInvocationMode = "allow" | "ask" | "manual" | "deny"
+export type AgentSkillEntry = { visible?: boolean; invocation?: SkillInvocationMode }
+
 export type ConfigurableAgent = {
   model?: string
   variant?: string
@@ -134,9 +137,9 @@ export function toolPolicy(agent: ConfigurableAgent): AgentToolPolicy {
   if (direct) return direct
   const migrated = structuredToolPolicy(agent.options?.__agentTools)
   if (migrated) return migrated
-  if (!value) return agent.permission ? { mode: "explicit" } : { mode: "inherit" }
+  if (!value) return { mode: "inherit" }
   return {
-    mode: "explicit",
+    mode: "inherit",
     entries: Object.fromEntries(Object.entries(value as Record<string, boolean>).map(([id, visible]) => [id, { visible }])),
   }
 }
@@ -147,7 +150,7 @@ export function completionPolicy(agent: ConfigurableAgent): AgentCompletionPolic
 
 export function toolEntry(agent: ConfigurableAgent, tool: string): AgentToolEntry {
   const policy = toolPolicy(agent)
-  const entry = policy.entries?.[tool]
+  const entry = Wildcard.all(tool, policy.entries ?? {})
   if (entry) return entry
   if (tool === switchTool) return { visible: false, permission: "deny" }
   if (agent.tools && "mode" in agent.tools && agent.tools.mode === "explicit") {
@@ -165,8 +168,8 @@ export function setAgentToolEntry(agent: ConfigurableAgent, tool: string, entry:
   return {
     ...agent,
     tools: {
-      mode: "explicit",
-      entries: { ...(policy.entries ?? {}), [tool]: { ...toolEntry(agent, tool), ...entry } },
+      mode: policy.mode,
+      entries: { ...(policy.entries ?? {}), [tool]: { ...policy.entries?.[tool], ...entry } },
     },
   }
 }
@@ -187,7 +190,7 @@ export function projectPermission(entry: AgentToolEntry, project: string) {
 }
 
 // Snapshot every catalog tool's effective state when entering explicit mode. Without
-// this, switching a single tool (or the mode dropdown) to "explicit" leaves every
+// this, deliberately switching the mode dropdown to "explicit" leaves every
 // other tool without an entry, and the explicit-mode fallback in toolEntry hides
 // them all at once. Materializing preserves the inherited visible/permission state
 // so toggling one tool only changes that tool.
@@ -243,8 +246,7 @@ export function setToolPermission(
   return next
 }
 
-export function saveAgent(id: string, agent: ConfigurableAgent): Config {
-  if (hasLegacySwitchConfig(agent)) {
+export function saveAgent(id: string, agent: ConfigurableAgent): Config {  if (hasLegacySwitchConfig(agent)) {
     const permission = permissionMap(agent.permission)
     const legacy = legacySwitchPermission(agent.tools) ?? legacySwitchPermission(agent.options?.__agentTools)
     const tools = hasLegacySwitchTools(agent) ? toolPolicy(agent) : agent.tools
@@ -269,6 +271,44 @@ export function saveAgent(id: string, agent: ConfigurableAgent): Config {
       [id]: agent as unknown as AgentConfig,
     },
   }
+}
+
+/** Sparse per-agent skill policy overrides stored on the agent config. */
+export function agentSkills(agent: ConfigurableAgent): Record<string, AgentSkillEntry> {
+  const value = agent.skills
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).flatMap(([name, entry]) =>
+      entry && typeof entry === "object" && !Array.isArray(entry)
+        ? [[name, { ...(entry as AgentSkillEntry) }] as const]
+        : [],
+    ),
+  )
+}
+
+/**
+ * Field-wise inherit. An absent patch key keeps the stored field; an explicit
+ * `undefined` removes it. An entry without any remaining field is dropped.
+ */
+export function setAgentSkillEntry(
+  agent: ConfigurableAgent,
+  skill: string,
+  patch: { visible?: boolean | undefined; invocation?: SkillInvocationMode | undefined },
+): ConfigurableAgent {
+  const entries = agentSkills(agent)
+  const current: AgentSkillEntry = { ...entries[skill] }
+  if ("visible" in patch) {
+    if (patch.visible === undefined) delete current.visible
+    else current.visible = patch.visible
+  }
+  if ("invocation" in patch) {
+    if (patch.invocation === undefined) delete current.invocation
+    else current.invocation = patch.invocation
+  }
+  if ("visible" in current || "invocation" in current) entries[skill] = current
+  else delete entries[skill]
+  const skills = Object.keys(entries).length > 0 ? entries : undefined
+  return { ...agent, skills }
 }
 
 function structuredToolPolicy(value: unknown): AgentToolPolicy | undefined {
@@ -407,6 +447,8 @@ export function filterToolCatalog(catalog: ToolCatalogEntry[], query: string) {
 }
 
 export function isCatalogToolVisible(agent: ConfigurableAgent, item: ToolCatalogEntry) {
-  if (toolPolicy(agent).mode === "explicit") return toolEntry(agent, item.id).visible !== false
+  const policy = toolPolicy(agent)
+  if (policy.mode === "explicit" || Wildcard.all(item.id, policy.entries ?? {})?.visible !== undefined)
+    return toolEntry(agent, item.id).visible !== false
   return item.visible && toolEntry(agent, item.id).visible !== false
 }

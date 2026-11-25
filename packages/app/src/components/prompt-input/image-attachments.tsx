@@ -9,6 +9,8 @@ type PromptAttachmentsProps = {
   onOpen: (attachment: PromptAttachmentPart) => void
   onRemove: (id: string) => void
   removeLabel: string
+  unpackLabel: string
+  onUnpack: (id: string, value: boolean) => void
 }
 
 const fallbackClass = "size-16 rounded-md bg-surface-base flex items-center justify-center border border-border-base"
@@ -26,36 +28,48 @@ export const PromptAttachments: Component<PromptAttachmentsProps> = (props) => {
           {(attachment) => (
             <Tooltip value={attachment.filename} placement="top" contentClass="break-all">
               <div class="relative group">
-                <LocalMediaSource
-                  source={
-                    attachment.mime.startsWith("image/") ? (attachment.dataUrl ?? attachment.sourcePath) : undefined
-                  }
-                  fallback={
-                    <div class={fallbackClass}>
-                      <Icon name="folder" class="size-6 text-text-weak" />
-                    </div>
-                  }
-                >
-                  {(src) => (
-                    <img
-                      src={src()}
-                      alt={attachment.filename}
-                      class={imageClass}
-                      onClick={() => props.onOpen(attachment)}
-                    />
-                  )}
-                </LocalMediaSource>
-                <button
-                  type="button"
-                  onClick={() => props.onRemove(attachment.id)}
-                  class={removeClass}
-                  aria-label={props.removeLabel}
-                >
-                  <Icon name="close" class="size-3 text-text-weak" />
-                </button>
-                <div class={nameClass}>
-                  <span class="text-10-regular text-white truncate block">{attachment.filename}</span>
+                <div class="relative size-16">
+                  <LocalMediaSource
+                    source={
+                      attachment.mime.startsWith("image/") ? (attachment.dataUrl ?? attachment.sourcePath) : undefined
+                    }
+                    fallback={
+                      <div class={fallbackClass}>
+                        <Icon name="folder" class="size-6 text-text-weak" />
+                      </div>
+                    }
+                  >
+                    {(src) => (
+                      <img
+                        src={src()}
+                        alt={attachment.filename}
+                        class={imageClass}
+                        onClick={() => props.onOpen(attachment)}
+                      />
+                    )}
+                  </LocalMediaSource>
+                  <button
+                    type="button"
+                    onClick={() => props.onRemove(attachment.id)}
+                    class={removeClass}
+                    aria-label={props.removeLabel}
+                  >
+                    <Icon name="close" class="size-3 text-text-weak" />
+                  </button>
+                  <div class={nameClass}>
+                    <span class="text-10-regular text-white truncate block">{attachment.filename}</span>
+                  </div>
                 </div>
+                <Show when={/\.(7z|zip|tar|tgz|tar\.(gz|bz2|xz))$/i.test(attachment.filename)}>
+                  <label class="flex items-center gap-1 mt-1 text-11-regular text-text-base">
+                    <input
+                      type="checkbox"
+                      checked={attachment.unpack === true}
+                      onChange={(event) => props.onUnpack(attachment.id, event.currentTarget.checked)}
+                    />
+                    {props.unpackLabel}
+                  </label>
+                </Show>
               </div>
             </Tooltip>
           )}

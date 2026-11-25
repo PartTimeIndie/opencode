@@ -1,7 +1,13 @@
-import { usePlatform } from "@/context/platform"
+import { usePlatform, type Platform } from "@/context/platform"
+import { useLanguage } from "@/context/language"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { DialogWebDock } from "@/components/dialog-web-dock"
 import { Button } from "@opencode-ai/ui/button"
-import { createEffect, createMemo, createRoot, For, onCleanup, onMount, Show } from "solid-js"
-import { createStore } from "solid-js/store"
+import { batch, createEffect, createMemo, createRoot, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createSessionBrowserRuntime, type BrowserTab } from "./session-browser-runtime"
+import { createBrowserTransferLock } from "./browser-transfer-lock"
+import { createBrowserFrameSlots } from "./browser-frame-slots"
+import { reloadBrowserFrame } from "./browser-frame-reload"
 import {
   browserPartition,
   crashedWebviewAction,
@@ -15,34 +21,11 @@ import {
 
 export { isAllowedBrowserURL, normalizeBrowserURL }
 
-type BrowserTab = {
-  id: string
-  draft: string
-  url: string
-  currentURL: string
-  error: string
-  loading: boolean
-  request: number
-}
+const browserRuntime = createSessionBrowserRuntime(defaultURL)
+const { browserStore, setBrowserStore, createTab } = browserRuntime
 
-type BrowserDockState = {
-  tabs: Record<string, BrowserTab>
-  order: string[]
-  activeTabId: string
-}
-
-let tabSeq = 0
-function createTab(): BrowserTab {
-  const id = `bt-${++tabSeq}`
-  return { id, draft: defaultURL, url: "", currentURL: "", error: "", loading: false, request: 0 }
-}
-
-const initialTab = createTab()
-const [browserStore, setBrowserStore] = createStore<BrowserDockState>({
-  tabs: { [initialTab.id]: initialTab },
-  order: [initialTab.id],
-  activeTabId: initialTab.id,
-})
+const dockTickets = new Map<string, { id: number; ticket: string }>()
+const transfers = createBrowserTransferLock()
 
 type BrowserWebviewElement = HTMLElement & {
   reload?: () => void
@@ -71,17 +54,14 @@ type FrameSingleton = {
 // tabs) never reloads the page. Only the active tab's frame is positioned over
 // the dock slot; the others stay alive but hidden.
 const frames = new Map<string, FrameSingleton>()
-let trackedSlot: HTMLElement | null = null
-let viewportObserver: ResizeObserver | undefined
-let resizeListener: (() => void) | undefined
-let scrollListener: (() => void) | undefined
+const frameSlots = createBrowserFrameSlots()
 
 function syncLocation(tabId: string, url: string) {
   if (!isAllowedBrowserURL(url)) return
   setBrowserStore("tabs", tabId, { draft: url, currentURL: url })
 }
 
-function ensureFrame(tabId: string, mode: BrowserFrameMode): FrameSingleton | undefined {
+function ensureFrame(tabId: string, mode: BrowserFrameMode, transfer?: Platform["browserTransfer"]): FrameSingleton | undefined {
   const existing = frames.get(tabId)
   if (existing) return existing
   if (typeof document === "undefined") return
@@ -123,6 +103,32 @@ function ensureFrame(tabId: string, mode: BrowserFrameMode): FrameSingleton | un
     webview.addEventListener("dom-ready", () => {
       const s = frames.get(tabId)
       if (s) s.ready = true
+      const dockID = Object.keys(browserStore.docked).find((id) => browserStore.docked[id] === tabId)
+      const guestID = webview.getWebContentsId?.()
+      if (!dockID || !guestID || dockTickets.get(dockID)?.id === guestID) return
+      // Restored docks create fresh guests. They need the same main-process
+      // ownership fence as a live tab transfer, not just renderer exclusion.
+      void transfers.run(`dock:${dockID}`, async () => {
+        if (!transfer) throw new Error("Desktop browser transfer is unavailable")
+        const ticket = await transfer("reserve", guestID)
+        if (typeof ticket !== "string") throw new Error("The browser is currently in use")
+        try {
+          if (browserStore.docked[dockID] !== tabId || frames.get(tabId) !== s) throw new Error("The browser page is no longer available")
+          if (await transfer("commit", guestID, ticket) !== true) throw new Error("Browser ownership could not be confirmed")
+          dockTickets.set(dockID, { id: guestID, ticket })
+          positionFrames()
+        } catch (error) {
+          if (await transfer("release", guestID, ticket) !== true) throw new Error("Browser ownership could not be released", { cause: error })
+          throw error
+        }
+      }).catch((error: unknown) => {
+        if (browserStore.docked[dockID] !== tabId || frames.get(tabId) !== s) return
+        // A rejected restore must not leave an unfenced guest available to
+        // automation. Keep the definition and error; an explicit retry creates
+        // a fresh guest and repeats admission.
+        disposeFrame(tabId)
+        setBrowserStore("tabs", tabId, "error", error instanceof Error ? error.message : "Browser ownership could not be confirmed")
+      })
     })
     webview.addEventListener("did-stop-loading", () => setBrowserStore("tabs", tabId, "loading", false))
     webview.addEventListener("did-navigate", onWebviewNavigate)
@@ -214,22 +220,26 @@ function loadFrameSource(s: FrameSingleton, tab: BrowserTab) {
 }
 
 function positionFrames() {
-  const slot = trackedSlot
   const activeId = browserStore.activeTabId
-  const activeTab = browserStore.tabs[activeId]
-  const rect = slot?.getBoundingClientRect()
-  const hasRect = !!rect && rect.width > 0 && rect.height > 0
+  const blocked = !!document.querySelector('[data-component="dialog"], [data-component="dock-add-menu"], [role="menu"][data-expanded]')
   for (const [id, s] of frames) {
+    const dockID = Object.keys(browserStore.docked).find((key) => browserStore.docked[key] === id)
+    const slot = dockID ? frameSlots.get(`dock:${dockID}`) : id === activeId ? frameSlots.get("browser") : undefined
+    const activeTab = browserStore.tabs[id]
+    const rect = slot?.getBoundingClientRect()
+    const hasRect = !!slot && !!rect && rect.width > 0 && rect.height > 0 && slot.getClientRects().length > 0 && getComputedStyle(slot).visibility !== "hidden" && !blocked
     // Never toggle display:none here: a <webview> whose host is display:none
     // attaches its guest at 0x0 (clamped to the 150px default) and fails to
     // resize afterwards. Keep every host display:block; show the active frame
     // over the slot and park inactive frames off-screen with visibility hidden.
-    if (id === activeId && hasRect && activeTab?.url) {
+    if (hasRect && rect && activeTab?.url) {
       s.host.style.left = `${rect.left}px`
       s.host.style.top = `${rect.top}px`
       s.host.style.width = `${rect.width}px`
       s.host.style.height = `${rect.height}px`
-      s.host.style.visibility = "visible"
+      // Restored desktop guests must load off-screen until Main confirms
+      // committed ownership. Geometry/attachment alone is not admission.
+      s.host.style.visibility = dockID && s.mode === "webview" && !dockTickets.has(dockID) ? "hidden" : "visible"
       s.frame.style.width = `${rect.width}px`
       s.frame.style.height = `${rect.height}px`
       if (s.mode === "webview" && s.frame.parentElement !== s.host) s.host.appendChild(s.frame)
@@ -241,27 +251,28 @@ function positionFrames() {
   }
 }
 
-function trackBrowserFrame(el: HTMLElement | null) {
-  if (trackedSlot === el) {
-    positionFrames()
-    return
-  }
-  viewportObserver?.disconnect()
-  if (resizeListener) window.removeEventListener("resize", resizeListener)
-  if (scrollListener) window.removeEventListener("scroll", scrollListener, true)
-  trackedSlot = el
-  if (!el) {
-    positionFrames()
-    return
-  }
+function trackBrowserFrame(owner: string, element: HTMLElement, visible: () => boolean) {
+  const unregister = frameSlots.register(owner, element, visible)
+  // Each mount owns its listener closures, even when desktop and mobile slots
+  // briefly overlap. Never disconnect the replacement mount's observers.
   const reposition = () => positionFrames()
-  resizeListener = reposition
-  scrollListener = reposition
-  window.addEventListener("resize", resizeListener)
-  window.addEventListener("scroll", scrollListener, true)
-  viewportObserver = new ResizeObserver(reposition)
-  viewportObserver.observe(el)
+  const resize = new ResizeObserver(reposition)
+  resize.observe(element)
+  const mutation = new MutationObserver(reposition)
+  mutation.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden", "data-expanded", "data-state", "aria-hidden"] })
+  window.addEventListener("resize", reposition)
+  window.addEventListener("scroll", reposition, true)
+  window.addEventListener("opencode:dock-resize", reposition)
   positionFrames()
+  return () => {
+    unregister()
+    resize.disconnect()
+    mutation.disconnect()
+    window.removeEventListener("resize", reposition)
+    window.removeEventListener("scroll", reposition, true)
+    window.removeEventListener("opencode:dock-resize", reposition)
+    positionFrames()
+  }
 }
 
 function frameStatus(tabId: string): Partial<SessionBrowserStatus> {
@@ -274,6 +285,152 @@ function frameStatus(tabId: string): Partial<SessionBrowserStatus> {
   return { actualURL: (s.frame as HTMLIFrameElement).src }
 }
 
+export async function dockBrowserTab(tabID: string, dockID: string, platform: Platform, save: (url: string) => () => void) {
+  return transfers.run(`tab:${tabID}`, () => transferBrowserTab(tabID, dockID, platform, save))
+}
+
+async function transferBrowserTab(tabID: string, dockID: string, platform: Platform, save: (url: string) => () => void) {
+  if (browserStore.docked[dockID]) throw new Error("The web dock already owns a page")
+  const tab = browserStore.tabs[tabID]
+  if (!tab || !browserStore.order.includes(tabID) || !tab.url) throw new Error("The browser tab is no longer available")
+  const frame = frames.get(tabID)
+  // A destroyed guest must fail the transfer honestly instead of crashing the
+  // whole renderer action with "Object has been destroyed".
+  let webviewID: number | undefined
+  try {
+    webviewID = frame?.mode === "webview" && frame.ready ? (frame.frame as BrowserWebviewElement).getWebContentsId?.() : undefined
+  } catch {
+    webviewID = undefined
+  }
+  let ticket: string | undefined
+  if (frame?.mode === "webview") {
+    if (!webviewID || !platform.browserTransfer) throw new Error("Desktop browser transfer is unavailable")
+    const result = await platform.browserTransfer("reserve", webviewID)
+    if (typeof result !== "string") throw new Error("The browser is currently in use")
+    ticket = result
+  }
+  let undoMove: (() => void) | undefined
+  let rollback: (() => void) | undefined
+  try {
+    if (!browserStore.order.includes(tabID)) throw new Error("The browser tab is no longer available")
+    const url = frame?.mode === "webview" ? (frame.frame as BrowserWebviewElement).getURL?.() : tab.url
+    if (!url || !isAllowedBrowserURL(url)) throw new Error("The browser address is not available")
+    const parsed = new URL(url)
+    if (parsed.username || parsed.password) throw new Error("Addresses containing credentials cannot be saved")
+    if (ticket && webviewID) {
+      if (await platform.browserTransfer!("commit", webviewID, ticket) !== true) throw new Error("Browser transfer could not be confirmed")
+      dockTickets.set(dockID, { id: webviewID, ticket })
+    }
+    batch(() => {
+      rollback = save(url)
+      undoMove = browserRuntime.dock(tabID, dockID)
+    })
+    positionFrames()
+  } catch (error) {
+    batch(() => {
+      undoMove?.()
+      rollback?.()
+    })
+    dockTickets.delete(dockID)
+    if (ticket && webviewID && await platform.browserTransfer!("release", webviewID, ticket) !== true) {
+      throw new Error("Browser transfer failed and its desktop reservation could not be released", { cause: error })
+    }
+    throw error
+  }
+}
+
+export async function returnBrowserDock(dockID: string, platform: Platform) {
+  return transfers.run(`dock:${dockID}`, () => releaseBrowserDock(dockID, platform, false))
+}
+
+export async function removeBrowserDock(dockID: string, platform: Platform) {
+  return transfers.run(`dock:${dockID}`, () => releaseBrowserDock(dockID, platform, true))
+}
+
+async function releaseBrowserDock(dockID: string, platform: Platform, remove: boolean) {
+  const tabID = browserStore.docked[dockID]
+  if (!tabID) {
+    if (!remove) throw new Error("The web dock is not loaded; open it before returning it to the browser")
+    return
+  }
+  const ticket = dockTickets.get(dockID)
+  if (ticket && (!platform.browserTransfer || await platform.browserTransfer("release", ticket.id, ticket.ticket) !== true)) {
+    throw new Error("Browser transfer could not be released")
+  }
+  dockTickets.delete(dockID)
+  if (remove) {
+    disposeFrame(tabID)
+    browserRuntime.removeDock(dockID)
+    return
+  }
+  browserRuntime.returnToBrowser(dockID)
+  positionFrames()
+}
+
+export function navigateBrowserDock(dockID: string, url: string) {
+  if (transfers.has(`dock:${dockID}`)) throw new Error("Browser transfer is in progress")
+  const id = browserStore.docked[dockID]
+  const normalized = normalizeBrowserURL(url)
+  if (!normalized) throw new Error("Enter an HTTP(S) address")
+  // Hidden definitions may not have created a page yet. Their saved address
+  // is consumed on first display; no runtime navigation is needed.
+  if (!id) return
+  const tab = browserStore.tabs[id]
+  if (!tab) throw new Error("The browser page is unavailable")
+  setBrowserStore("tabs", id, { url: normalized, currentURL: normalized, draft: normalized, error: "", loading: true, request: tab.request + 1 })
+}
+
+export function reloadBrowserDock(dockID: string) {
+  if (transfers.has(`dock:${dockID}`)) throw new Error("Browser transfer is in progress")
+  const id = browserStore.docked[dockID]
+  const frame = id && frames.get(id)
+  if (!frame) throw new Error("The browser page is unavailable")
+  reloadBrowserFrame(frame.mode === "webview"
+    ? { mode: "webview", ready: frame.ready, frame: frame.frame as BrowserWebviewElement }
+    : { mode: "iframe", frame: frame.frame as HTMLIFrameElement })
+}
+
+export function SessionWebDock(props: { id: string; startURL: string; visible: boolean }) {
+  const platform = usePlatform()
+  const language = useLanguage()
+  const pageState = () => {
+    const id = browserStore.docked[props.id]
+    return id ? browserStore.tabs[id] : undefined
+  }
+  let slot: HTMLDivElement | undefined
+  const mode = (): BrowserFrameMode => platform.platform === "desktop" && platform.embeddedBrowser === "webview" ? "webview" : "iframe"
+  let initialized = false
+  createEffect(() => {
+    if (initialized) return
+    if (browserStore.docked[props.id]) {
+      initialized = true
+      return
+    }
+    if (!props.visible) return
+    initialized = true
+    const tab = createTab()
+    setBrowserStore("tabs", tab.id, { ...tab, url: props.startURL, currentURL: props.startURL, draft: props.startURL, request: 1, loading: true })
+    setBrowserStore("docked", props.id, tab.id)
+    ensureFrame(tab.id, mode(), platform.browserTransfer)
+  })
+  createEffect(() => {
+    void props.visible
+    void browserStore.docked[props.id]
+    positionFrames()
+  })
+  onMount(() => {
+    if (!slot) return
+    onCleanup(trackBrowserFrame(`dock:${props.id}`, slot, () => props.visible && !pageState()?.error))
+  })
+  return <div data-component="session-web-dock" data-web-dock-id={props.id} class="relative size-full min-h-0 overflow-hidden" ref={slot}>
+    <Show when={pageState()?.error}>{(error) => <div role="alert" class="flex size-full flex-col items-start justify-center gap-3 overflow-auto p-4">
+      <p class="break-words text-12-regular text-text-weak">{error()}</p>
+      <Button size="small" variant="secondary" onClick={() => { navigateBrowserDock(props.id, props.startURL); const id = browserStore.docked[props.id]; if (id) ensureFrame(id, mode(), platform.browserTransfer) }}>{language.t("webDock.start")}</Button>
+      <Button size="small" variant="ghost" onClick={() => platform.openLink(props.startURL)}>{language.t("webDock.external")}</Button>
+    </div>}</Show>
+  </div>
+}
+
 function tabTitle(tab: BrowserTab | undefined) {
   if (!tab || !tab.url) return "New tab"
   try {
@@ -283,8 +440,15 @@ function tabTitle(tab: BrowserTab | undefined) {
   }
 }
 
-export function SessionBrowserDock() {
+export function SessionBrowserDock(props: { visible?: boolean; onDock?: (tabID: string, name: string) => Promise<void> }) {
   const platform = usePlatform()
+  const language = useLanguage()
+  const dialog = useDialog()
+  const [docking, setDocking] = createSignal(false)
+  createEffect(() => {
+    void props.visible
+    positionFrames()
+  })
   let slotRef: HTMLDivElement | undefined
 
   const mode = (): BrowserFrameMode =>
@@ -294,10 +458,12 @@ export function SessionBrowserDock() {
 
   const status = (): SessionBrowserStatus => {
     const tab = activeTab()
-    const hostStatus = frameStatus(browserStore.activeTabId)
+    const id = browserStore.activeTabId
+    const hostStatus = frameStatus(id)
+    if (hostStatus.destroyed) return rebuildDestroyedFrame(id)
     return {
       ...hostStatus,
-      tabId: browserStore.activeTabId,
+      tabId: id,
       draft: tab?.draft ?? defaultURL,
       url: tab?.currentURL || tab?.url || "",
       error: tab?.error ?? "",
@@ -306,16 +472,38 @@ export function SessionBrowserDock() {
     }
   }
 
+  // A destroyed webview guest must never poison the dock: the stale frame
+  // singleton would throw "Object has been destroyed" on every later native
+  // call, so dispose it and create a fresh frame for the same tab. The fresh
+  // webview loads the tab's committed URL through the normal load effect, and
+  // the caller sees an honest loading status instead of a bridge failure.
+  const rebuildDestroyedFrame = (id: string): SessionBrowserStatus => {
+    const tab = activeTab()
+    disposeFrame(id)
+    ensureFrame(id, mode(), platform.browserTransfer)
+    positionFrames()
+    return {
+      tabId: id,
+      draft: tab?.draft ?? defaultURL,
+      url: tab?.currentURL || tab?.url || "",
+      error: "",
+      loading: true,
+      mode: !tab?.url ? "empty" : mode(),
+    }
+  }
+
   const navigateActive = (input: string): SessionBrowserStatus => {
+    if (transfers.has(`tab:${browserStore.activeTabId}`)) throw new Error("Browser transfer is in progress")
     const url = normalizeBrowserURL(input)
     if (!url) throw new Error("Browser URL must be http:// or https://")
     const id = browserStore.activeTabId
-    ensureFrame(id, mode())
+    ensureFrame(id, mode(), platform.browserTransfer)
     setBrowserStore("tabs", id, { url, draft: url, currentURL: url, error: "", loading: true, request: (browserStore.tabs[id]?.request ?? 0) + 1 })
     return status()
   }
 
   const load = () => {
+    if (transfers.has(`tab:${browserStore.activeTabId}`)) return
     const tab = activeTab()
     if (!tab) return
     const url = normalizeBrowserURL(tab.draft)
@@ -323,14 +511,14 @@ export function SessionBrowserDock() {
       setBrowserStore("tabs", browserStore.activeTabId, "error", "Enter an http:// or https:// URL")
       return
     }
-    ensureFrame(browserStore.activeTabId, mode())
+    ensureFrame(browserStore.activeTabId, mode(), platform.browserTransfer)
     setBrowserStore("tabs", browserStore.activeTabId, { url, draft: url, currentURL: url, error: "", loading: true, request: tab.request + 1 })
   }
 
   const activateTab = (id: string) => {
     if (browserStore.activeTabId === id) return
     setBrowserStore("activeTabId", id)
-    ensureFrame(id, mode())
+    ensureFrame(id, mode(), platform.browserTransfer)
     positionFrames()
   }
 
@@ -343,6 +531,7 @@ export function SessionBrowserDock() {
   }
 
   const closeTab = (id: string) => {
+    if (transfers.has(`tab:${id}`)) throw new Error("Browser transfer is in progress")
     const index = browserStore.order.indexOf(id)
     if (index === -1) return
     const nextOrder = browserStore.order.filter((tabId) => tabId !== id)
@@ -351,7 +540,7 @@ export function SessionBrowserDock() {
     if (nextOrder.length === 0) {
       // Always keep at least one tab.
       const fresh = createTab()
-      setBrowserStore({ tabs: { [fresh.id]: fresh }, order: [fresh.id], activeTabId: fresh.id })
+      setBrowserStore({ tabs: { ...nextTabs, [fresh.id]: fresh }, order: [fresh.id], activeTabId: fresh.id })
     } else {
       const nextActive = browserStore.activeTabId === id ? nextOrder[Math.min(index, nextOrder.length - 1)] : browserStore.activeTabId
       setBrowserStore({ tabs: nextTabs, order: nextOrder, activeTabId: nextActive })
@@ -361,7 +550,7 @@ export function SessionBrowserDock() {
   }
 
   onMount(() => {
-    ensureFrame(browserStore.activeTabId, mode())
+    ensureFrame(browserStore.activeTabId, mode(), platform.browserTransfer)
     const unregister = SessionBrowserControl.register({
       navigate(input) {
         return navigateActive(input)
@@ -373,22 +562,22 @@ export function SessionBrowserDock() {
         setBrowserStore("tabs", tab.id, { ...tab, url, draft: url, currentURL: url, error: "", loading: true, request: 1 })
         setBrowserStore("order", (order) => [...order, tab.id])
         setBrowserStore("activeTabId", tab.id)
-        ensureFrame(tab.id, mode())
+        ensureFrame(tab.id, mode(), platform.browserTransfer)
         positionFrames()
         return { ...status(), tabId: tab.id }
       },
       closeTab(tabId) {
         const id = tabId ?? browserStore.activeTabId
-        if (!browserStore.tabs[id]) return { closed: false }
+        if (!browserStore.tabs[id] || !browserStore.order.includes(id)) return { closed: false }
         closeTab(id)
         return { closed: true, tabId: id }
       },
       status,
     })
-    trackBrowserFrame(slotRef ?? null)
+    const untrackFrame = slotRef ? trackBrowserFrame("browser", slotRef, () => props.visible !== false) : () => {}
     onCleanup(() => {
       unregister()
-      trackBrowserFrame(null)
+      untrackFrame()
     })
   })
 
@@ -451,6 +640,16 @@ export function SessionBrowserDock() {
         >
           Pop out
         </Button>
+        <Button type="button" size="small" variant="ghost" disabled={!activeTab()?.url || activeTab()?.loading || !props.onDock || docking()} onClick={() => {
+          const tabID = browserStore.activeTabId
+          const tab = browserStore.tabs[tabID]
+          if (!tab?.url || !props.onDock) return
+          const name = tabTitle(tab)
+          dialog.show(() => <DialogWebDock title={language.t("webDock.create")} label={language.t("webDock.name")} initial={name} hint={mode() === "iframe" ? language.t("webDock.webHint") : undefined} onSubmit={async (value) => {
+            setDocking(true)
+            try { await props.onDock!(tabID, value) } finally { setDocking(false) }
+          }} />)
+        }}>Dock</Button>
       </form>
       <div data-slot="browser-status">
         <Show when={activeTab()?.error}>{(error) => <div data-slot="browser-error">{error()}</div>}</Show>

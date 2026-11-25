@@ -1,8 +1,29 @@
 import type { Prompt } from "./prompt"
+import type { Tab } from "./tabs-domain"
+import { base64Encode } from "@opencode-ai/core/util/encode"
+import { pathKey } from "@/utils/path-key"
+
+export function backgroundPromptScope(input: { serverID: string; directory: string; sessionID?: string; composerID?: string }, tabs: readonly Tab[]) {
+  if (input.sessionID && input.composerID === input.sessionID)
+    return { dir: base64Encode(input.directory), id: input.sessionID }
+  if (input.sessionID || !input.composerID) return
+  const draft = tabs.find((tab) => tab.type === "draft" && tab.draftID === input.composerID && tab.server === input.serverID && pathKey(tab.directory) === pathKey(input.directory))
+  if (draft?.type === "draft") return { draftID: draft.draftID }
+}
 
 const insertions = new WeakMap<object, { snapshot: string; text: string; start: number }>()
 const sessionInsertions = new Map<string, { snapshot: string; text: string; start: number }>()
 const MAX_SESSION_INSERTION_ANCHORS = 256
+
+function insertionSnapshot(parts: Prompt) {
+  const normalized: (string | Exclude<Prompt[number], { type: "text" }>)[] = []
+  for (const part of parts) {
+    if (part.type !== "text") { normalized.push(part); continue }
+    if (typeof normalized.at(-1) === "string") normalized[normalized.length - 1] += part.content
+    else normalized.push(part.content)
+  }
+  return JSON.stringify(normalized)
+}
 
 export function promptInsertionIdentity(input: {
   serverID: string
@@ -27,7 +48,7 @@ export function insertPromptDraft(
   const previous = typeof identity === "string" ? sessionInsertions.get(identity) : insertions.get(identity)
   // Replacement identity is the recorded insertion, never a matching phrase elsewhere.
   // Without an edit history, concurrent draft changes invalidate the whole anchor.
-  if (replacement && (!previous || previous.text !== replacement || previous.snapshot !== JSON.stringify(parts)))
+  if (replacement && (!previous || previous.text !== replacement || previous.snapshot !== insertionSnapshot(parts)))
     return { ok: false, error: "The original transcript has changed or is no longer anchored in this draft" }
   const index = replacement ? previous!.start : -1
   const start =
@@ -77,7 +98,7 @@ export function insertPromptDraft(
   }
   if (!written) append({ type: "text", content: inserted, start: 0, end: 0 })
   state.set(next, start + inserted.length)
-  const anchor = { snapshot: JSON.stringify(state.current()), text, start: start + inserted.indexOf(text) }
+  const anchor = { snapshot: insertionSnapshot(state.current()), text, start: start + inserted.indexOf(text) }
   if (typeof identity !== "string") {
     insertions.set(identity, anchor)
     return { ok: true }

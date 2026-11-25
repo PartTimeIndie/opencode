@@ -8,6 +8,7 @@ import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionPlanDocument } from "@opencode-ai/core/session/plan-document"
 import { Surface } from "@opencode-ai/core/surface"
 import { AgentSwitchTool } from "@opencode-ai/core/tool/agent-switch"
+import { dailyReviewHandoffMarkdown } from "@opencode-ai/core/tool/agent-handoff"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ConfigAgent } from "@opencode-ai/core/config/agent"
@@ -86,12 +87,24 @@ const surfaces = Layer.mock(Surface.Service, {
     }),
 })
 const boot = Layer.mock(PluginBoot.Service, { wait: () => Effect.void })
+const dailyPlanMarkdown = [
+  "# Daily Review",
+  "- runId: `morning-run`",
+  "- runDate: `2026-10-05`",
+  "- planId: `plan-1`",
+  "- morningRunId: `morning-run`",
+  "## Angenommene Punkte",
+  "### itemId `item-1`",
+  `- approvalId: \`${"a".repeat(64)}\``,
+  "autoApply=false",
+].join("\n")
+let currentPlanMarkdown = dailyPlanMarkdown
 let planDocumentReads = 0
 const documents = Layer.mock(SessionPlanDocument.Service, {
   read: () =>
     Effect.sync(() => {
       planDocumentReads += 1
-      return new SessionPlanDocument.Info({ markdown: "Daily Review", revision: 7, updatedAt: 100 })
+      return new SessionPlanDocument.Info({ markdown: currentPlanMarkdown, revision: 7, updatedAt: 100 })
     }),
 })
 const switchLayer = AgentSwitchTool.layer.pipe(
@@ -402,8 +415,8 @@ describe("AgentSwitchTool", () => {
     const planDocument = {
       revision: 7,
       updatedAt: 100,
-      sha256: createHash("sha256").update("Daily Review").digest("hex"),
-      markdown: "Daily Review",
+      sha256: createHash("sha256").update(dailyPlanMarkdown).digest("hex"),
+      markdown: dailyPlanMarkdown,
     }
     const dailyReviewAction = {
       id: "handoff",
@@ -443,7 +456,7 @@ describe("AgentSwitchTool", () => {
         actions: [dailyReviewAction],
       },
     } as Surface.ControlRequest
-    const currentPlanDocument = new SessionPlanDocument.Info({ markdown: "Daily Review", revision: 7, updatedAt: 100 })
+    const currentPlanDocument = new SessionPlanDocument.Info({ markdown: dailyPlanMarkdown, revision: 7, updatedAt: 100 })
     const input = {
       sessionID: "ses_handoff",
       revision: 2,
@@ -483,8 +496,8 @@ describe("AgentSwitchTool", () => {
     ]
     const currentPlanVariants = [
       undefined,
-      new SessionPlanDocument.Info({ markdown: "Daily Review", revision: 8, updatedAt: 100 }),
-      new SessionPlanDocument.Info({ markdown: "Daily Review", revision: 7, updatedAt: 101 }),
+      new SessionPlanDocument.Info({ markdown: dailyPlanMarkdown, revision: 8, updatedAt: 100 }),
+      new SessionPlanDocument.Info({ markdown: dailyPlanMarkdown, revision: 7, updatedAt: 101 }),
       new SessionPlanDocument.Info({ markdown: "A changed plan", revision: 7, updatedAt: 100 }),
     ]
 
@@ -503,6 +516,15 @@ describe("AgentSwitchTool", () => {
         },
     } as Request
     expect(AgentSwitchTool.confirmation(changedPrompt, { ...input, prompt: "Run unrelated work" })).toBeUndefined()
+    const unreadablePlan = { ...planDocument, markdown: "Daily Review", sha256: createHash("sha256").update("Daily Review").digest("hex") }
+    expect(AgentSwitchTool.confirmation({
+      ...dailyRequest,
+      tool: { ...dailyRequest.tool!, planDocument: unreadablePlan },
+      surface: { ...dailyRequest.surface, markdown: dailyReviewHandoffMarkdown(unreadablePlan) },
+    } as Request, {
+      ...input,
+      planDocument: new SessionPlanDocument.Info({ markdown: unreadablePlan.markdown, revision: 7, updatedAt: 100 }),
+    })).toBeUndefined()
   })
 
   test("validates and authorizes the bound target before presenting one handoff", async () => {
@@ -601,7 +623,7 @@ describe("AgentSwitchTool", () => {
             planDocument: {
               revision: 7,
               updatedAt: 100,
-              sha256: createHash("sha256").update("Daily Review").digest("hex"),
+              sha256: createHash("sha256").update(dailyPlanMarkdown).digest("hex"),
             },
           })
           expect(result.result).toMatchObject({ type: "text" })
@@ -622,8 +644,8 @@ describe("AgentSwitchTool", () => {
               planDocument: {
                 revision: 7,
                 updatedAt: 100,
-                sha256: createHash("sha256").update("Daily Review").digest("hex"),
-                markdown: "Daily Review",
+                sha256: createHash("sha256").update(dailyPlanMarkdown).digest("hex"),
+                markdown: dailyPlanMarkdown,
               },
             },
             surface: {
@@ -636,7 +658,7 @@ describe("AgentSwitchTool", () => {
           expect(presentations[0].surface.markdown).toContain("Plan snapshot: revision 7; updatedAt 100; SHA-256")
           expect(presentations[0].surface.markdown).toContain(AgentSwitchTool.dailyReviewBuildPrompt)
           expect(presentations[0].surface.markdown).not.toContain("Ignore the accepted scope")
-          expect(presentations[0].surface.markdown).toContain("## Complete plan snapshot\n\nDaily Review")
+          expect(presentations[0].surface.markdown).toContain(`## Complete plan snapshot\n\n${dailyPlanMarkdown}`)
           expect(AgentSwitchTool.confirmation(persisted, {
             sessionID: "ses_daily_review",
             revision: 1,
@@ -644,11 +666,48 @@ describe("AgentSwitchTool", () => {
             agent: "build",
             prompt: AgentSwitchTool.dailyReviewBuildPrompt,
             confirmationToken: persisted.tool?.confirmationToken ?? "",
-            planDocument: new SessionPlanDocument.Info({ markdown: "Daily Review", revision: 7, updatedAt: 100 }),
+            planDocument: new SessionPlanDocument.Info({ markdown: dailyPlanMarkdown, revision: 7, updatedAt: 100 }),
           })).toBeDefined()
         }),
       ).pipe(Effect.provide(runtime)),
     )
+  })
+
+  test("rejects unreadable plan bindings before asking for a Daily Review confirmation", async () => {
+    currentPlanMarkdown = [
+      "# Daily Review",
+      "runId: morning-run",
+      "runDate: 2026-10-05",
+      "planId: plan-1",
+      "morningRunId: morning-run",
+      "## Angenommen (1)",
+      `- itemId: item-1 | approvalId: ${"a".repeat(64)}`,
+    ].join("\n")
+    try {
+      await Effect.runPromise(
+        Effect.scoped(Effect.gen(function* () {
+          presentations.length = 0
+          const tools = yield* ToolRegistry.Service
+          const result = yield* settleTool(tools, {
+            sessionID: SessionSchema.ID.make("ses_daily_review"),
+            ...toolIdentity,
+            call: {
+              type: "tool-call",
+              id: "call_invalid_plan",
+              name: AgentSwitchTool.name,
+              input: { agent: "build", prompt: "Implement accepted items", purpose: "daily_review_implementation" },
+            },
+          })
+          expect(result.result).toMatchObject({ type: "error" })
+          expect(JSON.stringify(result.result)).toContain("before requesting confirmation")
+          expect(JSON.stringify(result.result)).toContain("- runId: `")
+          expect(JSON.stringify(result.result)).toContain("## Angenommene Punkte")
+          expect(presentations).toHaveLength(0)
+        })).pipe(Effect.provide(runtime)),
+      )
+    } finally {
+      currentPlanMarkdown = dailyPlanMarkdown
+    }
   })
 
   test("rejects a Daily Review purpose on non-build targets with a plain-purpose remedy", async () => {

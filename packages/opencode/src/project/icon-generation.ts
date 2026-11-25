@@ -35,6 +35,12 @@ const manifests = [
   ["ProjectSettings/ProjectVersion.txt", "Unity"],
 ] as const
 
+const readmes = ["README.md", "readme.md", "README"] as const
+
+// A stored icon made under another style stamp came from an earlier look. The automatic
+// paths regenerate it once through the normal queue; manual overrides and discovered icons keep winning.
+export const STYLE = "two-tone-v1"
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -70,6 +76,7 @@ export const layer = Layer.effect(
         icon_generated_url?: string
         icon_generation_status: "ready" | "failed"
         icon_generation_error?: string | null
+        icon_generation_style?: string
       },
     ) {
       const row = yield* db
@@ -110,16 +117,31 @@ export const layer = Layer.effect(
       const name = started.name || path.basename(started.worktree) || "project"
       const folder = path.basename(started.worktree) || "project"
       const technology = tags.filter((tag) => tag !== undefined)
+      // The README says what the project is about, so the model picks a fitting symbol instead
+      // of a generic tool outline. It is optional context: anything unreadable just means none.
+      const summary = yield* Effect.forEach(readmes, (file) =>
+        fs
+          .readFileStringSafe(path.join(started.worktree, file))
+          .pipe(Effect.map(projectSummary), Effect.catch(() => Effect.succeed(undefined))),
+      ).pipe(Effect.map((found) => found.find((entry) => entry !== undefined)))
       const prompt = [
-        `Create a compact square app icon for a software project named ${JSON.stringify(name)}.`,
+        `Create a flat two-tone square app icon for a software project named ${JSON.stringify(name)}.`,
         `The project folder is named ${JSON.stringify(folder)}.`,
-        `Use a single bold symbolic motif, no text, no letters, no logos, no border, and strong contrast at 16 pixels.`,
+        summary &&
+          `The project says about itself: ${JSON.stringify(summary)}. Choose exactly one simple bold symbol that stands for what this project really is or does.`,
+        `Use exactly two colors: one solid, saturated background color filling the whole square edge to edge, and pure white (#FFFFFF) for exactly one simple bold symbol.`,
+        `Center the symbol, keep its silhouette clean and geometric, and make it readable at 16 pixels.`,
+        `No text, no letters, no logos, no gradients, no shadows, no outlines, no shading, no additional colors, no border, no rounded container, and no margins.`,
         technology.length
           ? `Technology context: ${technology.join(", ")}.`
-          : "Use a neutral software-tool motif.",
-      ].join(" ")
+          : summary
+            ? undefined
+            : "Use a neutral software-tool motif.",
+      ]
+        .filter((part) => typeof part === "string")
+        .join(" ")
       const exit = yield* images
-        .generate({ prompt, size: "1024x1024", style: "minimal polished software icon", format: "png" })
+        .generate({ prompt, size: "1024x1024", style: "flat two-tone vector app icon", format: "png" })
         .pipe(Effect.exit)
       if (exit._tag === "Failure") {
         yield* finish(job, {
@@ -128,7 +150,10 @@ export const layer = Layer.effect(
         })
         return
       }
-      const normalized = yield* ImageGeneration.thumbnail(exit.value, 128).pipe(Effect.exit)
+      const normalized = yield* ImageGeneration.thumbnail(exit.value, 128).pipe(
+        Effect.flatMap(ImageGeneration.twoTone),
+        Effect.exit,
+      )
       if (normalized._tag === "Failure") {
         yield* finish(job, {
           icon_generation_status: "failed",
@@ -140,6 +165,7 @@ export const layer = Layer.effect(
         icon_generated_url: `data:${normalized.value.mime};base64,${Buffer.from(normalized.value.data).toString("base64")}`,
         icon_generation_status: "ready",
         icon_generation_error: null,
+        icon_generation_style: STYLE,
       })
     })
 
@@ -170,7 +196,7 @@ export const layer = Layer.effect(
       if (!row) return undefined
       if (automatic && row.icon_generation_status === "failed") return Project.fromRow(row)
       if (!force && (row.icon_url_override || (row.icon_url && !row.icon_color))) return Project.fromRow(row)
-      if (!force && row.icon_generated_url) return Project.fromRow(row)
+      if (!force && row.icon_generated_url && row.icon_generation_style === STYLE) return Project.fromRow(row)
       if (!force && (queued.has(projectID) || active.has(projectID))) return Project.fromRow(row)
       if (force) {
         const queuedIndex = queue.findIndex((job) => job.projectID === projectID)
@@ -314,3 +340,23 @@ export const node = LayerNode.make(layer, [
   FSUtil.node,
   Database.node,
 ])
+
+// The first README that yields prose wins. Markup, code, images, links and tags are dropped so
+// only a short plain-text statement reaches the prompt; longer texts end at a word boundary.
+function projectSummary(text: string | undefined) {
+  if (!text) return undefined
+  const prose = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__|\*|_)([^*_]+)\1/g, "$2")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^(?:#{1,6}\s*|>\s*|[-*+]\s+|\d+\.\s+)/gm, "")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!prose) return undefined
+  if (prose.length <= 240) return prose
+  return prose.slice(0, 240).replace(/\s+\S*$/, "")
+}

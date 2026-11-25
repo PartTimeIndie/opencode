@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import { LLMError, TransportReason } from "@opencode-ai/llm"
 import { HeadlessAIChain } from "@/headless-ai-chain"
 
 const stepA = { providerID: "zhipuai-coding-plan", modelID: "glm-5.3" } as const
@@ -16,7 +17,7 @@ function recorder(script: Array<{ text?: string; error?: Error }>) {
   return { calls, runStep }
 }
 
-function quotaError(message = "resource_exhausted: quota exceeded") {
+function quotaError(message = "Rate limit exceeded") {
   return Object.assign(new Error(message), { statusCode: 429 })
 }
 
@@ -28,19 +29,91 @@ describe("HeadlessAIChain.runModelChain", () => {
     expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3"])
   })
 
-  test("advances to the next step in order after a transient quota failure", async () => {
-    const { calls, runStep } = recorder([{ error: quotaError() }, { text: "fallback reply" }])
+  test("does not retry or change models after a format correction fails at the provider", async () => {
+    const failure = new LLMError({
+      module: "RequestExecutor", method: "execute", structuredOutputCorrectionAttempted: true,
+      reason: new TransportReason({ kind: "provider-error", message: "Rate limit exceeded", canRetry: true, status: 429 }),
+    })
+    const { calls, runStep } = recorder([{ error: failure }, { text: "must not run" }])
+    const error = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], runStep).pipe(Effect.flip))
+    expect(error.message).toContain("Model chain stopped")
+    expect(error.cause).toBe(failure)
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3"])
+  })
+
+  test("advances to the next step in order after a transient rate limit", async () => {
+    const { calls, runStep } = recorder([{ error: quotaError() }, { error: quotaError() }, { text: "fallback reply" }])
     const result = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], runStep))
     expect(result).toEqual({ text: "fallback reply", model: "openai/gpt-5.6-sol" })
-    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
+  })
+
+  test("recovers on the same model before trying the fallback", async () => {
+    const { calls, runStep } = recorder([{ error: quotaError() }, { text: "recovered" }])
+    const result = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], runStep))
+    expect(result.text).toBe("recovered")
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "zhipuai-coding-plan/glm-5.3"])
+  })
+
+  test("respects Retry-After before a same-model retry", async () => {
+    const calls: number[] = []
+    const error = Object.assign(new Error("rate limit exceeded"), {
+      statusCode: 429,
+      responseHeaders: { "retry-after-ms": "40" },
+    })
+    const result = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], (step) => {
+      calls.push(Date.now())
+      return calls.length === 1 ? Effect.fail(error) : Effect.succeed({ model: step.modelID, text: "recovered" })
+    }))
+    expect(result.text).toBe("recovered")
+    expect(calls).toHaveLength(2)
+    expect(calls[1]! - calls[0]!).toBeGreaterThanOrEqual(35)
+  })
+
+  test("cancels a Retry-After wait without another provider call", async () => {
+    const controller = new AbortController()
+    const { calls, runStep } = recorder([{ error: Object.assign(new Error("rate limit exceeded"), {
+      statusCode: 429,
+      responseHeaders: { "retry-after-ms": "1000" },
+    }) }, { text: "must not run" }])
+    const run = Effect.runPromise(Effect.flip(HeadlessAIChain.runModelChain([stepA, stepB], runStep, {
+      abort: controller.signal,
+    })))
+    setTimeout(() => controller.abort(), 10)
+    const error = await run
+    expect((error as Error).name).toBe("AbortError")
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3"])
+  })
+
+  test("skips an early retry for a provider deadline beyond the automatic wait limit", async () => {
+    const calls: string[] = []
+    const result = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], (step) => {
+      calls.push(step.modelID)
+      return step === stepA
+        ? Effect.fail(Object.assign(new Error("rate limit exceeded"), { statusCode: 429, responseHeaders: { "retry-after": "600" } }))
+        : Effect.succeed({ model: step.modelID, text: "fallback" })
+    }))
+    expect(result.text).toBe("fallback")
+    expect(calls).toEqual([stepA.modelID, stepB.modelID])
+  })
+
+  test("does not retry an exhausted account quota on the same model", async () => {
+    const calls: string[] = []
+    await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], (step) => {
+      calls.push(step.modelID)
+      return step === stepA
+        ? Effect.fail(quotaError("insufficient_quota: account credits exhausted"))
+        : Effect.succeed({ model: step.modelID, text: "fallback" })
+    }))
+    expect(calls).toEqual([stepA.modelID, stepB.modelID])
   })
 
   test("treats a whitespace-only completion as empty and advances", async () => {
-    const { calls, runStep } = recorder([{ text: "   " }, { text: "recovered" }])
+    const { calls, runStep } = recorder([{ text: "   " }, { text: " " }, { text: "recovered" }])
     const result = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], runStep))
     expect(result.text).toBe("recovered")
     expect(result.model).toBe("openai/gpt-5.6-sol")
-    expect(calls).toHaveLength(2)
+    expect(calls).toHaveLength(3)
   })
 
   test("fails closed on permanent failures without advancing", async () => {
@@ -56,14 +129,14 @@ describe("HeadlessAIChain.runModelChain", () => {
   })
 
   test("fails with a combined message when every step fails transiently", async () => {
-    const { calls, runStep } = recorder([{ error: quotaError("rate limit exceeded") }, { error: quotaError("quota exceeded") }])
+    const { calls, runStep } = recorder([{ error: quotaError("rate limit exceeded") }, { error: quotaError("rate limit exceeded") }, { error: quotaError("too many requests") }])
     const error = await Effect.runPromise(Effect.flip(HeadlessAIChain.runModelChain([stepA, stepB], runStep)))
     expect((error as Error).message).toBe(
       "All 2 models in the chain failed: " +
         "zhipuai-coding-plan/glm-5.3: Error: rate limit exceeded; " +
-        "openai/gpt-5.6-sol (medium): Error: quota exceeded",
+        "openai/gpt-5.6-sol (medium): Error: too many requests",
     )
-    expect(calls).toHaveLength(2)
+    expect(calls).toHaveLength(4)
   })
 
   test("propagates abort errors immediately without advancing", async () => {
@@ -78,10 +151,10 @@ describe("HeadlessAIChain.runModelChain", () => {
   test("advances to the next step after a provider timeout error", async () => {
     const timeout = new Error("provider request timed out after 30s")
     timeout.name = "TimeoutError"
-    const { calls, runStep } = recorder([{ error: timeout }, { text: "fallback after timeout" }])
+    const { calls, runStep } = recorder([{ error: timeout }, { error: timeout }, { text: "fallback after timeout" }])
     const result = await Effect.runPromise(HeadlessAIChain.runModelChain([stepA, stepB], runStep))
     expect(result).toEqual({ text: "fallback after timeout", model: "openai/gpt-5.6-sol" })
-    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
   })
 
   test("still fails immediately for timeout errors when the caller aborted the run", async () => {
@@ -93,8 +166,8 @@ describe("HeadlessAIChain.runModelChain", () => {
     const error = await Effect.runPromise(
       Effect.flip(HeadlessAIChain.runModelChain([stepA, stepB], runStep, { abort: controller.signal })),
     )
-    expect(error).toBe(timeout)
-    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3"])
+    expect((error as Error).name).toBe("AbortError")
+    expect(calls).toEqual([])
   })
 
   test("fails immediately when the abort signal is already aborted even for transient errors", async () => {
@@ -105,8 +178,8 @@ describe("HeadlessAIChain.runModelChain", () => {
       Effect.flip(HeadlessAIChain.runModelChain([stepA, stepB], runStep, { abort: controller.signal })),
     )
     expect(error).toBeInstanceOf(Error)
-    expect((error as Error).message).toBe("resource_exhausted: quota exceeded")
-    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3"])
+    expect((error as Error).name).toBe("AbortError")
+    expect(calls).toEqual([])
   })
 
   test("supports structured object results with the same transient-only order", async () => {
@@ -119,7 +192,7 @@ describe("HeadlessAIChain.runModelChain", () => {
       }),
     )
     expect(result).toEqual({ model: "openai/gpt-5.6-sol", object: { decision: "safe" } })
-    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
   })
 
   const stalledStep = (signal: AbortSignal) =>
@@ -149,8 +222,10 @@ describe("HeadlessAIChain.runModelChain", () => {
       ),
     )
     expect(result).toEqual({ text: "fallback after stall", model: "openai/gpt-5.6-sol" })
-    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
-    expect(stalledSignals[0]?.aborted).toBe(true)
+    expect(calls).toEqual(["zhipuai-coding-plan/glm-5.3", "zhipuai-coding-plan/glm-5.3", "openai/gpt-5.6-sol"])
+    expect(stalledSignals).toHaveLength(2)
+    expect(stalledSignals[0]).not.toBe(stalledSignals[1])
+    expect(stalledSignals.every((signal) => signal.aborted)).toBe(true)
   })
 
   test("reports the deadline in the combined failure message when every step stalls", async () => {
@@ -285,7 +360,7 @@ describe("HeadlessAIChain.chainStepFailureEligible", () => {
         [stepA, stepB],
         (step) => {
           calls.push(`${step.providerID}/${step.modelID}`)
-          if (calls.length === 1)
+          if (step.providerID === "zhipuai-coding-plan")
             return Effect.fail(Object.assign(new Error("No endpoints found that matched your request"), { statusCode: 404 }))
           return Effect.succeed({ text: "luna recovered the chain", model: `${step.providerID}/${step.modelID}` })
         },

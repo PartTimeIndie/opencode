@@ -1,4 +1,8 @@
+import { randomUUID } from "node:crypto"
+
 export const SessionGoalMetadataKey = "opencode.session.goal"
+const SessionGoalRunMetadataKey = "opencode.session.goal_run"
+const SessionGoalStatusMetadataKey = "opencode.session.goal_status"
 
 export type SessionGoalControl =
   | { readonly type: "set"; readonly value: string }
@@ -8,7 +12,7 @@ export type SessionGoalControl =
   | { readonly type: "plugin" }
 
 export type SessionGoalMetadataPatch =
-  { readonly set: Readonly<Record<string, unknown>> } | { readonly unset: readonly string[] }
+  { readonly set: Readonly<Record<string, unknown>>; readonly unset?: readonly string[] } | { readonly unset: readonly string[] }
 
 const clearCommands = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
 const statusCommands = new Set(["status", "history", "list", "pause", "resume"])
@@ -40,7 +44,12 @@ export function parseSessionGoalControl(argumentsText: string): SessionGoalContr
 }
 
 export function sessionGoalMetadataPatch(control: SessionGoalControl): SessionGoalMetadataPatch | undefined {
-  if (control.type === "set") return { set: { [SessionGoalMetadataKey]: control.value } }
-  if (control.type === "clear") return { unset: [SessionGoalMetadataKey] }
+  // A same-text replacement is still a new run. Publish identity with the text
+  // in one metadata patch so an older run's CAS clear cannot erase it.
+  if (control.type === "set") return {
+    set: { [SessionGoalMetadataKey]: control.value, [SessionGoalRunMetadataKey]: randomUUID() },
+    unset: [SessionGoalStatusMetadataKey],
+  }
+  if (control.type === "clear") return { unset: [SessionGoalMetadataKey, SessionGoalRunMetadataKey, SessionGoalStatusMetadataKey] }
   return undefined
 }

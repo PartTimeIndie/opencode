@@ -47,6 +47,22 @@ test("copies the platform CLI beside app.asar", async () => {
   ])
 })
 
+test("ships native window and tray icons at the runtime resources path", async () => {
+  const config = (await import("./electron-builder.config.ts?tray-resources")).default as Configuration
+  const resources = Array.isArray(config.extraResources) ? config.extraResources : [config.extraResources]
+  for (const name of ["icon.ico", "icon.png", "dock.png"]) {
+    const resource = resources.find((entry) => typeof entry === "object" && entry.to === "icons")
+    expect(resource).toBeDefined()
+    if (!resource || typeof resource === "string") throw new Error("Native runtime icons are missing")
+    expect(resource.from).toBe("resources/icons")
+    const filters = Array.isArray(resource.filter) ? resource.filter : [resource.filter]
+    expect(filters).toContain(name)
+    for (const channel of channels) {
+      expect(await Bun.file(`icons/${channel.channel}/${name}`).exists()).toBe(true)
+    }
+  }
+})
+
 test("keeps a hidden prod launcher for old Linux pins", async () => {
   const previous = process.env.OPENCODE_CHANNEL
   process.env.OPENCODE_CHANNEL = "prod"

@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url"
 import { Effect, Layer, Schema } from "effect"
 import { AgentV2 } from "../src/agent"
 import { Config } from "../src/config"
+import { SkillPolicy } from "../src/skill/policy"
 import { ConfigAgentPlugin } from "../src/config/plugin/agent"
 import { ConfigSkillPlugin } from "../src/config/plugin/skill"
 import { ConfigSkillGroups } from "../src/config/skill-groups"
@@ -75,12 +76,15 @@ const data = await Effect.runPromise(
           const agent = yield* agents.get(AgentV2.ID.make(name))
           if (!agent) throw new Error(`Missing agent ${name}`)
           const permitted = SkillV2.available(skills, agent)
-          const grouped = SkillCatalog.project(permitted, groups)
-          const flat = SkillCatalog.project(permitted, { ...groups, enabled: false })
-          const descriptors = permitted
-            .filter((skill) => !skill.disableModelInvocation && skill.description !== undefined)
-            .map((skill) => ({ name: skill.name, description: skill.description!, groups: skill.groups }))
           const entries = yield* (yield* Config.Service).entries()
+          const invocation = Config.globalLatest(entries, "skill_invocation")
+          const policies = SkillPolicy.policiesFor(permitted, invocation, agent.skills)
+          const grouped = SkillCatalog.project(permitted, groups, policies)
+          const flat = SkillCatalog.project(permitted, { ...groups, enabled: false }, policies)
+          const descriptors = permitted
+            .filter((skill) => policies.get(skill.name)?.visible.value ?? !skill.disableModelInvocation)
+            .filter((skill) => skill.description !== undefined)
+            .map((skill) => ({ name: skill.name, description: skill.description!, groups: skill.groups }))
           return {
             name,
             agent,

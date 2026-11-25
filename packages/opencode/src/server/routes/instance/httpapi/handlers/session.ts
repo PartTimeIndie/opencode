@@ -1,14 +1,21 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { DelegationPreferences } from "@opencode-ai/core/session/delegation-preferences"
+import { DelegationSettings } from "@opencode-ai/core/session/delegation-settings"
+import { Location } from "@opencode-ai/core/location"
+import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionArchive } from "@opencode-ai/core/session-archive"
 import * as SessionProtection from "@opencode-ai/core/session/protection"
 import { ContentStore } from "@opencode-ai/core/content-store"
 import { Database } from "@opencode-ai/core/database/database"
 import { QuestionTable } from "@opencode-ai/core/question/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
 import { FileAttachment, Source } from "@opencode-ai/core/session/prompt"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionActivityTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionAttentionState } from "@opencode-ai/core/session/attention-state"
 import { Permission } from "@/permission"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
@@ -22,12 +29,14 @@ import { Todo } from "@/session/todo"
 import { InstanceState } from "@/effect/instance-state"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { and, eq, gt, inArray, isNull } from "drizzle-orm"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import {
   DeleteQuery,
+  DelegationQuery,
+  AttentionQuery,
   DiffQuery,
   ForkPayload,
   ListQuery,
@@ -37,7 +46,7 @@ import {
   RevertPayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError, notFound } from "../errors"
+import { ConflictError, ForbiddenError, InvalidRequestError, PermissionNotFoundError, UnknownError, notFound } from "../errors"
 import { sameEventDirectory } from "./event"
 import * as SessionError from "./session-errors"
 
@@ -61,6 +70,33 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     yield* TurnCompletionV2.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
+    const locations = yield* LocationServiceMap
+
+    const preferences = Effect.fn("SessionHttpApi.preferences")(function* (
+      sessionID: SessionID,
+      request: { operation: "get"; target: DelegationPreferences.Target } | { operation: "patch"; patch: DelegationPreferences.ScopedPatch },
+    ) {
+      const instance = yield* InstanceState.context
+      const workspaceID = yield* InstanceState.workspaceID
+      // This is the authenticated host Settings route, not a model tool. Scope
+      // and Session placement are still checked by the same Location owner.
+      return yield* DelegationSettings.Service.use((settings) => request.operation === "get"
+        ? settings.get(SessionSchema.ID.make(sessionID), request.target, () => Effect.void)
+        : settings.patch(SessionSchema.ID.make(sessionID), request.patch, () => Effect.void))
+        .pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(instance.directory), workspaceID }))),
+          Effect.mapError((error) => {
+            if (error._tag === "Session.NotFoundError") return notFound("Session not found in this location")
+            if (error._tag === "DelegationPreferences.Conflict" || error._tag === "ConfigFileWriter.Conflict")
+              return new ConflictError({ message: error.message, resource: "delegation-preferences" })
+            if (error._tag === "ConfigFileWriter.IO") return new UnknownError({ message: error.message })
+            if (error._tag !== "DelegationPreferences.Invalid") return new ForbiddenError({ message: error.message })
+            return new InvalidRequestError({ message: error.message })
+          }))
+    })
+    const delegationPreferences = (ctx: { params: { sessionID: SessionID }; query: typeof DelegationQuery.Type }) =>
+      preferences(ctx.params.sessionID, { operation: "get", target: { scope: ctx.query.scope, taskID: ctx.query.taskID } })
+    const patchDelegationPreferences = (ctx: { params: { sessionID: SessionID }; payload: DelegationPreferences.ScopedPatch }) =>
+      preferences(ctx.params.sessionID, { operation: "patch", patch: ctx.payload })
 
     const list = Effect.fn("SessionHttpApi.list")(function* (ctx: { query: typeof ListQuery.Type }) {
       return yield* session.list({
@@ -173,6 +209,22 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* requireSession(ctx.params.sessionID)
     })
 
+    const attentionState = Effect.fn("SessionHttpApi.attentionState")(function* (ctx: {
+      params: { sessionID: SessionID }; query: typeof AttentionQuery.Type
+    }) {
+      const info = yield* requireSession(ctx.params.sessionID)
+      const instance = yield* InstanceState.context
+      const workspaceID = yield* InstanceState.workspaceID
+      if (!ctx.query.directory || ctx.query.directory === "global" ||
+        !sameEventDirectory(info.directory, ctx.query.directory) ||
+        info.projectID !== instance.project.id || (info.workspaceID ?? undefined) !== workspaceID ||
+        !sameEventDirectory(info.directory, instance.directory))
+        return yield* notFound("Session not found in this workspace")
+      const result = yield* SessionAttentionState.read({ db, sessionID: SessionSchema.ID.make(ctx.params.sessionID), afterSeq: ctx.query.afterSeq })
+      if (!result) return yield* notFound(`Session not found: ${ctx.params.sessionID}`)
+      return result
+    })
+
     const exists = Effect.fn("SessionHttpApi.exists")(function* (ctx: { params: { sessionID: SessionID } }) {
       return yield* session.get(ctx.params.sessionID).pipe(
         Effect.map((info) => ({ exists: true as const, session: info })),
@@ -201,25 +253,30 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       query: typeof MessagesQuery.Type
     }) {
+      const trace = { kind: "session-stage", sessionID: ctx.params.sessionID } as const
       if (ctx.query.before && ctx.query.limit === undefined) return yield* new HttpApiError.BadRequest({})
       if (ctx.query.before) {
         const before = ctx.query.before
         yield* Effect.try({
-          try: () => MessageV2.cursor.decode(before),
+          try: () => CrashActivity.trackSync({ ...trace, name: "legacy.cursor-decode" }, () => MessageV2.cursor.decode(before)),
           catch: () => new HttpApiError.BadRequest({}),
         })
       }
-      yield* requireSession(ctx.params.sessionID)
+      yield* CrashActivity.track({ ...trace, name: "legacy.lookup" }, requireSession(ctx.params.sessionID))
       if (ctx.query.limit === undefined || ctx.query.limit === 0) {
-        return yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
+        return yield* CrashActivity.track({ ...trace, name: "legacy.messages" },
+          SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID })),
+        )
       }
 
-      const page = yield* SessionError.mapStorageNotFound(
-        MessageV2.page({
-          sessionID: ctx.params.sessionID,
-          limit: ctx.query.limit,
-          before: ctx.query.before,
-        }),
+      const page = yield* CrashActivity.track({ ...trace, name: "legacy.message-page" },
+        SessionError.mapStorageNotFound(
+          MessageV2.page({
+            sessionID: ctx.params.sessionID,
+            limit: ctx.query.limit,
+            before: ctx.query.before,
+          }),
+        ),
       )
       if (!page.cursor) return page.items
 
@@ -488,6 +545,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("status", status)
       .handle("exists", exists)
       .handle("get", get)
+      .handle("attentionState", attentionState)
       .handle("children", children)
       .handle("todo", todo)
       .handle("diff", diff)
@@ -497,6 +555,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("remove", remove)
       .handle("update", update)
       .handle("protection", protection)
+      .handle("delegationPreferences", delegationPreferences)
+      .handle("patchDelegationPreferences", patchDelegationPreferences)
       .handleRaw("fork", forkRaw)
       .handle("share", share)
       .handle("unshare", unshare)
@@ -507,4 +567,4 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("deletePart", deletePart)
       .handle("updatePart", updatePart)
   }),
-)
+).pipe(Layer.provide(LocationServiceMap.layer))

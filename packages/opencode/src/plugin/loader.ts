@@ -12,6 +12,8 @@ import { ConfigPlugin } from "@/config/plugin"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { requirePluginAPIs } from "@opencode-ai/plugin/api"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
+import { createHash } from "node:crypto"
 
 export namespace PluginLoader {
   // A normalized plugin declaration derived from config before any filesystem or npm work happens.
@@ -143,7 +145,10 @@ export namespace PluginLoader {
   export async function load(row: Resolved): Promise<{ ok: true; value: Loaded } | { ok: false; error: unknown }> {
     let mod
     try {
-      mod = await import(row.entry)
+      const pluginID = typeof row.pkg?.json.name === "string" && row.source === "npm"
+        ? row.pkg.json.name
+        : `legacy-${createHash("sha256").update(row.target).digest("hex")}`
+      mod = await CrashActivity.trackPromise({ kind: "plugin", pluginID, name: "module.import" }, () => import(row.entry))
     } catch (error) {
       return { ok: false, error }
     }

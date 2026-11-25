@@ -85,10 +85,13 @@ const triggerSystemTransform = Effect.fn("PluginTriggerTest.triggerSystemTransfo
 })
 
 describe("plugin.trigger", () => {
-  it.instance("passes legacy and V2 SDK clients to server plugins", () =>
+  it.instance("passes working legacy and V2 SDK clients to initialized server-plugin hooks", () =>
     withProject(
       [
-        "export default async (input) => {",
+        "export default async (input) => ({",
+        // SDK requests also enter InstanceBootstrap; the factory must finish
+        // before the real hook invokes them, or it waits for its own startup.
+        `  ${JSON.stringify(systemHook)}: async (_args, output) => {`,
         "  const created = await input.clientV2.v2.session.create({ location: { directory: input.directory } })",
         "  const session = created.data?.data ?? created.data",
         "  const admission = session ? await input.clientV2.v2.session.prompt({",
@@ -103,14 +106,17 @@ describe("plugin.trigger", () => {
         '    created: typeof session?.id === "string",',
         '    admitted: typeof admittedInput?.admittedSeq === "number",',
         "  }))",
-        "  return {}",
-        "}",
+        '  output.system.push("sdk-client-request-complete")',
+        "  },",
+        "})",
         "",
       ].join("\n"),
       Effect.gen(function* () {
         const test = yield* TestInstance
         const plugin = yield* Plugin.Service
         yield* plugin.list()
+        expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, "plugin-clients.json")).exists())).toBe(false)
+        expect(yield* triggerSystemTransform()).toEqual(["sdk-client-request-complete"])
         expect(
           yield* Effect.promise(
             () => Bun.file(path.join(test.directory, "plugin-clients.json")).json() as Promise<Record<string, boolean>>,

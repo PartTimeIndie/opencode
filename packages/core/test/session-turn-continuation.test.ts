@@ -32,6 +32,49 @@ const metadata = (sessionID: SessionSchema.ID) =>
   )
 
 describe("SessionTurnContinuation", () => {
+  it.effect("does not arm generic continuation while an active Goal persists without its plugin registration", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const sessionID = SessionSchema.ID.make("ses_goal_durable_fence")
+      yield* seed(sessionID)
+      yield* db.update(SessionTable).set({ metadata: { "opencode.session.goal": "ship it" } })
+        .where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      expect(yield* SessionTurnContinuation.arm(db, sessionID, "activity_before_restart")).toBeUndefined()
+      expect((yield* metadata(sessionID))?.metadata?.[SessionTurnContinuation.MetadataKey]).toBeUndefined()
+      yield* db.update(SessionTable).set({ metadata: { "opencode.session.goal": "" } })
+        .where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      expect(yield* SessionTurnContinuation.arm(db, sessionID, "activity_after_clear")).toMatchObject({ attempts: 1 })
+    }),
+  )
+
+  it.effect("holds an already-armed generic continuation while a Goal is active and releases it after clear", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const sessionID = SessionSchema.ID.make("ses_goal_pending_fence")
+      yield* seed(sessionID)
+      yield* SessionTurnContinuation.arm(db, sessionID, "activity_pending_before_goal")
+      expect(yield* SessionTurnContinuation.pending(db, sessionID)).toMatchObject({ activityID: "activity_pending_before_goal" })
+      // Merge: replacing metadata wholesale would erase the continuation marker itself.
+      const metadataWith = (goal: string) =>
+        Database.Service.use(({ db: shared }) =>
+          shared.select({ metadata: SessionTable.metadata }).from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(
+            Effect.flatMap((row) =>
+              shared.update(SessionTable)
+                .set({ metadata: { ...(row?.metadata ?? {}), "opencode.session.goal": goal } })
+                .where(eq(SessionTable.id, sessionID))
+                .run()
+                .pipe(Effect.orDie),
+            ),
+            Effect.orDie,
+          ),
+        )
+      yield* metadataWith("ship it")
+      expect(yield* SessionTurnContinuation.pending(db, sessionID)).toBeUndefined()
+      yield* metadataWith("")
+      expect(yield* SessionTurnContinuation.pending(db, sessionID)).toMatchObject({ activityID: "activity_pending_before_goal" })
+    }),
+  )
+
   it.effect("consumption durably retires the parent completion claim before the lineage can be reset", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service

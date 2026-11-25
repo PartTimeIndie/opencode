@@ -20,6 +20,13 @@ type TreeStoreOptions = {
   onError: (message: string) => void
 }
 
+type ListDirOptions = {
+  force?: boolean
+  // Background refreshes (file watcher) keep the failure in the tree state but
+  // must not raise an error toast for work the user did not trigger.
+  silent?: boolean
+}
+
 export function createFileTreeStore(options: TreeStoreOptions) {
   const [tree, setTree] = createStore<{
     node: Record<string, FileNode>
@@ -30,9 +37,13 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   })
 
   const inflight = new Map<string, Promise<void>>()
+  // Per-directory error message that already raised a toast. Cleared on success
+  // so a recurring failure is reported again instead of disappearing silently.
+  const toasted = new Map<string, string>()
 
   const reset = () => {
     inflight.clear()
+    toasted.clear()
     setTree("node", reconcile({}))
     setTree("dir", reconcile({}))
     setTree("dir", "", { expanded: true })
@@ -43,7 +54,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     setTree("dir", path, { expanded: false })
   }
 
-  const listDir = (input: string, opts?: { force?: boolean }) => {
+  const listDir = (input: string, opts?: ListDirOptions) => {
     const dir = options.normalizeDir(input)
     ensureDir(dir)
 
@@ -111,6 +122,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
               draft.children = nextChildren
             }),
           )
+          toasted.delete(dir)
         })
         .catch((e) => {
           if (options.scope() !== directory) return
@@ -132,6 +144,12 @@ export function createFileTreeStore(options: TreeStoreOptions) {
               draft.error = e.message
             }),
           )
+          if (opts?.silent) return
+          // Session/page components can trigger the same listing multiple times
+          // while the failure persists; only surface the first identical error
+          // until a listing succeeds again.
+          if (toasted.get(dir) === e.message) return
+          toasted.set(dir, e.message)
           options.onError(e.message)
         })
 

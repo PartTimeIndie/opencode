@@ -65,6 +65,7 @@ export interface Interface {
     readonly sessionID: SessionSchema.ID
     readonly prompt: Prompt
     readonly delivery: SessionInput.Delivery
+    readonly origin?: SessionInput.Origin
   }) => Effect.Effect<
     SessionInput.Admitted,
     NotFoundError | RevertActiveError | PromptConflictError | ContentStore.Error
@@ -164,6 +165,7 @@ export const layer = Layer.effect(
           sessionID: input.sessionID,
           prompt,
           delivery: input.delivery,
+          ...(input.origin === undefined ? {} : { origin: input.origin }),
         }).pipe(
           Effect.catchDefect((defect) =>
             defect instanceof SessionInput.LifecycleConflict

@@ -1,4 +1,5 @@
 import path from "node:path"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
 import type {
   ServerServiceCall,
   ServerServiceContext,
@@ -74,7 +75,10 @@ export function createPluginServiceRegistry(options: {
             async execute(input: unknown, context: ServerServiceContext) {
               const parsed = await validate(definition.input, input, "input")
               context.signal.throwIfAborted()
-              const output = await definition.execute(parsed, context)
+              const output = await CrashActivity.trackPromise(
+                { kind: "plugin", pluginID: identity.pluginID, sessionID: context.sessionID, name: `service.${definition.id}` },
+                async () => definition.execute(parsed, context),
+              )
               context.signal.throwIfAborted()
               return validate(definition.output, output, "output")
             },
@@ -84,7 +88,10 @@ export function createPluginServiceRegistry(options: {
           const dispose = () => {
             if (disposal.promise) return disposal.promise
             disposal.promise = Promise.resolve()
-              .then(() => definition.dispose?.())
+              .then(() => definition.dispose && CrashActivity.trackPromise(
+                { kind: "plugin", pluginID: identity.pluginID, name: `service.dispose.${definition.id}` },
+                async () => definition.dispose!(),
+              ))
               .finally(() => {
                 disposers.delete(dispose)
               })

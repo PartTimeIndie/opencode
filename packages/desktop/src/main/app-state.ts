@@ -10,6 +10,6 @@ type AppWithQuitFlag = typeof app & { isQuitting?: boolean }
 
 export const isAppQuitting = (): boolean => (app as AppWithQuitFlag).isQuitting === true
 
-export const markAppQuitting = (): void => {
-  ;(app as AppWithQuitFlag).isQuitting = true
+export const markAppQuitting = (quitting = true): void => {
+  ;(app as AppWithQuitFlag).isQuitting = quitting
 }

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import { createComposerApi } from "./composer-api"
 import { createComposerRegistry } from "./composer-registry"
+import { composerSendIntents } from "./composer-send-intent"
 
 test("a retained composer API cannot read, edit, insert, submit or subscribe after switching servers", async () => {
   const registry = createComposerRegistry()
@@ -23,7 +24,13 @@ test("a retained composer API cannot read, edit, insert, submit or subscribe aft
   expect(await api.insertText({ ...target, text: "valid" })).toEqual({ ok: true })
   expect(await api.submitText({ ...target, text: "valid" })).toEqual({ ok: true })
   expect(calls).toEqual(["first:insert", "first:submit"])
+  const preparation = { operationID: crypto.randomUUID(), isActive: () => true, subscribe: () => () => {}, prepare: async () => ({ ok: true as const, text: "ready" }) }
+  const unregister = api.registerSendPreparation(target, preparation)
+  expect(composerSendIntents.available({ ...target, serverID: "first" })).toBe(true)
+  unregister()
   state.server = "second"
+  api.registerSendPreparation(target, preparation)
+  expect(composerSendIntents.available({ ...target, serverID: "first" })).toBe(false)
   expect(api.read(target)).toBeUndefined()
   expect(api.change({ ...target, text: "stale" }).ok).toBe(false)
   expect((await api.insertText({ ...target, text: "stale" })).ok).toBe(false)
@@ -33,5 +40,7 @@ test("a retained composer API cannot read, edit, insert, submit or subscribe aft
   expect(calls).toEqual(["first:insert", "first:submit"])
   state.server = "first"
   controller.abort()
+  api.registerSendPreparation(target, preparation)
+  expect(composerSendIntents.available({ ...target, serverID: "first" })).toBe(false)
   expect((await api.submitText({ ...target, text: "unloaded" })).ok).toBe(false)
 })

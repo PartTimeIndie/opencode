@@ -1,12 +1,8 @@
 import { onCleanup, onMount } from "solid-js"
 
-// Windows occasionally stops presenting a window's composited surface while
-// the renderer process stays alive and healthy: the whole window turns into
-// the native background color (gray in the light tone, near-black in the dark
-// tone) and only recovers when the user moves or resizes it. The desktop main
-// process reacts to these stall reports by invalidating the surface and, if
-// frames stay stalled, nudging the window bounds — the programmatic version
-// of the manual move/resize fix.
+// This monitors renderer animation callbacks, not whether Windows actually
+// presents a frame. The desktop process may request a repaint on a stall;
+// neither a report nor a repaint request proves or fixes a presentation failure.
 
 const STALL_MS = 8000
 const CHECK_INTERVAL_MS = 2000
@@ -42,8 +38,7 @@ export function PresentationWatchdog() {
     let stalled = false
     let frame = 0
 
-    // The pending callback survives a presentation stall and fires as soon as
-    // frames resume, so a single self-rescheduling chain tracks liveness.
+    // A single self-rescheduling chain tracks animation callback liveness.
     const armFrame = () => {
       frame = requestAnimationFrame(() => {
         lastFrameAt = performance.now()

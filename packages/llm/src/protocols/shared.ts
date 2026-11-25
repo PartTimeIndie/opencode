@@ -171,14 +171,30 @@ export const openAiToolInputSchema = (schema: JsonSchema.JsonSchema): JsonSchema
       : {
           ...Object.fromEntries(Object.entries(base).filter(([key]) => key !== "anyOf")),
           type: "object",
-          properties: variants.reduce(
-            (properties, variant) => ({ ...(isRecord(variant.properties) ? variant.properties : {}), ...properties }),
-            {},
-          ),
+          properties: mergeOpenAIToolProperties(variants),
           additionalProperties: false,
         }
   const normalized = removeNullSchemas(flattened)
   return isRecord(normalized) ? normalized : { type: "object" }
+}
+
+function mergeOpenAIToolProperties(variants: Record<string, unknown>[]) {
+  const properties = new Map<string, Map<string, unknown>>()
+  variants.forEach((variant) => {
+    if (!isRecord(variant.properties)) return
+    Object.entries(variant.properties).forEach(([name, schema]) => {
+      const alternatives = properties.get(name) ?? new Map<string, unknown>()
+      alternatives.set(JSON.stringify(schema), schema)
+      properties.set(name, alternatives)
+    })
+  })
+  // First-wins merging hides later discriminator values (for example cancel
+  // after dispatch). Only the wire schema is flattened; runtime validation still
+  // enforces the original branch's required fields and constraints.
+  return Object.fromEntries([...properties].map(([name, alternatives]) => [
+    name,
+    alternatives.size === 1 ? [...alternatives.values()][0] : { anyOf: [...alternatives.values()] },
+  ]))
 }
 
 /** Function tools require an object at the schema root, even when the source schema uses a local root ref. */

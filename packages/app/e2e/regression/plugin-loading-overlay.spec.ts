@@ -87,8 +87,20 @@ test("plugin loading overlay blocks the app and times out", async ({ page }) => 
   expectNoSmokeErrors(errors, [], failedResponses)
 })
 
-test("plugin manifests load for the active project with one bounded query", async ({ page }) => {
+test("slow cold plugin manifests load for the active project with one bounded query", async ({ page }) => {
   const manifestDirectories: string[] = []
+  const manifestErrors: string[] = []
+  const bootstrapDirectories: string[] = []
+  page.on("request", (request) => {
+    const url = new URL(request.url())
+    if (url.pathname !== "/config") return
+    bootstrapDirectories.push(url.searchParams.get("directory") ?? decodeURIComponent(request.headers()["x-opencode-directory"] ?? ""))
+  })
+  page.on("console", (message) => {
+    if (message.type() === "error" && message.text().includes("app plugin manifest")) {
+      manifestErrors.push(message.text())
+    }
+  })
   const projects = Array.from({ length: 10 }, (_, index) => ({
     id: `${projectID}_${index}`,
     worktree: `${directory}_${index}`,
@@ -97,7 +109,7 @@ test("plugin manifests load for the active project with one bounded query", asyn
     time: { created: 1700000000000 + index, updated: 1700000000000 + index },
     sandboxes: [],
   }))
-  const activeDirectory = projects[3]!.worktree
+  const activeDirectory = projects[0]!.worktree
 
   await mockOpenCodeServer(page, {
     directory: activeDirectory,
@@ -119,7 +131,7 @@ test("plugin manifests load for the active project with one bounded query", asyn
       {
         id: sessionID,
         slug: "plugin-loading-overlay",
-        projectID: projects[3]!.id,
+        projectID: projects[0]!.id,
         directory: activeDirectory,
         title: "Plugin manifest performance",
         version: "dev",
@@ -128,8 +140,9 @@ test("plugin manifests load for the active project with one bounded query", asyn
     ],
     pageMessages: () => ({ items: [] }),
   })
-  await page.route("**/app/plugins**", (route) => {
+  await page.route("**/app/plugins**", async (route) => {
     manifestDirectories.push(new URL(route.request().url()).searchParams.get("directory") ?? "")
+    await new Promise((resolve) => setTimeout(resolve, 11_000))
     return route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -149,10 +162,17 @@ test("plugin manifests load for the active project with one bounded query", asyn
   )
 
   await page.setViewportSize({ width: 1280, height: 720 })
+  const manifestLoaded = page.waitForResponse((response) => new URL(response.url()).pathname === "/app/plugins")
   await page.goto(`/?dir=${base64Encode(activeDirectory)}&session=${sessionID}`)
   await expectAppVisible(page.getByRole("heading", { name: "Plugin manifest performance" }))
 
+  expect((await manifestLoaded).status()).toBe(200)
   await expect.poll(() => manifestDirectories).toEqual([activeDirectory])
+  expect(manifestErrors).toEqual([])
+  const refreshed = page.waitForResponse((response) => new URL(response.url()).pathname === "/config")
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")))
+  expect((await refreshed).status()).toBe(200)
+  expect([...new Set(bootstrapDirectories)]).toEqual([activeDirectory])
 })
 
 test("retries a failed plugin manifest without blocking the session timeline", async ({ page }) => {

@@ -80,6 +80,73 @@ const layer = Layer.mergeAll(config, leases, permission, registry, bridge, brows
 const it = testEffect(layer)
 
 describe("Skill capability activation", () => {
+  it.effect("lists all Browser tools for configuration without activating or executing them", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const leases = yield* CapabilityLease.Service
+      const catalog = yield* registry.catalog()
+      const expected = ["browser_click", "browser_navigate", "browser_snapshot", "browser_type", "browser_wait"]
+      expect(catalog.filter((item) => item.id.startsWith("browser_")).map((item) => item.id).sort()).toEqual(expected)
+      for (const id of expected) {
+        expect(catalog.find((item) => item.id === id)).toMatchObject({
+          parameters: { type: "object" },
+          visible: true,
+        })
+      }
+      expect(yield* leases.snapshot(sessionID, toolIdentity.agent)).toEqual({})
+      const request = yield* registry.materialize(undefined, {
+        mode: "explicit",
+        entries: Object.fromEntries(expected.map((id) => [id, { visible: true, permission: "allow" }])),
+      }, { sessionID, agent: toolIdentity.agent })
+      expect(request.definitions).toEqual([])
+      const result = yield* request.settle({
+        sessionID,
+        ...toolIdentity,
+        call: { type: "tool-call", id: "inactive-browser", name: "browser_snapshot", input: {} },
+      })
+      expect(result.result).toEqual({ type: "error", value: "Unknown tool: browser_snapshot" })
+    }),
+  )
+
+  it.effect("keeps Browser configuration stable while runtime grants, permissions and agent policy still filter", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const leases = yield* CapabilityLease.Service
+      const before = yield* registry.catalog()
+      yield* leases.activate({
+        sessionID,
+        agent: toolIdentity.agent,
+        skill: "computer-use",
+        requested: ["browser_read"],
+      })
+      const context = { sessionID, agent: toolIdentity.agent }
+      const allowed = yield* registry.materialize(undefined, {
+        mode: "explicit",
+        entries: { browser_snapshot: { visible: true, permission: "allow" } },
+      }, context)
+      expect(allowed.definitions.map((item) => item.name)).toEqual(["browser_snapshot"])
+      const denied = yield* registry.materialize(
+        [{ action: "browser_read", resource: "*", effect: "deny" }], undefined, context,
+      )
+      expect(denied.definitions.some((item) => item.name.startsWith("browser_"))).toBe(false)
+      const unlisted = yield* registry.materialize(undefined, { mode: "explicit", entries: {} }, context)
+      expect(unlisted.definitions).toEqual([])
+      yield* leases.revoke(sessionID, toolIdentity.agent)
+      const stale = yield* allowed.settle({
+        sessionID,
+        ...toolIdentity,
+        call: { type: "tool-call", id: "revoked-browser", name: "browser_snapshot", input: {} },
+      })
+      expect(stale.result).toEqual({
+        type: "error",
+        value: "Capability lease is not active for tool: browser_snapshot",
+      })
+      expect(yield* registry.catalog()).toEqual(before)
+      const revoked = yield* registry.materialize(undefined, undefined, context)
+      expect(revoked.definitions.some((item) => item.name.startsWith("browser_"))).toBe(false)
+    }),
+  )
+
   test("detects only a real capability snapshot change for continuation rebuilds", () => {
     expect(capabilitySnapshotChanged({}, {})).toBe(false)
     expect(capabilitySnapshotChanged({ browser_read: 1 }, { browser_read: 1 })).toBe(false)

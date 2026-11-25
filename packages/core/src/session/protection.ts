@@ -1,10 +1,13 @@
-import { and, eq, inArray } from "drizzle-orm"
+export * as SessionProtection from "./protection"
+
+import { and, eq, inArray, or } from "drizzle-orm"
 import { Effect, Schema, Semaphore } from "effect"
 import { Database } from "../database/database"
 import { SessionProtectionTable } from "./protection.sql"
 import { SessionSchema } from "./schema"
 import { SessionArchiveCatalogTable } from "../archive.sql"
 import { SessionTable } from "./sql"
+import { SessionOrchestratorTable, SessionOrchestratorTaskTable } from "./legacy-delegation/sql"
 
 type DatabaseShape = Database.Interface["db"]
 type QueryDatabase = Pick<DatabaseShape, "all" | "get" | "run" | "select" | "insert" | "delete">
@@ -15,10 +18,9 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Ses
   sessionID: SessionSchema.ID,
 }) {}
 
-export class ProtectedError extends Schema.TaggedErrorClass<ProtectedError>()(
-  "SessionProtection.ProtectedError",
-  { sessionID: SessionSchema.ID },
-) {}
+export class ProtectedError extends Schema.TaggedErrorClass<ProtectedError>()("SessionProtection.ProtectedError", {
+  sessionID: SessionSchema.ID,
+}) {}
 
 export function isProtected(db: QueryDatabase, sessionID: SessionSchema.ID) {
   return db
@@ -26,7 +28,10 @@ export function isProtected(db: QueryDatabase, sessionID: SessionSchema.ID) {
     .from(SessionProtectionTable)
     .where(eq(SessionProtectionTable.session_id, sessionID))
     .get()
-    .pipe(Effect.orDie, Effect.map((row) => row !== undefined))
+    .pipe(
+      Effect.orDie,
+      Effect.map((row) => row !== undefined),
+    )
 }
 
 export function protectedIDs(db: QueryDatabase, sessionIDs: ReadonlyArray<SessionSchema.ID>) {
@@ -36,7 +41,10 @@ export function protectedIDs(db: QueryDatabase, sessionIDs: ReadonlyArray<Sessio
     .from(SessionProtectionTable)
     .where(inArray(SessionProtectionTable.session_id, [...sessionIDs]))
     .all()
-    .pipe(Effect.orDie, Effect.map((rows) => new Set(rows.map((row) => row.sessionID))))
+    .pipe(
+      Effect.orDie,
+      Effect.map((rows) => new Set(rows.map((row) => row.sessionID))),
+    )
 }
 
 function exists(db: QueryDatabase, sessionID: SessionSchema.ID) {
@@ -52,10 +60,7 @@ function exists(db: QueryDatabase, sessionID: SessionSchema.ID) {
       .select({ id: SessionArchiveCatalogTable.session_id })
       .from(SessionArchiveCatalogTable)
       .where(
-        and(
-          eq(SessionArchiveCatalogTable.session_id, sessionID),
-          eq(SessionArchiveCatalogTable.location, "archived"),
-        ),
+        and(eq(SessionArchiveCatalogTable.session_id, sessionID), eq(SessionArchiveCatalogTable.location, "archived")),
       )
       .get()
       .pipe(Effect.orDie)
@@ -106,8 +111,37 @@ export function withMutationLock<A, E, R>(effect: Effect.Effect<A, E, R>) {
   return mutationLock.withPermit(effect)
 }
 
+/** Ownership is not a user pin. Even released/terminal children retain their
+ * admission tombstone until a dedicated retirement protocol can preserve it.
+ * Call again in the deleting transaction: a UI preflight cannot fence new claims.
+ */
+export function requireUnmanaged(db: Pick<DatabaseShape, "select">, sessionID: SessionSchema.ID) {
+  return Effect.gen(function* () {
+    const main = yield* db
+      .select({ id: SessionOrchestratorTable.main_session_id })
+      .from(SessionOrchestratorTable)
+      .where(eq(SessionOrchestratorTable.main_session_id, sessionID))
+      .get()
+      .pipe(Effect.orDie)
+    if (main) return yield* new ProtectedError({ sessionID })
+    const task = yield* db
+      .select({ id: SessionOrchestratorTaskTable.id })
+      .from(SessionOrchestratorTaskTable)
+      .where(
+        or(
+          eq(SessionOrchestratorTaskTable.main_session_id, sessionID),
+          eq(SessionOrchestratorTaskTable.child_session_id, sessionID),
+        ),
+      )
+      .get()
+      .pipe(Effect.orDie)
+    if (task) return yield* new ProtectedError({ sessionID })
+  })
+}
+
 export function requireDeletable(db: QueryDatabase, sessionID: SessionSchema.ID, overrideProtection: boolean) {
   return Effect.gen(function* () {
+    yield* requireUnmanaged(db, sessionID)
     if (overrideProtection) return
     if (yield* isProtected(db, sessionID)) return yield* new ProtectedError({ sessionID })
   })

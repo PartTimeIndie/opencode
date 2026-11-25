@@ -22,6 +22,12 @@ describe("app plugin capability manifest", () => {
     expect(appPluginMetadata(pkg).capabilities).toContain("host:skill-content")
   })
 
+  test("retains explicit shared-toolbar capability without granting it to legacy plugins", () => {
+    const declared = appPluginMetadata({ opencode: { app: { capabilities: ["ui:toolbar", "host:composer", "host:toolbar"] } } })
+    expect(declared.capabilities).toEqual(["ui:toolbar", "host:composer", "host:toolbar"])
+    expect(appPluginMetadata({ opencode: { app: {} } }).capabilities).not.toContain("host:toolbar")
+  })
+
   test("falls back to legacy capabilities without a declaration", () => {
     const meta = appPluginMetadata({ opencode: { app: {} } })
     expect(Array.isArray(meta.capabilities)).toBe(true)

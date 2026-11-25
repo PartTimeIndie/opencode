@@ -58,15 +58,25 @@ import {
   syncSessionModel,
 } from "@/pages/session/session-model-helpers"
 import { useDockContent } from "@/pages/session/dock-content-registry"
-import { setSessionMetadata, unsetSessionMetadata } from "@/utils/session-metadata-patch"
 import {
   confirmGoalOverride,
+  goalMetadataPatch,
   prepareGoalMetadataUpdate,
   readGoalMetadata,
+  readGoalStatusMetadata,
   sameGoalMetadata,
   sessionGoalMetadataKey,
+  sessionGoalRunMetadataKey,
+  shouldWriteGoalPatch,
   type GoalOverride,
 } from "@/utils/session-goal-state"
+import {
+  buildGoalControlRequest,
+  goalControlErrorText,
+  goalControlResponseStale,
+  parseGoalControlResponse,
+  type SessionGoalControlAction,
+} from "@/utils/session-goal-control"
 import { SessionSidePanel } from "@/pages/session/session-side-panel"
 import { TerminalPanel } from "@/pages/session/terminal-panel"
 import { useSessionCommands } from "@/pages/session/use-session-commands"
@@ -1557,14 +1567,13 @@ export default function Page() {
     )
   }
 
-  const setGoal = (input: { sessionID: string; goal: string }) => {
-    const update = prepareGoalMetadataUpdate(input.goal, info()?.metadata)
+  const setGoal = (input: { sessionID: string; goal: string }) => {    const update = prepareGoalMetadataUpdate(input.goal, info()?.metadata)
     const goal = update.goal
     const previousLocal = goals.items[input.sessionID]
     const revision = (goalOverrideRevisions.get(input.sessionID) ?? 0) + 1
     goalOverrideRevisions.set(input.sessionID, revision)
     setGoals("items", input.sessionID, goal || undefined)
-    if (update.isIdempotent) {
+    if (!shouldWriteGoalPatch(update.isIdempotent, goalOverrides[input.sessionID] !== undefined)) {
       clearGoalOverride(input.sessionID)
       return
     }
@@ -1580,9 +1589,7 @@ export default function Page() {
         if (goalOverrideRevisions.get(input.sessionID) !== revision) return
         return sdk().client.session.update({
           sessionID: input.sessionID,
-          metadataPatch: goal
-            ? setSessionMetadata(sessionGoalMetadataKey, goal)
-            : unsetSessionMetadata(sessionGoalMetadataKey),
+          metadataPatch: goalMetadataPatch(goal),
         })
       })
       .then(() => {
@@ -1602,6 +1609,63 @@ export default function Page() {
           description: error instanceof Error ? error.message : "The session metadata update failed.",
         })
       })
+  }
+
+  const [goalControlPending, setGoalControlPending] = createStore<Record<string, boolean>>({})
+  // The control mutates a run-bound lifecycle: without the goal run metadata
+  // there is no safely addressable target, so the dock shows a disabled
+  // control with a reason instead of letting a click mutate "whatever runs".
+  const goalControlUnavailableReason = (sessionID: string) => {
+    const runID = info()?.metadata?.[sessionGoalRunMetadataKey]
+    return typeof runID === "string" && runID ? undefined : "Goal control unavailable for this goal"
+  }
+  const controlGoal = async (action: SessionGoalControlAction) => {
+    const sessionID = params.id
+    const goal = currentGoal()
+    if (!sessionID || !goal) return
+    if (goalControlPending[sessionID]) return
+    const status = readGoalStatusMetadata(info()?.metadata, goal)
+    const request = buildGoalControlRequest({
+      sessionID,
+      action,
+      goalRunMetadata: info()?.metadata?.[sessionGoalRunMetadataKey],
+      status,
+    })
+    setGoalControlPending(sessionID, true)
+    const failureToast = (description: string) =>
+      showToast({
+        title: action === "pause" ? "Goal could not be paused" : "Goal could not be continued",
+        description,
+      })
+    try {
+      const response = await sdk().client.pluginServices.sessionGoal({
+        sessionID: request.sessionID,
+        action: request.action,
+        operationID: request.operationID,
+        ...(request.runID ? { runID: request.runID } : {}),
+        ...(request.expectedRevision !== undefined ? { expectedRevision: request.expectedRevision } : {}),
+      })
+      // The endpoint wraps the plugin outcome: `{ ok: true, data: outcome }`.
+      // Semantic rejections (stale run/revision, no goal) are `outcome.ok ===
+      // false` on an otherwise successful HTTP response.
+      const outcome = parseGoalControlResponse(response?.data as { ok?: boolean; data?: unknown } | undefined)
+      if (!outcome) {
+        failureToast("The session goal control returned no result.")
+        return
+      }
+      if (!outcome.ok && !outcome.repeated) {
+        failureToast(goalControlErrorText(typeof outcome.error === "string" ? outcome.error : undefined))
+        return
+      }
+      // The mutation response is only an acknowledgement; the canonical goal
+      // status arrives through session metadata. A stale response for a
+      // replaced run or older revision is ignored outright.
+      if (goalControlResponseStale(request, outcome)) return
+    } catch (error) {
+      failureToast(error instanceof Error ? error.message : "The session goal control failed.")
+    } finally {
+      setGoalControlPending(sessionID, false)
+    }
   }
 
   createEffect(() => {
@@ -1640,13 +1704,20 @@ export default function Page() {
     const item = queuedFollowups().find((entry) => entry.id === id)
     if (!item) return
 
-    setFollowup("items", sessionID, (items) => (items ?? []).filter((entry) => entry.id !== id))
-    setFollowup("failed", sessionID, (value) => (value === id ? undefined : value))
-    setFollowup("edit", sessionID, {
-      id: item.id,
-      prompt: item.prompt,
-      context: item.context,
-    })
+    const edit = (prompt = item.prompt) => {
+      setFollowup("items", sessionID, (items) => (items ?? []).filter((entry) => entry.id !== id))
+      setFollowup("failed", sessionID, (value) => (value === id ? undefined : value))
+      setFollowup("edit", sessionID, { id: item.id, prompt, context: item.context })
+    }
+    const refs = item.prompt.flatMap((part) => part.type === "image" && part.annotation ? [part.annotation] : [])
+    if (!refs.length) { edit(); return }
+    void import("@/components/image-annotation/storage").then(async ({ restoreQueuedAnnotation }) => {
+      const { annotationPart } = await import("@/components/image-annotation/draft-controller")
+      const prompt = await Promise.all(item.prompt.map((part) => part.type === "image" && part.annotation ? annotationPart(part.annotation) : part))
+      await Promise.all(refs.map(restoreQueuedAnnotation))
+      if (params.id !== sessionID || !(followup.items[sessionID] ?? []).some((entry) => entry.id === id)) return
+      edit(prompt)
+    }).catch(fail)
   }
 
   const deleteFollowup = (id: string) => {
@@ -1654,9 +1725,18 @@ export default function Page() {
     if (!sessionID) return
     if (followupBusy(sessionID)) return
 
-    setFollowup("items", sessionID, (items) => (items ?? []).filter((entry) => entry.id !== id))
-    setFollowup("failed", sessionID, (value) => (value === id ? undefined : value))
-    setFollowup("edit", sessionID, (value) => (value?.id === id ? undefined : value))
+    const item = (followup.items[sessionID] ?? []).find((entry) => entry.id === id)
+    const remove = () => {
+      setFollowup("items", sessionID, (items) => (items ?? []).filter((entry) => entry.id !== id))
+      setFollowup("failed", sessionID, (value) => (value === id ? undefined : value))
+      setFollowup("edit", sessionID, (value) => (value?.id === id ? undefined : value))
+    }
+    const refs = item?.prompt.flatMap((part) => part.type === "image" && part.annotation ? [part.annotation] : []) ?? []
+    if (!refs.length) { remove(); return }
+    void import("@/components/image-annotation/storage").then(async ({ removeAnnotation }) => {
+      await Promise.all(refs.map(removeAnnotation))
+      remove()
+    }).catch(fail)
   }
 
   const moveFollowup = (id: string, beforeID: string) => {
@@ -2015,6 +2095,10 @@ export default function Page() {
           ? {
               value: currentGoal(),
               onClear: () => setGoal({ sessionID: params.id!, goal: "" }),
+              status: readGoalStatusMetadata(info()?.metadata, currentGoal()),
+              onControl: (action) => void controlGoal(action),
+              controlPending: goalControlPending[params.id!] === true,
+              controlUnavailableReason: goalControlUnavailableReason(params.id!),
             }
           : undefined
       }
@@ -2189,14 +2273,14 @@ export default function Page() {
   // terminal, and mobile changes; registration lives under this page's owner
   // so disposing the routed subtree (directory switch) clears it atomically.
   dockContent.register({
-    header: <SessionHeader />,
-    review: rightDockContent("review"),
-    changes: rightDockContent("changes"),
-    files: rightDockContent("all"),
+    header: () => <SessionHeader />,
+    review: () => rightDockContent("review"),
+    changes: () => rightDockContent("changes"),
+    files: () => rightDockContent("all"),
     // Keep terminal construction lazy: registering hidden dock content must not
     // create a PTY until the terminal pane is actually mounted.
     bottom: () => <TerminalPanel docked />,
-    mobileChanges: mobileChangesContent(),
+    mobileChanges: mobileChangesContent,
     mobileChangesOpen: () => !!params.id && mobileChanges(),
     onResponseSubmit: resumeScroll,
   })

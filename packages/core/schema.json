@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "c77a5001-420d-41b4-a725-32c864b5b563",
+  "id": "2304f00d-d5b0-4f50-bd8e-274c341f5171",
   "prevIds": [
-    "7381bfd2-91b1-40e7-9e19-a43a5dc1a4b6"
+    "f5a98d54-dd85-4348-88a9-dc1f495910ae"
   ],
   "ddl": [
     {
@@ -107,6 +107,10 @@
       "entityType": "tables"
     },
     {
+      "name": "project_directory_icon",
+      "entityType": "tables"
+    },
+    {
       "name": "project_directory",
       "entityType": "tables"
     },
@@ -116,6 +120,10 @@
     },
     {
       "name": "session_question",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_orchestrator_commission",
       "entityType": "tables"
     },
     {
@@ -168,6 +176,14 @@
     },
     {
       "name": "session_message",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_skill_selection_barrier",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_skill_selection",
       "entityType": "tables"
     },
     {
@@ -1027,6 +1043,26 @@
       "default": null,
       "generated": null,
       "name": "heartbeat_at",
+      "entityType": "columns",
+      "table": "background_job"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cleanup_token",
+      "entityType": "columns",
+      "table": "background_job"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_owner_settled",
       "entityType": "columns",
       "table": "background_job"
     },
@@ -2332,6 +2368,36 @@
     },
     {
       "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "project_directory_icon"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "url",
+      "entityType": "columns",
+      "table": "project_directory_icon"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "project_directory_icon"
+    },
+    {
+      "type": "text",
       "notNull": true,
       "autoincrement": false,
       "default": null,
@@ -2521,6 +2587,16 @@
       "table": "project"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "icon_generation_style",
+      "entityType": "columns",
+      "table": "project"
+    },
+    {
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
@@ -2671,6 +2747,16 @@
       "table": "session_question"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "answer_source",
+      "entityType": "columns",
+      "table": "session_question"
+    },
+    {
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
@@ -2749,6 +2835,146 @@
       "name": "time_updated",
       "entityType": "columns",
       "table": "session_question"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "main_session_id",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "origin_input_id",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "origin_digest",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "scope",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_assistant_id",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_call_id",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "agent",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "policy_digest",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "settings",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cache_family",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "true",
+      "generated": null,
+      "name": "revoked",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_orchestrator_commission"
     },
     {
       "type": "text",
@@ -3076,6 +3302,16 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "basis_digest",
+      "entityType": "columns",
+      "table": "session_orchestrator_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "cache_profile",
       "entityType": "columns",
       "table": "session_orchestrator_task"
@@ -3097,6 +3333,16 @@
       "default": null,
       "generated": null,
       "name": "cache_ratio",
+      "entityType": "columns",
+      "table": "session_orchestrator_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "result",
       "entityType": "columns",
       "table": "session_orchestrator_task"
     },
@@ -3762,6 +4008,16 @@
     },
     {
       "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "before_mode",
+      "entityType": "columns",
+      "table": "session_file_mutation"
+    },
+    {
+      "type": "integer",
       "notNull": true,
       "autoincrement": false,
       "default": null,
@@ -3787,6 +4043,16 @@
       "default": null,
       "generated": null,
       "name": "after_sha256",
+      "entityType": "columns",
+      "table": "session_file_mutation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "after_mode",
       "entityType": "columns",
       "table": "session_file_mutation"
     },
@@ -3847,6 +4113,16 @@
       "default": null,
       "generated": null,
       "name": "delivery",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "origin",
       "entityType": "columns",
       "table": "session_input"
     },
@@ -4026,6 +4302,256 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "forgotten_seq",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "operation_id",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "operation_name",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "operation_payload",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "origin_kind",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "origin_id",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "origin_seq",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "selected_at",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "limit_minutes",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "limit_messages",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "forgotten_at",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "forgotten_seq",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "operation_id",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "renewal_declined_at",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "renewal_declined_generation",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "bound_message_id",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "receipt_input_id",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "session_skill_selection"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "id",
       "entityType": "columns",
       "table": "session"
@@ -4057,6 +4583,26 @@
       "default": null,
       "generated": null,
       "name": "parent_id",
+      "entityType": "columns",
+      "table": "session"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "fork_history_seq",
+      "entityType": "columns",
+      "table": "session"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "fork_dispatch_digest",
       "entityType": "columns",
       "table": "session"
     },
@@ -4782,6 +5328,36 @@
     },
     {
       "columns": [
+        "main_session_id"
+      ],
+      "tableTo": "session_orchestrator",
+      "columnsTo": [
+        "main_session_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_orchestrator_commission_main_session_id_session_orchestrator_main_session_id_fk",
+      "entityType": "fks",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "columns": [
+        "origin_input_id"
+      ],
+      "tableTo": "session_input",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_orchestrator_commission_origin_input_id_session_input_id_fk",
+      "entityType": "fks",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "columns": [
         "task_id"
       ],
       "tableTo": "session_orchestrator_task",
@@ -5009,6 +5585,36 @@
     },
     {
       "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_skill_selection_barrier_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_skill_selection_barrier"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_skill_selection_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_skill_selection"
+    },
+    {
+      "columns": [
         "project_id"
       ],
       "tableTo": "project",
@@ -5136,6 +5742,16 @@
       "name": "session_link_pk",
       "entityType": "pks",
       "table": "session_link"
+    },
+    {
+      "columns": [
+        "session_id",
+        "name"
+      ],
+      "nameExplicit": false,
+      "name": "session_skill_selection_pk",
+      "entityType": "pks",
+      "table": "session_skill_selection"
     },
     {
       "columns": [
@@ -5356,6 +5972,15 @@
     },
     {
       "columns": [
+        "directory"
+      ],
+      "nameExplicit": false,
+      "name": "project_directory_icon_pk",
+      "table": "project_directory_icon",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -5370,6 +5995,15 @@
       "nameExplicit": false,
       "name": "session_question_pk",
       "table": "session_question",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "session_orchestrator_commission_pk",
+      "table": "session_orchestrator_commission",
       "entityType": "pks"
     },
     {
@@ -5469,6 +6103,15 @@
       "nameExplicit": false,
       "name": "session_message_pk",
       "table": "session_message",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_skill_selection_barrier_pk",
+      "table": "session_skill_selection_barrier",
       "entityType": "pks"
     },
     {
@@ -6140,6 +6783,38 @@
     {
       "columns": [
         {
+          "value": "main_session_id",
+          "isExpression": false
+        },
+        {
+          "value": "origin_input_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "session_orchestrator_commission_origin_idx",
+      "entityType": "indexes",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "columns": [
+        {
+          "value": "cache_family",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "session_orchestrator_commission_family_idx",
+      "entityType": "indexes",
+      "table": "session_orchestrator_commission"
+    },
+    {
+      "columns": [
+        {
           "value": "task_id",
           "isExpression": false
         }
@@ -6550,6 +7225,38 @@
       "name": "session_message_time_created_idx",
       "entityType": "indexes",
       "table": "session_message"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_skill_selection_session_idx",
+      "entityType": "indexes",
+      "table": "session_skill_selection"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "receipt_input_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_skill_selection_receipt_input_idx",
+      "entityType": "indexes",
+      "table": "session_skill_selection"
     },
     {
       "columns": [

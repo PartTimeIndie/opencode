@@ -234,10 +234,52 @@ const scenarios: Scenario[] = [
     .get("/project/{projectID}/directories", "project.directories")
     .seeded((ctx) => ctx.project())
     .at((ctx) => ({
-      path: route("/project/{projectID}/directories", { projectID: ctx.state.id }),
-      headers: ctx.headers(),
-    }))
+        path: route("/project/{projectID}/directories", { projectID: ctx.state.id }),
+        headers: ctx.headers(),
+      }))
     .json(200, array, "status"),
+  http.protected.get("/project/directory-icons", "project.directoryIcons").json(200, array, "status"),
+  http.protected
+    .put("/project/directory-icon", "project.directoryIcon")
+    .mutating()
+    .at((ctx) => ({
+      path: "/project/directory-icon",
+      headers: ctx.headers(),
+      body: { directory: ctx.directory, url: "https://example.com/icon.svg" },
+    }))
+    .json(
+      200,
+      (body) => {
+        object(body)
+        check(
+          isRecord(body.icon) && body.icon.override === "https://example.com/icon.svg",
+          "directory icon should return the stored override",
+        )
+      },
+      "status",
+    ),
+  http.protected
+    .post("/project/resolve", "project.resolve")
+    .at((ctx) => ({
+      path: "/project/resolve",
+      headers: ctx.headers(),
+      body: { directories: [ctx.directory, "global"] },
+    }))
+    .json(
+      200,
+      (body) => {
+        array(body)
+        check(
+          body.length === 2 && isRecord(body[1]) && body[1].directory === "global" && body[1].exists === true,
+          "resolve should keep the global sentinel",
+        )
+        check(
+          isRecord(body[0]) && body[0].exists === true && typeof body[0].real === "string",
+          "resolve should report the scenario directory",
+        )
+      },
+      "status",
+    ),
   http.protected
     .post("/experimental/project/{projectID}/copy/generate-name", "experimental.projectCopy.generateName")
     .seeded((ctx) => ctx.project())
@@ -771,6 +813,7 @@ const scenarios: Scenario[] = [
     .status(204, undefined, "status"),
   http.protected.get("/api/command", "v2.command.list").json(200, locationData(array)),
   http.protected.get("/api/skill", "v2.skill.list").json(200, locationData(array)),
+  http.protected.get("/api/skill/diagnostics", "v2.skill.diagnostics").json(200, locationData(array)),
   http.protected
     .get("/api/event", "v2.event.subscribe")
     .stream()

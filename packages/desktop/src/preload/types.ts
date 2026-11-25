@@ -2,6 +2,9 @@ import type { AppHostDesktopServiceState } from "@opencode-ai/plugin/app"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import type { WslServersPlatform } from "@opencode-ai/app/wsl/types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
+import type { ServerState } from "./server-state"
+import type { AttentionCommand, AttentionResult } from "@opencode-ai/app/session-attention/broker"
+import type { AttentionEntry } from "@opencode-ai/app/session-attention/state"
 export type {
   WslDistroProbe,
   WslInstalledDistro,
@@ -84,6 +87,10 @@ export type ElectronAPI = {
   killSidecar: () => Promise<void>
   installCli: () => Promise<string>
   awaitInitialization: () => Promise<ServerReadyData>
+  serverStatus: {
+    subscribe: (callback: (state: ServerState) => void) => Promise<() => void>
+    retry: () => Promise<void>
+  }
   wslServers: WslServersAPI
   updater: UpdaterAPI
   consumeInitialDeepLinks: () => Promise<string[]>
@@ -94,6 +101,13 @@ export type ElectronAPI = {
   parseMarkdownCommand: (markdown: string) => Promise<string>
   checkAppExists: (appName: string) => Promise<boolean>
   resolveAppPath: (appName: string) => Promise<string | null>
+  sessionAttention: {
+    list: () => Promise<Record<string, AttentionEntry>>
+    update: (command: AttentionCommand) => Promise<AttentionResult>
+    subscribe: (callback: (key: string, entry: AttentionEntry) => void) => () => void
+    visible: (key: string | null) => Promise<void>
+    isVisible: (key: string) => Promise<boolean>
+  }
   storeGet: (name: string, key: string) => Promise<string | null>
   storeSet: (name: string, key: string, value: string) => Promise<void>
   storeDelete: (name: string, key: string) => Promise<void>
@@ -129,6 +143,8 @@ export type ElectronAPI = {
     width: number
     height: number
   } | null>
+  /** Shell-side text write; unlike the web Clipboard API it needs no renderer focus. */
+  writeClipboardText: (text: string) => Promise<{ ok: true } | { ok: false; error: string }>
   showNotification: (title: string, body?: string) => void
   getWindowFocused: () => Promise<boolean>
   setWindowFocus: () => Promise<void>
@@ -138,6 +154,7 @@ export type ElectronAPI = {
   setZoomFactor: (factor: number) => Promise<void>
   getPinchZoomEnabled: () => Promise<boolean>
   setPinchZoomEnabled: (enabled: boolean) => Promise<void>
+  browserTransfer: (action: "reserve" | "commit" | "release", id: number, ticket?: string) => Promise<string | boolean>
   getBrowserAutomationEnabled: () => Promise<boolean>
   setBrowserAutomationEnabled: (enabled: boolean) => Promise<void>
   onPinchZoomEnabledChanged: (cb: (enabled: boolean) => void) => () => void

@@ -14,7 +14,7 @@ import type {
 import type { NormalizedProviderListResponse } from "@opencode-ai/ui/context"
 import {
   bootstrapDirectory,
-  bootstrapFeedbackErrors,
+  bootstrapGlobal,
   loadAgentsQuery,
   loadGlobalConfigQuery,
   loadPathQuery,
@@ -41,16 +41,6 @@ describe("global config catalog refresh", () => {
   test("keeps refreshing catalogs for provider-related config writes", () => {
     expect(shouldRefreshCatalogsAfterConfigUpdate({ provider: { custom: {} } })).toBe(true)
     expect(shouldRefreshCatalogsAfterConfigUpdate({ disabled_providers: ["custom"] })).toBe(true)
-  })
-})
-
-describe("bootstrap feedback", () => {
-  test("does not duplicate a handled provider failure as a global bootstrap error", () => {
-    const providerFailure = new Error("Provider catalog unavailable")
-    const otherFailure = new Error("Session status unavailable")
-    expect(bootstrapFeedbackErrors([providerFailure], new Set([providerFailure]))).toEqual([])
-    expect(bootstrapFeedbackErrors([providerFailure, otherFailure], new Set([providerFailure]))).toEqual([otherFailure])
-    expect(bootstrapFeedbackErrors([otherFailure], new Set())).toEqual([otherFailure])
   })
 })
 
@@ -179,7 +169,79 @@ async function waitForBootstrap(store: ReturnType<typeof bootstrapState>[0]) {
   }
 }
 
+describe("bootstrapGlobal", () => {
+  test("finishes the app shell while global provider discovery is still pending", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const [globalStore, setGlobalStore] = createStore({ project: [] as Project[] })
+    let releaseProvider = () => {}
+    const providerGate = new Promise<void>((resolve) => (releaseProvider = resolve))
+    const sdk = {
+      global: { config: { get: async () => ({ data: {} }) } },
+      path: {
+        get: async () => ({
+          data: { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" },
+        }),
+      },
+      project: { list: async () => ({ data: [{ id: "project", worktree: "/project" }] }) },
+      provider: {
+        list: async () => {
+          await providerGate
+          return { data: { all: [], connected: [], default: {} } }
+        },
+      },
+    } as unknown as OpencodeClient
+    const providerQuery = loadProvidersQuery(ServerScope.local, null, sdk)
+    const bootstrap = bootstrapGlobal({
+      serverSDK: sdk,
+      scope: ServerScope.local,
+      requestFailedTitle: "request failed",
+      translate: (key) => key,
+      formatMoreCount: String,
+      setGlobalStore: setGlobalStore as unknown as Parameters<typeof bootstrapGlobal>[0]["setGlobalStore"],
+      queryClient,
+    })
+
+    try {
+      const result = await Promise.race([bootstrap.then(() => "complete"), Bun.sleep(1_000).then(() => "stalled")])
+      expect(result).toBe("complete")
+      expect(globalStore.project).toHaveLength(1)
+      expect(queryClient.getQueryState(providerQuery.queryKey)?.fetchStatus).toBe("fetching")
+    } finally {
+      releaseProvider()
+      await Promise.all([bootstrap, queryClient.fetchQuery(providerQuery)])
+    }
+  })
+})
+
 describe("bootstrapDirectory", () => {
+  test("finishes loading sessions while provider discovery is still pending", async () => {
+    const [store, setStore] = bootstrapState()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let releaseProvider = () => {}
+    const providerGate = new Promise<void>((resolve) => (releaseProvider = resolve))
+    const sdk = {
+      ...questionSDK({}),
+      provider: {
+        list: async () => {
+          await providerGate
+          return { data: { all: [], connected: [], default: {} } }
+        },
+      },
+    } as unknown as OpencodeClient
+    const providerQuery = loadProvidersQuery(ServerScope.local, "/project", sdk)
+    const bootstrap = startQuestionBootstrap({ store, setStore, sdk, queryClient })
+
+    try {
+      const result = await Promise.race([bootstrap.then(() => "complete"), Bun.sleep(1_000).then(() => "stalled")])
+      expect(result).toBe("complete")
+      expect(store.status).toBe("complete")
+      expect(queryClient.getQueryState(providerQuery.queryKey)?.fetchStatus).toBe("fetching")
+    } finally {
+      releaseProvider()
+      await Promise.all([bootstrap, queryClient.fetchQuery(providerQuery)])
+    }
+  })
+
   test("completes directory bootstrap when its independent provider query fails", async () => {
     const [store, setStore] = bootstrapState()
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })

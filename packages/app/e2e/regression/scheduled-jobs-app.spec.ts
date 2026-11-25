@@ -1651,6 +1651,57 @@ test("retries the startup job list and resumes a persisted run exactly once", as
   ).toHaveLength(2)
 })
 
+test("recovers an interrupted scheduled run after an outer service outage without replay", async ({ page }) => {
+  const errors = trackPageErrors(page)
+  const requests: SchedulerRequest[] = []
+  const prompts: unknown[] = []
+  const creates: unknown[] = []
+  const failures: string[] = []
+  const targetSessionID = "ses_interrupted_saved"
+  const job: SchedulerJob = {
+    name: "Interrupted Morning", slug: "interrupted-morning", schedule: "0 9 * * *",
+    workdir: directory, scopeId: schedulerScopeID,
+    run: { prompt: "Never replay this prompt.", runTarget: "app", appSessionStrategy: "job" },
+    lastRunStatus: "running", lastRunRunId: "interrupted-run",
+    lastRunSessionID: targetSessionID, lastRunMessageID: "msg_interrupted_saved",
+    lastRunResultContract: "opencode.scheduled-job-result/v1",
+  }
+  await mockOpenCodeServer(page, {
+    directory, project: [project(projectID, directory, "Scheduled Jobs")], provider: provider(),
+    sessions: [session(), session(targetSessionID, "Interrupted Morning")], pageMessages: () => ({ items: [] }),
+    onSessionPrompt: (input) => { prompts.push(input); return {} },
+    onSessionCreate: (input) => { creates.push(input); return session("ses_unexpected", "Unexpected") },
+  })
+  await mockScheduledJobsPlugin(page)
+  await mockSchedulerApi(page, [job], requests, {
+    outcome: () => ({ status: "failed", error: "Interrupted before settlement", activityID: "activity_interrupted" }),
+  })
+  let unavailable = false
+  await page.route("**/plugins/opencode-scheduler/services/jobs**", async (route) => {
+    const input = JSON.parse(route.request().postData() ?? "{}").input
+    if (!unavailable && input?.path === "/scheduler/jobs" && input?.query?.includeLegacy === "false") {
+      unavailable = true
+      return route.fulfill({ status: 503, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify({ message: "Scheduler service warming up" }) })
+    }
+    return route.fallback()
+  })
+  page.on("response", (response) => { if (response.status() >= 400) failures.push(`${response.status()} ${new URL(response.url()).pathname}`) })
+  await configurePage(page)
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+  await expect.poll(() => job.lastRunStatus, { timeout: 10_000 }).toBe("failed")
+  await expect(page.locator(".oc-scheduled-jobs")).toBeVisible()
+  await page.getByRole("button", { name: "Refresh", exact: true }).click()
+  await expect(page.locator(".oc-scheduled-jobs").getByText("daily at 09:00 · failed", { exact: true })).toBeVisible()
+  expect(unavailable).toBe(true)
+  expect(prompts).toEqual([])
+  expect(creates).toEqual([])
+  expect(requests.filter((request) => request.path.endsWith("/state")).at(-1)?.body).toMatchObject({ status: "failed", messageID: "msg_interrupted_saved" })
+  expect(failures).toEqual(["503 /plugins/opencode-scheduler/services/jobs"])
+  expect(errors.filter((error) => !/Failed to load resource.*503/i.test(error))).toEqual([])
+  await page.screenshot({ path: "e2e/test-results/scheduled-jobs-interrupted-recovery-desktop.png", fullPage: true })
+})
+
 test("marks a missing-prompt invariant failed instead of retrying forever", async ({ page }) => {
   const requests: SchedulerRequest[] = []
   const slug = "missing-prompt"

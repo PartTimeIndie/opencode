@@ -1,8 +1,26 @@
 import { describe, expect, test } from "bun:test"
 import type { Prompt } from "@/context/prompt"
-import { buildRequestParts } from "./build-request-parts"
+import { buildRequestParts, imageAttachmentPromptFile } from "./build-request-parts"
 
 describe("buildRequestParts", () => {
+  test("sends archive extraction consent only when selected", () => {
+    const archive = {
+      type: "image" as const,
+      id: "archive",
+      filename: "save.7z",
+      mime: "application/x-compressed",
+      dataUrl: "data:application/x-compressed;base64,N3o=",
+    }
+    expect(imageAttachmentPromptFile(archive)).not.toHaveProperty("unpack")
+    expect(imageAttachmentPromptFile({ ...archive, unpack: true })?.unpack).toBe(true)
+    expect(imageAttachmentPromptFile({ ...archive, unpack: false })).not.toHaveProperty("unpack")
+    const result = buildRequestParts({
+      prompt: [{ type: "text", content: "Inspect", start: 0, end: 7 }],
+      context: [], images: [{ ...archive, unpack: true }], text: "Inspect",
+      messageID: "msg_archive", sessionID: "ses_archive", sessionDirectory: "/repo",
+    })
+    expect(result.requestPrompt.files?.[0]?.unpack).toBe(true)
+  })
   test("builds typed request and optimistic parts without cast path", () => {
     const prompt: Prompt = [
       { type: "text", content: "hello", start: 0, end: 5 },

@@ -16,6 +16,7 @@ import {
   createSerialDirectoryLoader,
   loadPassiveSessionInfo,
   loadPassiveSessionStatus,
+  recoverMissingSessionInfo,
   withAbortableDeadline,
   PASSIVE_SIDEBAR_REQUEST_TIMEOUT_MS,
   SESSION_STATUS_RECONCILIATION_INTERVAL_MS,
@@ -39,9 +40,15 @@ import {
   sessionActivity,
   sessionActivityGenerationSnapshot,
   sessionActivitySettled,
+  sessionActivityStartedAt,
   startSessionActivity,
 } from "@/utils/session-activity"
-import { resolveLifecycleStatus, sessionIsWorking } from "@/utils/session-status"
+import {
+  latestAssistantCompletedBefore,
+  latestAssistantSettled,
+  resolveLifecycleStatus,
+  sessionIsWorking,
+} from "@/utils/session-status"
 import { activeSessionReadyForBackgroundPrefetch } from "./global-sync/session-prefetch"
 
 describe("mcpSetupSessionModel", () => {
@@ -947,6 +954,51 @@ describe("session tab events", () => {
     ).toBeFalse()
   })
 
+  test("keeps a fresh activity busy when an idle or absent status snapshot arrives before the new assistant message", () => {
+    const directory = "C:/OpenCode/status-fresh-activity"
+    const startedAt = Date.now()
+    const results = [undefined, { type: "idle" } as const].map((incoming) => {
+      const sessionID = `ses_fresh_${incoming?.type ?? "absent"}`
+      startSessionActivity(directory, sessionID, "activity_fresh", { timestamp: startedAt })
+      const generations = sessionActivityGenerationSnapshot(directory)
+      const store = {
+        session_status: { [sessionID]: { type: "busy" } },
+        message: {
+          [sessionID]: [
+            {
+              id: "msg_previous",
+              role: "assistant",
+              finish: "stop",
+              time: { created: startedAt - 10_000, completed: startedAt - 5_000 },
+            },
+          ],
+        },
+        part: { msg_previous: [{ type: "text" }] },
+      } as never
+      try {
+        const status = reconcileSessionStatusSnapshot({ directory, sessionID, generations, incoming, store })
+        const settled = sessionActivitySettled(directory, sessionID)
+        const lifecycle = resolveLifecycleStatus({
+          activity: sessionActivity(directory, sessionID)?.type,
+          activityTracked: latestAssistantCompletedBefore(store, sessionID, sessionActivityStartedAt(directory, sessionID)),
+          activitySettled: settled,
+          store: status?.type,
+          latestAssistantSettled: latestAssistantSettled(store, sessionID),
+        })
+        return {
+          working: sessionIsWorking(store, sessionID, lifecycle, settled),
+          activity: sessionActivity(directory, sessionID)?.type,
+        }
+      } finally {
+        finishSessionActivity(directory, sessionID, "activity_fresh")
+      }
+    })
+    expect(results).toEqual([
+      { working: true, activity: "busy" },
+      { working: true, activity: "busy" },
+    ])
+  })
+
   test("finishes stale activity and hydrates idle from an empty status response after finish stop", () => {
     const directory = "C:/OpenCode/status-missed-terminal"
     const sessionID = "ses_done"
@@ -1143,3 +1195,31 @@ describe("sessionDirectoryInStores", () => {
     expect(directory).toBe("C:/First")
   })
 })
+
+describe("recoverMissingSessionInfo", () => {
+  const notFound = (sessionID: string) =>
+    new Error(`Request failed with status 404: Session not found: ${sessionID}`, {
+      cause: { status: 404, body: { name: "NotFoundError", data: { message: `Session not found: ${sessionID}` } } },
+    })
+
+  test("forgets the stale session record and settles the load", () => {
+    let forgotten = 0
+    const result = recoverMissingSessionInfo(notFound("ses_gone"), () => {
+      forgotten += 1
+    })
+    expect(result).toBeUndefined()
+    expect(forgotten).toBe(1)
+  })
+
+  test("rethrows errors that are not missing-session 404s", () => {
+    const serverError = new Error("Request failed with status 500", { cause: { status: 500 } })
+    let forgotten = 0
+    expect(() =>
+      recoverMissingSessionInfo(serverError, () => {
+        forgotten += 1
+      }),
+    ).toThrow("Request failed with status 500")
+    expect(forgotten).toBe(0)
+  })
+})
+

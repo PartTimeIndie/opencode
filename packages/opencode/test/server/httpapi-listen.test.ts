@@ -168,6 +168,25 @@ async function openPtySocket(listener: Awaited<ReturnType<typeof startListener>>
 }
 
 describe("HttpApi Server.listen", () => {
+  test("stop(true) closes an active desktop event stream", async () => {
+    const listener = await startListener()
+    const controller = new AbortController()
+    try {
+      const response = await fetch(new URL("/global/event", listener.url), {
+        headers: { authorization: authorization() },
+        signal: controller.signal,
+        // Do not leak Bun's pooled SSE connection into later same-port fixtures.
+        keepalive: false,
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get("content-type")).toContain("text/event-stream")
+      await withTimeout(listener.stop(true), 5_000, "timed out closing active desktop event stream")
+    } finally {
+      controller.abort()
+      await stop(listener, "timed out cleaning up desktop event stream listener").catch(() => undefined)
+    }
+  })
+
   testPty("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startListener()

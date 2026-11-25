@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { expect, test, type Page } from "@playwright/test"
 import { base64Encode, checksum } from "@opencode-ai/core/util/encode"
 import { mockOpenCodeServer } from "../utils/mock-server"
-import { expectNoSmokeErrors, trackPageErrors } from "../utils/errors"
+import { expectNoSmokeErrors, trackNetworkFailures, trackPageErrors } from "../utils/errors"
 import { expectAppVisible } from "../utils/waits"
 import { pathKey } from "../../src/utils/path-key"
 
@@ -62,6 +62,8 @@ async function setup(
     queuedSessionID?: string
     persistedPaused?: boolean
     sessionAgent?: string
+    settings?: Record<string, unknown> | null
+    emptyFollowups?: boolean
   },
 ) {
   const requests: Array<{ sessionID: string; body: Record<string, unknown> }> = []
@@ -149,10 +151,7 @@ async function setup(
   })
 
   await page.addInitScript((input) => {
-    localStorage.setItem(
-      "settings.v3",
-      JSON.stringify({ general: { followup: "queue", followupQueueMigrated: true } }),
-    )
+    if (input.settings !== null) localStorage.setItem("settings.v3", JSON.stringify(input.settings))
     localStorage.setItem(
       "opencode.global.dat:server",
       JSON.stringify({ projects: { local: [{ worktree: input.directory, expanded: true }] }, lastProject: { local: input.directory } }),
@@ -175,7 +174,8 @@ async function setup(
     } }))
   }, {
     storage: workspaceStorage(directory),
-    followup: followupState("queued while inactive later", options?.queuedSessionID, options?.persistedPaused),
+    followup: options?.emptyFollowups ? { items: {}, failed: {}, paused: {}, edit: {} } : followupState("queued while inactive later", options?.queuedSessionID, options?.persistedPaused),
+    settings: options?.settings === undefined ? { general: { followup: "queue", followupQueueMigrated: true } } : options.settings,
     directory,
     dirBase64: base64Encode(directory),
     sessionID: activeSessionID,
@@ -220,6 +220,34 @@ async function setup(
     settleInactiveSession: () => {
       settled = true
     },
+  }
+}
+
+for (const viewport of [{ name: "desktop", width: 1280, height: 720 }, { name: "mobile", width: 390, height: 844 }]) {
+  for (const stored of ["fresh", "legacy-steer"] as const) {
+    test(`sends a busy correction at the next safe boundary with ${stored} settings on ${viewport.name}`, async ({ page }) => {
+      await page.setViewportSize(viewport)
+      const errors = trackPageErrors(page)
+      const networkFailures = trackNetworkFailures(page)
+      const qa = await setup(page, {
+        activeBusy: true,
+        emptyFollowups: true,
+        settings: stored === "fresh" ? null : { general: { followup: "steer" } },
+      })
+      await qa.openSession(activeSessionID)
+      const input = page.locator('[data-component="session-composer"] [data-component="prompt-input"]').filter({ visible: true })
+      const text = "Please include this correction at your next safe boundary"
+      await input.fill(text)
+      await input.press("Enter")
+      await expect.poll(() => qa.requests.length).toBe(1)
+      expect(qa.requests[0]).toMatchObject({ sessionID: activeSessionID, body: { prompt: { text } } })
+      expect(qa.requests[0]?.body.delivery ?? "steer").toBe("steer")
+      expect(qa.interrupts).toEqual([])
+      await expect(page.locator('[data-component="session-followup-dock"]')).not.toBeVisible()
+      await page.screenshot({ path: test.info().outputPath("safe-boundary-followup.png") })
+      expectNoSmokeErrors(errors, [], [])
+      expect(networkFailures).toEqual([])
+    })
   }
 }
 

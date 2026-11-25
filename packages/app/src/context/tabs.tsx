@@ -10,6 +10,7 @@ import { uuid } from "@/utils/uuid"
 import { notifySessionTabReconciled, type SessionTabsRemovedDetail } from "@/components/titlebar-session-events"
 import { clearDraftPromptState, createDraftPromptState } from "./prompt"
 import { decode64 } from "@/utils/base64"
+import { composerSendIntents } from "@/plugin/composer-send-intent"
 import {
   draftHref,
   migrateStoredTabs,
@@ -53,6 +54,14 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
   gate: false,
   init: () => {
     const server = useServer()
+    createEffect(() => {
+      const active = server.key
+      composerSendIntents.revoke((target) => target.serverID !== active)
+    })
+    const cancelPrepared = (tab: Tab) => composerSendIntents.revoke((target) =>
+      target.serverID === tab.server && (tab.type === "draft"
+        ? target.composerID === tab.draftID
+        : target.sessionID === tab.sessionId && base64Encode(target.directory) === tab.dirBase64))
     const platform = usePlatform()
     const fallback = server.key
     const [store, setStore, _, ready] = persisted(
@@ -290,6 +299,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       removeTab: (index: number) => {
         const tab = store[index]
         if (!tab) return
+        cancelPrepared(tab)
         const key = tabKey(tab)
         const closingKey = tab.type === "session" ? sessionTabIdentity(tab) : key
         const draftID = tab.type === "draft" ? tab.draftID : undefined
@@ -313,6 +323,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       },
       removeTabs: (keys: string[]) => {
         const removed = store.filter((tab) => keys.includes(tabKey(tab)))
+        removed.forEach(cancelPrepared)
         if (removed.length === 0) return
         const removedKeys = new Set(removed.map(tabKey))
         const closingKeys = new Set(
@@ -348,6 +359,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         return transition
       },
       removeServer(key: ServerConnection.Key) {
+        composerSendIntents.revoke((target) => target.serverID === key)
         const drafts = store.flatMap((tab) => (tab.type === "draft" && tab.server === key ? [tab.draftID] : []))
         const removed = store.filter((tab) => tab.server === key).map(tabKey)
         setStore((tabs) => tabs.filter((tab) => tab.server !== key))
@@ -357,6 +369,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       },
       removeSessions: (input: SessionTabsRemovedDetail) => {
         const sessionIDs = new Set(input.sessionIDs)
+        composerSendIntents.revoke((target) => target.serverID === input.server && target.directory === input.directory && !!target.sessionID && sessionIDs.has(target.sessionID))
         const removed = store
           .filter((tab) =>
             sessionTabMatchesRemoved(tab, { server: input.server, directory: input.directory, sessionIDs }),

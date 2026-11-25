@@ -75,7 +75,11 @@ describe("global skill invocation policy", () => {
     expect(ConfigMigrateV1.migrate(legacy).skill_invocation).toEqual(manual)
     for (const schema of [Config.Info, ConfigV1.Info]) {
       expect(() => Schema.decodeUnknownSync(schema)({ skill_invocation: { manual: true } })).toThrow()
-      expect(() => Schema.decodeUnknownSync(schema)({ skill_invocation: { default: "manual" } })).toThrow()
+      // Contract change with optional `manual`: entries-only documents are
+      // valid, and unknown excess keys stay ignored by design.
+      expect(() =>
+        Schema.decodeUnknownSync(schema)({ skill_invocation: { entries: { effect: { invocation: "sometimes" } } } }),
+      ).toThrow()
     }
   })
 

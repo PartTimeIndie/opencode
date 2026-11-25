@@ -54,6 +54,7 @@ const getBase = (appId: string): Configuration => ({
   },
   files: ["out/**/*", "resources/**/*", "!resources/opencode-cli", "!resources/opencode-cli.exe"],
   extraResources: [
+    { from: "resources/icons", to: "icons", filter: ["icon.ico", "icon.png", "dock.png"] },
     { from: "../provider-plugins", to: "plugin-packages/provider", filter: ["release-manifest.json", "*/package.json", "*/dist/**/*"] },
     { from: "../tui-plugins", to: "plugin-packages/tui", filter: ["release-manifest.json", "*/package.json", "*/dist/**/*"] },
     {

@@ -1,12 +1,14 @@
 const ICON = new URL("./assets/prompt-improve.svg", import.meta.url).href
 const LABEL = "Improve current prompt"
-const DEFAULT_SETTINGS = {
+export const DEFAULT_SETTINGS = {
   modelChain: "chain:default",
   promptTemplate: [
     "Rewrite the user's draft prompt for an AI coding assistant.",
     "Return only the improved prompt text, with no preamble, no markdown fence, and no surrounding quotes.",
     "Keep the user's intent, language, constraints, and concrete details. Make it clearer, more specific, and actionable.",
     "Do not add requirements the user did not imply.",
+    "Always format the improved prompt as clean, readable text: separate paragraphs, topics, and requirement groups with blank lines, and use numbered lists for ordered steps and bulleted lists for unordered points, with nested points indented consistently.",
+    "In prose, use Markdown bold sparingly to highlight key requirements, constraints, or warnings. Never bold or otherwise reformat code, commands, file paths, flags, or identifiers; keep them literal and wrap multi-line code in fenced code blocks with a blank line before and after.",
     "",
     "Draft prompt:",
     "{prompt}",
@@ -216,7 +218,7 @@ function normalizePromptTemplate(value) {
   return template || DEFAULT_SETTINGS.promptTemplate
 }
 
-function promptImproveUserPrompt(prompt, template) {
+export function promptImproveUserPrompt(prompt, template) {
   const normalized = normalizePromptTemplate(template)
   if (normalized.includes("{prompt}")) return normalized.replaceAll("{prompt}", prompt)
   return [normalized, "", "Draft prompt:", prompt].join("\n")
@@ -226,13 +228,45 @@ export function promptImproveMaxTokens(prompt) {
   return Math.min(MAX_OUTPUT_TOKENS, Math.max(MIN_OUTPUT_TOKENS, Math.ceil(prompt.length / 2) + 4096))
 }
 
-function cleanImprovedPrompt(text) {
+export function cleanImprovedPrompt(text) {
   const trimmed = unwrapMarkdownFence(text.trim())
   const prompt = stripPromptLabel(promptFromJson(trimmed) ?? trimmed)
-  if ((prompt.startsWith('"') && prompt.endsWith('"')) || (prompt.startsWith("'") && prompt.endsWith("'"))) {
-    return decodeQuotedPrompt(prompt).trim()
+  const unwrapped =
+    (prompt.startsWith('"') && prompt.endsWith('"')) || (prompt.startsWith("'") && prompt.endsWith("'"))
+      ? decodeQuotedPrompt(prompt).trim()
+      : prompt
+  return normalizeImprovedFormatting(unwrapped)
+}
+
+// Guarantees clean spacing for flowing text while keeping fenced code blocks byte-identical.
+function normalizeImprovedFormatting(text) {
+  const out = []
+  let inFence = false
+  let blankRun = 0
+  for (const raw of text.split("\n")) {
+    if (/^\s*```/.test(raw)) {
+      inFence = !inFence
+      blankRun = 0
+      out.push(raw.trim())
+      continue
+    }
+    if (inFence) {
+      blankRun = 0
+      out.push(raw)
+      continue
+    }
+    const line = raw.replace(/[ \t]+$/, "")
+    if (!line) {
+      blankRun++
+      if (blankRun === 1) out.push(line)
+      continue
+    }
+    blankRun = 0
+    out.push(line)
   }
-  return prompt
+  while (out.length && out[0] === "") out.shift()
+  while (out.length && out[out.length - 1] === "") out.pop()
+  return out.join("\n")
 }
 
 function unwrapMarkdownFence(text) {

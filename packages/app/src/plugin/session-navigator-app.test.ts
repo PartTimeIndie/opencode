@@ -24,6 +24,32 @@ beforeEach(() => {
   localStorage.clear()
 })
 
+function mountProjectFixture(projects: Array<{ worktree: string; name: string; icon?: { url: string; color: string } }>, storage = new Map<string, unknown>()) {
+  let mount: DockRegistration["mount"] | undefined
+  navigator.default.app({
+    dock: {
+      state: { item: () => ({}) },
+      register: (input: DockRegistration) => { mount = input.mount },
+      open: { item: () => {} },
+    },
+    kv: { get: (key: string) => storage.get(key), set: (key: string, value: unknown) => storage.set(key, value) },
+    host: {
+      projects: { list: () => projects, subscribe: () => () => {} },
+      sessions: { active: () => [], subscribe: () => () => {}, favorites: { list: () => [], subscribe: () => () => {} } },
+    },
+    client: { experimental: { session: { list: async () => ({ data: [] }) } } },
+  })
+  const element = document.createElement("div")
+  document.body.append(element)
+  const unmount = mount?.({ area: "left", element, signal: new AbortController().signal })
+  return {
+    element,
+    dispose: () => { unmount?.(); element.remove() },
+    paths: () => [...element.querySelectorAll<HTMLButtonElement>(".oc-session-nav__project-toggle")].map((button) => button.title),
+    button: (label: string) => [...element.querySelectorAll("button")].find((button) => (button.getAttribute("aria-label") ?? button.textContent) === label),
+  }
+}
+
 describe("session navigator responsive ordering", () => {
   test("declares the capabilities used by the session navigator", async () => {
     const manifest = await Bun.file(
@@ -38,8 +64,59 @@ describe("session navigator responsive ordering", () => {
       "host:projects",
       "host:navigation",
       "host:sessions",
+      "host:session-attention-read",
       "host:http",
     ])
+  })
+
+  test("renders existing ICO artwork even when the host supplies a fallback color", () => {
+    const ico = "data:image/vnd.microsoft.icon;base64,AAEAAAEAEBA="
+    const setup = mountProjectFixture([
+      { worktree: "C:/test/workspace", name: "Workspace", icon: { url: ico, color: "blue" } },
+      { worktree: "C:/test/other", name: "Other", icon: { url: "data:image/vnd.microsoft.icon,invalid", color: "blue" } },
+    ])
+    try {
+      const [icon, fallback] = setup.element.querySelectorAll(".oc-session-nav__project-toggle")
+      expect(icon.querySelector("img")?.getAttribute("src")).toBe(ico)
+      expect(fallback.querySelector("img")).toBeNull()
+      expect(fallback.querySelector(".oc-session-nav__avatar")?.textContent).toBe("O")
+    } finally {
+      setup.dispose()
+    }
+  })
+
+  test("hides only the selected worktree and restores it across fresh navigator mounts", async () => {
+    const projects = [
+      { worktree: "C:/test/workspace", name: "Workspace" },
+      { worktree: "C:/test/workspace-copy", name: "Workspace copy" },
+      { worktree: "C:/other/workspace", name: "Other workspace" },
+    ]
+    const storage = new Map<string, unknown>()
+    const first = mountProjectFixture(projects, storage)
+    try {
+      first.button("Manage hidden projects")?.click()
+      await Promise.resolve()
+      const hide = first.button("Hide C:/test/workspace in Navigator")
+      expect(hide).toBeDefined()
+      hide?.click()
+      await Promise.resolve()
+      expect(first.button("Show C:/test/workspace in Navigator")).toBeDefined()
+    } finally {
+      first.dispose()
+    }
+    const second = mountProjectFixture(projects, storage)
+    try {
+      expect(second.paths()).toEqual(["C:/test/workspace-copy", "C:/other/workspace"])
+      second.button("Manage hidden projects")?.click()
+      await Promise.resolve()
+      second.button("Show C:/test/workspace in Navigator")?.click()
+      await Promise.resolve()
+      second.button("Manage hidden projects")?.click()
+      await Promise.resolve()
+      expect(second.paths()).toEqual(projects.map((project) => project.worktree))
+    } finally {
+      second.dispose()
+    }
   })
 
   test("falls back to the client when host http is exposed without a capability grant", async () => {
@@ -461,9 +538,51 @@ describe("session navigator global event scope", () => {
 
     expect(session.directory).toBe("C:/GitRepros/PU")
     const puGroup = state.groups.get("C:\\GitRepros\\PU")!
-    expect(puGroup.sessions[0]?.directory).toBe("C:\\GitRepros\\PU")
+    expect(puGroup.sessions[0]?.directory).toBe(session.directory)
     expect(puGroup.sessions[0]).not.toBe(session)
     expect(state.groups.get("global")!.sessions).toEqual([])
+    unsubscribe()
+  })
+
+  test("routes shared-ID events by stored directory and does not infer a workspace from the ID", () => {
+    const handlers = new Map<string, (event: unknown, context: unknown) => void>()
+    const api = {
+      event: {
+        on: (type: string, handler: (event: unknown, context: unknown) => void) => {
+          handlers.set(type, handler)
+          return () => handlers.delete(type)
+        },
+      },
+    }
+    const state = navigatorState(api)
+    const real = "E:/Projects/Repo"
+    const alias = "C:/Projects/Repo"
+    const other = "E:/Clones/Repo"
+    const raw = "e:\\CLONES\\Repo\\"
+    state.groups.clear()
+    state.projects = [
+      { projectID: "shared", worktree: real, sessionDirectories: [real, alias] },
+      { projectID: "shared", worktree: other, sessionDirectories: [other] },
+    ]
+    for (const worktree of [real, other]) {
+      const key = worktree.toLowerCase()
+      state.groups.set(key, group(worktree, `project:${key}`))
+    }
+    const unsubscribe = navigator.subscribeSessionEvents(api, state)
+    const emit = (id: string, directory?: string, scope = "global") => handlers.get("session.updated")!(
+      { properties: { info: { id, directory, projectID: "shared", time: { updated: 42 } } } },
+      { directory: scope },
+    )
+    emit("ses_alias", alias)
+    emit("ses_other", raw, real)
+    emit("ses_missing")
+    emit("ses_unknown", "D:/Third/Repo")
+
+    const rows = (worktree: string) => state.groups.get(worktree.toLowerCase())?.sessions.map((row) => [row.id, row.directory])
+    expect(rows(real)).toEqual([["ses_alias", alias]])
+    expect(rows(other)).toEqual([["ses_other", raw]])
+    expect(state.groups.size).toBe(2)
+    expect(state.recent.sessions).toHaveLength(4)
     unsubscribe()
   })
 

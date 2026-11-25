@@ -4,7 +4,6 @@ import { Layer } from "effect"
 import { BashTool } from "./bash"
 import { BrowserTool } from "./browser"
 import { ApplyPatchTool } from "./apply-patch"
-import { EditTool } from "./edit"
 import { GitStatusTool } from "./git-status"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
@@ -18,7 +17,6 @@ import { SkillTool } from "./skill"
 import { TodoWriteTool } from "./todowrite"
 import { WebFetchTool } from "./webfetch"
 import { WebSearchTool } from "./websearch"
-import { WriteTool } from "./write"
 import { PlanDocumentTool } from "./plan-document"
 import { AgentSwitchTool } from "./agent-switch"
 
@@ -30,16 +28,20 @@ import { AgentSwitchTool } from "./agent-switch"
  * than this static list. The caller intentionally supplies shared Location
  * services once to this merged set.
  *
- * TODO: Port the remaining launch-follow-up leaves deliberately: edit fuzzy
- * parity, LSP,
+ * TODO: Port the remaining launch-follow-up leaves deliberately: LSP,
  * repo_clone, repo_overview, and Rune/code mode. Keep MCP and plugin
  * transforms separate from this static built-in list.
  */
-export const locationLayer = Layer.mergeAll(
+/**
+ * Inspectable composition of every shipped location-scoped tool. The retired
+ * edit/write leaves stay absent by contract (apply_patch is the only shipped
+ * general file-write tool); tool/edit.ts and tool/write.ts remain as legacy
+ * modules for historical display fixtures, never registered here.
+ */
+export const composition = [
   ApplyPatchTool.layer,
   BashTool.layer,
   BrowserTool.layer.pipe(Layer.provide(BrowserTool.defaultBridgeLayer)),
-  EditTool.layer,
   GitStatusTool.layer,
   GlobTool.layer,
   GrepTool.layer,
@@ -52,7 +54,8 @@ export const locationLayer = Layer.mergeAll(
   TodoWriteTool.layer,
   WebFetchTool.layer,
   WebSearchTool.layer.pipe(Layer.provide(WebSearchTool.defaultConfigLayer)),
-  WriteTool.layer,
   PlanDocumentTool.layer,
   AgentSwitchTool.layer,
-)
+] as const
+
+export const locationLayer = Layer.mergeAll(...composition)

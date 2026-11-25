@@ -502,6 +502,114 @@ it.effect("updates global config and omits empty shell key in jsonc", () =>
     ),
   )
 
+  it.effect("applies skill policy patches in global json: set, null-delete, entry cleanup, no null persisted", () =>
+    withGlobalConfig(
+      {
+        config: {
+          model: "test/model",
+          agent: {
+            build: {
+              name: "build",
+              tools: { mode: "explicit", entries: { bash: { visible: true, permission: "allow" } } },
+              skills: { effect: { visible: true, invocation: "ask" } },
+            },
+          },
+        },
+      },
+      ({ dir }) =>
+        Effect.gen(function* () {
+          const result = yield* Config.use.updateGlobal({
+            skill_policy: {
+              global: {
+                effect: { visible: false, invocation: "allow" },
+                locked: { visible: false, invocation: "deny" },
+              },
+              agents: {
+                build: { effect: { visible: null, invocation: "allow" } },
+              },
+            },
+          })
+          expect(result.changed).toBe(true)
+          expect(result.info.skill_invocation).toEqual({
+            entries: {
+              effect: { visible: false, invocation: "allow" },
+              locked: { visible: false, invocation: "deny" },
+            },
+          })
+          expect(result.info.agent?.build?.skills).toEqual({ effect: { invocation: "allow" } })
+
+          // null deletes exactly the stored field; empty entries disappear.
+          yield* Config.use.updateGlobal({
+            skill_policy: {
+              global: { locked: { visible: null, invocation: null } },
+              agents: { build: { effect: { invocation: null } } },
+            },
+          })
+          const written = (yield* FSUtil.use.readJson(path.join(dir, "opencode.json"))) as Record<string, any>
+          expect(written.skill_invocation).toEqual({ entries: { effect: { visible: false, invocation: "allow" } } })
+          expect(written.agent.build.skills).toBeUndefined()
+          // Unrelated stored fields survive untouched.
+          expect(written.agent.build.tools).toEqual({ mode: "explicit", entries: { bash: { visible: true, permission: "allow" } } })
+          expect(written.model).toBe("test/model")
+          const serialized = JSON.stringify(written)
+          expect(serialized).not.toContain("skill_policy")
+          expect(serialized).not.toContain(": null")
+        }),
+    ),
+  )
+
+  it.effect("applies skill policy patches in global jsonc while preserving comments", () =>
+    withGlobalConfig(
+      {
+        name: "opencode.jsonc",
+        config: {
+          model: "test/model",
+          skill_invocation: { manual: ["legacy-skill"] },
+          agent: {
+            build: {
+              name: "build",
+              skills: { effect: { visible: true, invocation: "ask" } },
+            },
+          },
+        },
+      },
+      ({ dir }) =>
+        Effect.gen(function* () {
+          const file = path.join(dir, "opencode.jsonc")
+          yield* FSUtil.use.writeFileString(
+            file,
+            (yield* FSUtil.use.readFileString(file)).replace('"model":', '// keep this comment\n  "model":'),
+          )
+
+          yield* Config.use.updateGlobal({
+            skill_policy: {
+              global: { "toolbar-skill": { visible: false, invocation: "allow" }, "legacy-skill": { invocation: null } },
+              agents: { build: { effect: { invocation: "allow" } } },
+            },
+          })
+
+          const written = yield* FSUtil.use.readFileString(file)
+          const parsed = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(written, file), file)
+          expect(written).toContain("// keep this comment")
+          expect(parsed.skill_invocation?.manual).toEqual(["legacy-skill"])
+          expect(parsed.skill_invocation?.entries).toEqual({
+            "toolbar-skill": { visible: false, invocation: "allow" },
+          })
+          expect(parsed.agent?.build?.skills).toEqual({ effect: { visible: true, invocation: "allow" } })
+          expect(written).not.toContain("null")
+        }),
+    ),
+  )
+
+  it.effect("preserves unrecognized global keys while saving known settings", () =>
+    withGlobalConfig({ config: { model: "test/model" } }, ({ dir }) => Effect.gen(function* () {
+      const file = path.join(dir, "opencode.json")
+      yield* FSUtil.use.writeFileString(file, JSON.stringify({ model: "test/model", future_setting: { keep: true } }))
+      yield* Config.use.updateGlobal({ username: "saved" })
+      expect(yield* FSUtil.use.readJson(file)).toMatchObject({ model: "test/model", username: "saved", future_setting: { keep: true } })
+    })),
+  )
+
   it.effect("serializes concurrent global config writes from multiple clients", () =>
     withGlobalConfig(
       {
@@ -765,7 +873,7 @@ describe("agent tool policy precedence", () => {
   } as const
 
   for (const mode of ["explicit", "inherit"] as const) {
-    it.live(`replaces structured tool policies from project JSON (${mode})`, () =>
+    it.live(`merges inherited overrides and replaces explicit project JSON policies (${mode})`, () =>
       withConfigTree(
         {
           global,
@@ -779,7 +887,10 @@ describe("agent tool policy precedence", () => {
         },
         Effect.gen(function* () {
           const build = (yield* Config.use.get()).agent?.build
-          const tools = { mode, entries: { read: { visible: true, permission: "ask" } } } as const
+          const tools = { mode, entries: {
+            ...(mode === "inherit" ? global.agent.build.tools.entries : {}),
+            read: { visible: true, permission: "ask" },
+          } } as const
           expect(build?.tools).toEqual(tools)
           expect(build?.options?.__agentTools).toEqual(tools)
           expect(build?.options?.custom).toBe("preserved")
@@ -803,8 +914,9 @@ describe("agent tool policy precedence", () => {
           },
           Effect.gen(function* () {
             const build = (yield* Config.use.get()).agent?.build
-            expect(build?.tools).toEqual({ mode })
-            expect(build?.options?.__agentTools).toEqual({ mode })
+            const tools = mode === "inherit" ? { mode, entries: global.agent.build.tools.entries } : { mode }
+            expect(build?.tools).toEqual(tools)
+            expect(build?.options?.__agentTools).toEqual(tools)
             expect(build?.options?.custom).toBe("preserved")
           }),
         ),
@@ -1044,7 +1156,7 @@ tools:
     ),
   )
 
-  it.live("replaces inherit-policy entries while preserving separate permission restrictions", () =>
+  it.live("inherits tool-policy restrictions alongside sparse project overrides", () =>
     withConfigTree(
       {
         global: {
@@ -1059,7 +1171,7 @@ tools:
       },
       Effect.gen(function* () {
         const build = (yield* Config.use.get()).agent?.build
-        expect(build?.tools).toEqual({ mode: "inherit", entries: { read: { permission: "ask" } } })
+        expect(build?.tools).toEqual({ mode: "inherit", entries: { bash: { permission: "deny" }, read: { permission: "ask" } } })
         expect(build?.options?.__agentTools).toEqual(build?.tools)
         expect(build?.permission?.bash).toBe("deny")
       }),
@@ -1321,6 +1433,19 @@ it.effect("global config update invalidates loaded instance config", () =>
       expect((yield* Config.use.get()).optimization?.profile).toBe("off")
     }),
   ),
+)
+
+it.instance(
+  "project saves preserve unknown keys and JSONC comments in the same document",
+  Effect.gen(function* () {
+    const instance = yield* TestInstance
+    const file = path.join(instance.directory, ".opencode", "opencode.json")
+    yield* FSUtil.use.writeWithDirs(file, '// keep future settings\n{ "future_setting": { "keep": true }, "username": "before" }')
+    yield* Config.use.update({ username: "after" })
+    const written = yield* FSUtil.use.readFileString(file)
+    expect(written).toContain("// keep future settings")
+    expect(ConfigParse.jsonc(written, file)).toMatchObject({ username: "after", future_setting: { keep: true } })
+  }),
 )
 
 it.instance(

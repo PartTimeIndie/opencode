@@ -302,6 +302,68 @@ describe("ReadTool", () => {
     ),
   )
 
+  it.live("renders explicitly requested full lines with bounded UTF-8 pages and the whole-file hash", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const target = path.join(tmp.path, "long.txt")
+          const long = "😀ü".repeat(3000)
+          const content = `before\r\n${long}\r\nafter\r\n`
+          yield* Effect.promise(() => Bun.write(target, content))
+          const page = yield* ReadToolFileSystem.read(fs, target, "long.txt", { offset: 2, limit: 1, fullLines: true })
+          expect(page).toMatchObject({
+            type: "text-page",
+            content: long,
+            fullLines: true,
+            truncated: true,
+            next: 3,
+            sha256: createHash("sha256").update(content).digest("hex"),
+          })
+          const rendered = ReadTool.toModelOutput({ path: "long.txt" }, page)
+          expect(rendered).toHaveLength(1)
+          expect(rendered[0]).toMatchObject({ type: "text", text: expect.stringContaining(`2: ${long}\n`) })
+          const defaultPage = yield* ReadToolFileSystem.read(fs, target, "long.txt", { offset: 2, limit: 1 })
+          expect(defaultPage.content).toContain(ReadToolFileSystem.MAX_LINE_SUFFIX)
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("pages full lines at the byte limit and refuses a line too large to render", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const target = path.join(tmp.path, "budget.txt")
+          const long = "ü".repeat(ReadToolFileSystem.MAX_READ_BYTES / 2)
+          yield* Effect.promise(() => Bun.write(target, `${long}\ntail\n`))
+          expect(yield* ReadToolFileSystem.read(fs, target, "budget.txt", { fullLines: true })).toMatchObject({
+            content: long,
+            truncated: true,
+            next: 2,
+            fullLines: true,
+          })
+          expect(yield* ReadToolFileSystem.read(fs, target, "budget.txt", { offset: 2, fullLines: true })).toMatchObject({
+            content: "tail",
+            truncated: false,
+          })
+          yield* Effect.promise(() => Bun.write(target, `${long}ü\n`))
+          const error = yield* ReadToolFileSystem.read(fs, target, "budget.txt", { fullLines: true }).pipe(Effect.flip)
+          expect(error).toBeInstanceOf(ReadToolFileSystem.FullLineLimitError)
+          expect(error.message).toContain("51200")
+          // The streaming path must also refuse a line spanning multiple 64 KiB reads.
+          yield* Effect.promise(() => Bun.write(target, "x".repeat(130_000)))
+          expect(
+            yield* ReadToolFileSystem.read(fs, target, "budget.txt", { fullLines: true }).pipe(Effect.flip),
+          ).toBeInstanceOf(ReadToolFileSystem.FullLineLimitError)
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("reports invalid UTF-8 text as a binary file error instead of an encoder defect", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -532,10 +594,15 @@ describe("ReadTool", () => {
       expect(settled.outputPaths).toBeUndefined()
       expect(durableFile(settled.result)).toMatchObject({ mime: "image/png", name: "large.png" })
       const metadata = settled.output?.structured as {
-        $opencode?: { type?: string; uri?: string; mime?: string }
+        content?: { $opencode?: { type?: string; uri?: string; mime?: string; sizeBytes?: number } }
       }
-      expect(metadata.$opencode).toMatchObject({ type: "content-reference", mime: "application/json" })
-      expect(metadata.$opencode?.uri).toStartWith("attachment://")
+      expect(metadata.content?.$opencode).toMatchObject({
+        type: "content-reference",
+        mime: "image/png",
+        sizeBytes: Buffer.from(png, "base64").byteLength,
+        uri: durableFile(settled.result).uri,
+      })
+      expect(JSON.stringify(settled.output)).not.toContain(png)
       if (!settled.output) return
       expect((yield* materialize(settled.output)).content).toEqual([
         { type: "text", text: "Image read successfully" },
@@ -758,6 +825,51 @@ describe("ReadTool", () => {
         }),
       ).toEqual({ type: "error", value: "Unable to read README.md" })
       expect(readCalls).toEqual([])
+    }),
+  )
+
+  it.effect("authorizes full-line mode normally and preserves its typed byte-limit refusal", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      allow = false
+      expect(
+        yield* executeTool(registry, {
+          sessionID,
+          ...toolIdentity,
+          call: { type: "tool-call", id: "full-denied", name: "read", input: { path: "long.txt", fullLines: true } },
+        }),
+      ).toEqual({ type: "error", value: "Unable to read long.txt" })
+      expect(readCalls).toEqual([])
+      allow = true
+      readFailure = new ReadToolFileSystem.FullLineLimitError("long.txt", 2)
+      expect(
+        yield* executeTool(registry, {
+          sessionID,
+          ...toolIdentity,
+          call: {
+            type: "tool-call",
+            id: "full-limit",
+            name: "read",
+            input: { path: "long.txt", offset: 2, limit: 1, fullLines: true },
+          },
+        }),
+      ).toEqual({ type: "error", value: readFailure.message })
+      expect(readCalls).toEqual([readCall("long.txt", { offset: 2, limit: 1, fullLines: true })])
+    }),
+  )
+
+  it.effect("rejects full-line mode for directory listings", () =>
+    Effect.gen(function* () {
+      resolvedType = "directory"
+      const registry = yield* ToolRegistry.Service
+      expect(
+        yield* executeTool(registry, {
+          sessionID,
+          ...toolIdentity,
+          call: { type: "tool-call", id: "full-directory", name: "read", input: { path: "src", fullLines: true } },
+        }),
+      ).toEqual({ type: "error", value: "fullLines is supported only for text files, not directories" })
+      expect(listCalls).toEqual([])
     }),
   )
 

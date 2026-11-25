@@ -14,11 +14,11 @@ const modelList = agents.map((agent) => ({ ...provider.models[agent.model.modelI
 
 type SwitchAgentInput = { sessionID: string; agent: string; model?: unknown }
 
-function sessionInfo(agent: string, modelID: string, updated: number) {
+function sessionInfo(agent: string, modelID: string, updated: number, chainID?: string) {
   return {
     id: "ses_local_selection",
     agent,
-    model: { providerID: provider.id, id: modelID },
+    model: { providerID: provider.id, id: modelID, ...(chainID ? { chain: { id: chainID } } : {}) },
     time: { created: 1, updated },
   }
 }
@@ -27,6 +27,18 @@ type SessionInfo = ReturnType<typeof sessionInfo>
 
 function createModels() {
   const allModels = new Map(modelList.map((item) => [`${item.provider.id}:${item.id}`, item]))
+  const chains = [
+    {
+      id: "chain-build",
+      name: "Build Chain",
+      steps: [
+        { providerID: provider.id, modelID: "build-model" },
+        { providerID: provider.id, modelID: "review-model" },
+      ],
+    },
+    { id: "chain-plan", name: "Plan Chain", steps: [{ providerID: provider.id, modelID: "plan-model" }] },
+  ]
+  let selectedChainID: string | undefined
   return {
     ready: () => true,
     list: () => modelList,
@@ -37,15 +49,18 @@ function createModels() {
     variant: { get: () => undefined, set() {} },
     selection: { model: () => undefined, setModel() {}, setVariant() {} },
     chain: {
-      list: () => [],
-      find: () => undefined,
+      list: () => chains,
+      find: (id?: string) => chains.find((chain) => chain.id === id),
       default: () => undefined,
-      select() {},
+      select(chainID?: string) {
+        selectedChainID = chainID
+      },
       setDefault() {},
       save() {},
       remove() {},
       move() {},
     },
+    selectedChain: () => selectedChainID,
   }
 }
 
@@ -179,6 +194,7 @@ function setup(
   })
   return {
     local: () => local,
+    models,
     setSession(info: SessionInfo) {
       sessions.set(info.id, info)
       setSessionVersion((version) => version + 1)
@@ -436,5 +452,127 @@ describe("LocalProvider agent selection ACK reconciliation", () => {
     second.resolve()
     await selection.session.settled()
     expect(selection.agent.current()?.name).toBe("review")
+  })
+})
+
+const handoffSnapshot = { agent: "build", chainID: "chain-build" }
+
+const chainSource = (agent: string, modelID: string, chainID: string, updatedAt: number) => ({
+  sessionID: "ses_local_selection",
+  agent,
+  model: { providerID: provider.id, modelID, chain: { id: chainID } },
+  updatedAt,
+})
+
+describe("LocalProvider confirmed agent-handoff selection", () => {
+  test("propagates a confirmed handoff selection to a second provider of the same session", async () => {
+    const directory = `/handoff-propagate-${++fixtureID}`
+    const popup = setup(async () => undefined, undefined, directory).local()
+    const composer = setup(async () => undefined, undefined, directory).local()
+
+    popup.session.restore(chainSource("plan", "plan-model", "chain-plan", 100), { force: true })
+    composer.session.restore(chainSource("plan", "plan-model", "chain-plan", 100), { force: true })
+    expect(composer.agent.current()?.name).toBe("plan")
+    expect(composer.model.chain.selected()).toBe("chain-plan")
+
+    expect(popup.session.handoff.begin("ses_local_selection", handoffSnapshot)).toBe(true)
+    popup.session.handoff.commit("ses_local_selection", handoffSnapshot)
+    await Promise.resolve()
+
+    expect(composer.agent.current()?.name).toBe("build")
+    expect(composer.model.chain.selected()).toBe("chain-build")
+    expect(composer.model.chain.current()?.name).toBe("Build Chain")
+    expect(popup.agent.current()?.name).toBe("build")
+    expect(popup.model.chain.selected()).toBe("chain-build")
+  })
+
+  test("locks the session pickers while pending and releases them after the transition settles", async () => {
+    const { local, models, setSession } = setup(async () => undefined)
+    const selection = local()
+    selection.session.restore(source("plan", "plan-model", 100), { force: true })
+
+    expect(selection.session.handoff.begin("ses_local_selection", handoffSnapshot)).toBe(true)
+    expect(selection.session.handoff.busy()).toBe(true)
+
+    selection.agent.set("review")
+    selection.model.set({ providerID: provider.id, modelID: "review-model" })
+    selection.model.chain.set("chain-plan")
+    selection.model.variant.set("high")
+    await Promise.resolve()
+
+    expect(selection.agent.current()?.name).toBe("plan")
+    expect(selection.model.selected()?.modelID).toBe("plan-model")
+    expect(models.selectedChain()).toBeUndefined()
+    expect(selection.session.handoff.begin("ses_local_selection", handoffSnapshot)).toBe(false)
+
+    selection.session.handoff.commit("ses_local_selection", handoffSnapshot)
+    expect(selection.session.handoff.busy()).toBe(false)
+    await Promise.resolve()
+    expect(selection.agent.current()?.name).toBe("build")
+    expect(selection.model.chain.selected()).toBe("chain-build")
+
+    // A later manual pick is a new generation and must be accepted.
+    selection.model.set({ providerID: provider.id, modelID: "review-model" })
+    await Promise.resolve()
+    expect(selection.model.selected()?.modelID).toBe("review-model")
+    expect(selection.model.chain.selected()).toBeUndefined()
+
+    // The consumed snapshot must not clobber the manual pick on later store touches.
+    setSession(sessionInfo("build", "review-model", 103))
+    await Promise.resolve()
+    expect(selection.model.selected()?.modelID).toBe("review-model")
+    expect(selection.model.chain.selected()).toBeUndefined()
+  })
+
+  test("does not lock sibling sessions of another route", async () => {
+    const directory = `/handoff-sibling-${++fixtureID}`
+    const locked = setup(async () => undefined, undefined, directory, "ses_locked").local()
+    const sibling = setup(async () => undefined, undefined, directory, "ses_sibling").local()
+
+    locked.session.restore(source("plan", "plan-model", 100), { force: true })
+    locked.session.handoff.begin("ses_locked", handoffSnapshot)
+    expect(locked.session.handoff.busy()).toBe(true)
+    expect(sibling.session.handoff.busy()).toBe(false)
+
+    sibling.agent.set("review")
+    await Promise.resolve()
+    expect(sibling.agent.current()?.name).toBe("review")
+    expect(locked.agent.current()?.name).toBe("plan")
+  })
+
+  test("applies an uncertain handoff only after canonical session data confirms it", async () => {
+    const { local, setSession } = setup(async () => undefined)
+    const selection = local()
+    selection.session.restore(chainSource("plan", "plan-model", "chain-plan", 100), { force: true })
+
+    selection.session.handoff.begin("ses_local_selection", handoffSnapshot)
+    selection.session.handoff.uncertain("ses_local_selection")
+    await Promise.resolve()
+    expect(selection.agent.current()?.name).toBe("plan")
+    expect(selection.model.chain.selected()).toBe("chain-plan")
+
+    setSession(sessionInfo("plan", "plan-model", 101, "chain-plan"))
+    await Promise.resolve()
+    expect(selection.agent.current()?.name).toBe("plan")
+
+    setSession(sessionInfo("build", "build-model", 102, "chain-build"))
+    await Promise.resolve()
+    expect(selection.agent.current()?.name).toBe("build")
+    expect(selection.model.chain.selected()).toBe("chain-build")
+  })
+
+  test("a remounted provider adopts the committed handoff snapshot", async () => {
+    const directory = `/handoff-remount-${++fixtureID}`
+    const first = setup(async () => undefined, undefined, directory).local()
+    first.session.restore(chainSource("plan", "plan-model", "chain-plan", 100), { force: true })
+    first.session.handoff.begin("ses_local_selection", handoffSnapshot)
+    first.session.handoff.commit("ses_local_selection", handoffSnapshot)
+    await Promise.resolve()
+    mounted.pop()!()
+
+    const second = setup(async () => undefined, undefined, directory).local()
+    await Promise.resolve()
+    expect(second.agent.current()?.name).toBe("build")
+    expect(second.model.chain.selected()).toBe("chain-build")
   })
 })

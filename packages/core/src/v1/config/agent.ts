@@ -4,6 +4,7 @@ import { Option, Schema, SchemaGetter } from "effect"
 import { PositiveInt } from "../../schema"
 import { ConfigPermissionV1 } from "./permission"
 import { ConfigAgent } from "../../config/agent"
+import { ConfigSkillInvocation } from "../../config/skill-invocation"
 import { PermissionSchema } from "../../permission/schema"
 
 const Color = Schema.Union([
@@ -39,6 +40,8 @@ const StructuredTools = Schema.Struct({
 })
 const decodeStructuredTools = Schema.decodeUnknownOption(StructuredTools)
 
+const StructuredSkills = Schema.Record(Schema.String, ConfigSkillInvocation.SkillEntry)
+
 const AgentSchema = Schema.StructWithRest(
   Schema.Struct({
     model: Schema.optional(Schema.String),
@@ -58,6 +61,7 @@ const AgentSchema = Schema.StructWithRest(
       }),
     ),
     tools: Schema.optional(Schema.Union([Schema.Record(Schema.String, Schema.Boolean), StructuredTools])),
+    skills: Schema.optional(StructuredSkills),
     disable: Schema.optional(Schema.Boolean),
     disabled: Schema.optional(Schema.Boolean),
     description: Schema.optional(Schema.String).annotate({ description: "Description of when to use the agent" }),
@@ -108,6 +112,7 @@ const KNOWN_KEYS = new Set([
   "disable",
   "disabled",
   "tools",
+  "skills",
   "permissions",
 ])
 

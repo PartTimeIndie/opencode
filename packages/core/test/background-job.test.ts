@@ -4,6 +4,58 @@ import { Deferred, Effect, Exit, Scope } from "effect"
 import { it } from "./lib/effect"
 
 describe("BackgroundJob", () => {
+  it.live("attests owner cleanup only after job-scope finalizers and refuses replacement until then", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const cleanup = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const attested = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      const job = yield* jobs.start({
+        id: "cleanup-fence",
+        type: "test",
+        onSettled: Deferred.succeed(attested, undefined).pipe(Effect.asVoid),
+        run: Effect.addFinalizer(() =>
+          Deferred.succeed(cleanup, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(Effect.as("done")),
+      })
+      yield* Deferred.await(cleanup).pipe(Effect.timeout("1 second"))
+      expect(yield* Deferred.isDone(attested)).toBe(false)
+      let replacements = 0
+      const rejected = yield* jobs.start({
+        id: job.id,
+        type: "test",
+        run: Effect.sync(() => {
+          replacements++
+          return "replacement"
+        }),
+      })
+      expect(rejected).toMatchObject({ accepted: false })
+      expect(replacements).toBe(0)
+      yield* Deferred.succeed(release, undefined)
+      yield* Deferred.await(attested).pipe(Effect.timeout("1 second"))
+    }).pipe(Effect.provide(BackgroundJob.layer)),
+  )
+
+  it.live("accepts a new generation after scope drain even while the old acknowledgement returns", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const acknowledged = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      yield* jobs.start({
+        id: "acknowledgement-window",
+        type: "test",
+        onSettled: Deferred.succeed(acknowledged, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        run: Effect.succeed("first"),
+      })
+      yield* Deferred.await(acknowledged).pipe(Effect.timeout("1 second"))
+      const next = yield* jobs.start({ id: "acknowledgement-window", type: "test", run: Effect.succeed("second") })
+      expect(next).toMatchObject({ accepted: true })
+      expect((yield* jobs.wait({ id: next.id })).info).toMatchObject({ output: "second" })
+    }).pipe(Effect.provide(BackgroundJob.layer)),
+  )
+
   it.live("tracks process-local work through explicit observation", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -25,6 +77,25 @@ describe("BackgroundJob", () => {
         timedOut: false,
         info: { status: "completed", output: "done" },
       })
+    }).pipe(Effect.provide(BackgroundJob.layer)),
+  )
+
+  it.live("cancellation waits only for its own generation when acknowledgement installs a successor", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      yield* jobs.start({ id: "cancel-generation", type: "test",
+        onSettled: jobs.start({ id: "cancel-generation", type: "test",
+          run: Deferred.await(release).pipe(Effect.as("successor")),
+        }).pipe(Effect.tap((receipt) => Effect.sync(() => expect(receipt.accepted).toBe(true))), Effect.asVoid),
+        run: Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      })
+      yield* Deferred.await(started)
+      expect(yield* jobs.cancel("cancel-generation").pipe(Effect.timeout("1 second")))
+        .toMatchObject({ status: "cancelled" })
+      expect(yield* jobs.get("cancel-generation")).toMatchObject({ status: "running" })
     }).pipe(Effect.provide(BackgroundJob.layer)),
   )
 

@@ -41,15 +41,23 @@ test("inactive dock title, avatar state, and prefetch come from the tab server",
   const tabB = page.getByRole("tab", { name: new RegExp(titleB) })
   await expectAppVisible(tabA)
   await expectAppVisible(tabB)
-  await expect(tabA.locator('[data-component="project-avatar-v2"]')).toHaveAttribute("data-unread", "")
-  await expect(tabB.locator('[data-component="project-avatar-v2"]')).not.toHaveAttribute("data-unread", "")
+  // data-unread is also the spinner overflow hook; assert the actual attention
+  // marker so a working tab is not mistaken for an unread question.
+  await expectAppVisible(tabA.locator('[data-slot="project-avatar-unread-dot"][data-status="question"]'))
+  await expect(tabB.locator('[data-slot="project-avatar-unread-dot"]')).toHaveCount(0)
   await expect(tabA.locator('[data-slot="project-avatar-loader"]')).toHaveCount(0)
   await expect
     .poll(() => requests.some((request) => request.server === "B" && request.method === "GET" && request.path === "/session/status"))
     .toBe(true)
   const runningIndicator = tabB.locator('[data-slot="project-avatar-loader"]')
   await expectAppVisible(runningIndicator)
-  expect(await runningIndicator.evaluate((element) => element.getAnimations({ subtree: true }).length)).toBe(0)
+  await expect.poll(() => runningIndicator.evaluate((element) =>
+    element.getAnimations({ subtree: true }).map((animation) => (animation as CSSAnimation).animationName),
+  )).toEqual(["project-avatar-v2-loading-spin"])
+  await page.emulateMedia({ reducedMotion: "reduce" })
+  await expect.poll(() => runningIndicator.evaluate((element) =>
+    element.getAnimations({ subtree: true }).map((animation) => (animation as CSSAnimation).animationName),
+  )).toEqual(["project-avatar-v2-loading-pulse"])
   expect(
     requests.some(
       (request) => request.server === "B" && request.method === "GET" && request.path === `/session/${sessionID}`,
@@ -102,12 +110,14 @@ test("dock overflow and context menus share bulk close actions", async ({ page }
     "Add to favorites",
     "Copy session ID",
     "Close All Tabs",
+    "Close All Inactive Tabs",
     "Close All to Left",
     "Close All to Right",
     "Close All but This",
     "Archive",
     "Delete",
   ])
+  await expect(page.locator('[role="menu"]:visible')).toHaveCSS("opacity", "1")
   await page.screenshot({ path: "test-results/session-dock-context-menu.png" })
   await page.keyboard.press("Escape")
   await page.setViewportSize({ width: 800, height: 844 })
@@ -145,6 +155,34 @@ for (const scenario of [
       await page
         .locator('[data-dock-area]:not([data-dock-area="middle"]) [data-dock-tab]')
         .evaluateAll((tabs) => tabs.map((tab) => tab.getAttribute("data-dock-tab"))),
+    ).toEqual(otherTabsBefore)
+    expectNoSmokeErrors(errors, [], [])
+  })
+}
+
+for (const selected of [titleA, titleB]) {
+  test(`close all inactive tabs keeps working tabs when ${selected} is selected`, async ({ page }) => {
+    const errors = trackPageErrors(page)
+    await page.setViewportSize({ width: 1600, height: 900 })
+    await setup(page, { questions: false })
+    const middle = page.locator('[data-dock-area="middle"]')
+    const idleTab = middle.getByRole("tab", { name: new RegExp(titleA) })
+    const workingTab = middle.getByRole("tab", { name: new RegExp(titleB) })
+    await middle.getByRole("tab", { name: new RegExp(selected) }).click()
+    await expectAppVisible(workingTab.locator('[data-slot="project-avatar-loader"]'))
+    await expect(idleTab.locator('[data-slot="project-avatar-loader"]')).toHaveCount(0)
+    const otherTabsBefore = await page
+      .locator('[data-dock-area]:not([data-dock-area="middle"]) [data-dock-tab]')
+      .evaluateAll((tabs) => tabs.map((tab) => tab.getAttribute("data-dock-tab")))
+    await middle.locator("[data-dock-tab]").filter({ has: page.getByRole("tab", { name: new RegExp(titleB) }) })
+      .locator('[data-action="session-tab-menu"]').click()
+    await page.getByRole("menuitem", { name: "Close All Inactive Tabs" }).click()
+
+    await expectAppVisible(workingTab)
+    await expect(idleTab).toHaveCount(0)
+    expect(await page
+      .locator('[data-dock-area]:not([data-dock-area="middle"]) [data-dock-tab]')
+      .evaluateAll((tabs) => tabs.map((tab) => tab.getAttribute("data-dock-tab"))),
     ).toEqual(otherTabsBefore)
     expectNoSmokeErrors(errors, [], [])
   })
@@ -215,7 +253,7 @@ test("deleting the inactive server B tab never deletes or closes server A", asyn
   expectNoSmokeErrors(errors, [], [])
 })
 
-async function setup(page: Page) {
+async function setup(page: Page, options: { questions?: boolean } = {}) {
   const requests: SessionRequest[] = []
   page.on("request", (request) => recordSessionRequest(request, requests))
 
@@ -228,7 +266,7 @@ async function setup(page: Page) {
     onSessionCreate: () => session("New session A", "project-a", "ses_new_server_a"),
     onSessionUpdate: ({ body }) => updatedSession(body, titleA, "project-a"),
     pageMessages: () => ({ items: [] }),
-    questions: () => [question()],
+    questions: () => options.questions === false ? [] : [question()],
     sessionStatus: { [sessionID]: { type: "idle" } },
   })
   await mockOpenCodeServer(page, {
@@ -240,6 +278,7 @@ async function setup(page: Page) {
     onSessionCreate: () => session("New session B", "project-b", "ses_new_server_b"),
     onSessionUpdate: ({ body }) => updatedSession(body, titleB, "project-b"),
     pageMessages: () => ({ items: [] }),
+    questions: () => [],
     sessionStatus: { [sessionID]: { type: "busy" } },
   })
 

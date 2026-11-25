@@ -11,6 +11,13 @@ When diagnosing OpenCode slowness or high resource usage, choose the relevant re
 7. Check renderer event pressure: measure SSE/EventV2 bursts for the slow session, including event count per turn, active session count, V2 delta type mix, and whether inactive timelines are mounted. Streams with thousands of text/reasoning/tool deltas can be renderer-bound even when CPU, DB, and migrations look healthy.
 8. Classify the most likely bottleneck: CPU, I/O, DB history, parallel runners, single-session context pressure, or renderer event bursts. Report the winner with measured numbers and PowerShell exit codes.
 
+### Large native form input latency
+
+- Measure input/change/click to the next rendered frame in the real built renderer with isolated API data. Capture long tasks and a CPU profile before blaming model/network latency; distinguish profiling overhead and source builds from installed desktop behavior.
+- Single-field rendering, visibility conditions and validation must read that field directly. Never build a complete `Object.fromEntries(form.fields.map(...))` snapshot for each field: validation becomes quadratic and every control subscribes to every other value. Keep complete snapshots at answer/action boundaries only.
+- Batch synchronous local action writes so one gesture does not trigger intermediate renders. Preserve the original pre-action expression snapshot, step ordering, callbacks, validation and submitted values; performance is not permission to change those semantics.
+- Regression gates: `test-browser/question-form-values.test.ts` verifies field-local dependencies and linear reads; `e2e/regression/question-form-latency.spec.ts` verifies real typing latency, conditional layout, bounds, ordered local actions and full answer preservation on a portable500-field fixture. Functional success alone is not responsive-input evidence.
+
 ### Renderer memory exhaustion and blank windows
 
 - Check `render-process-gone` for `reason: 'oom'` before treating a black window as a GPU/presentation fault. Repainting a dead renderer cannot repair memory exhaustion.
@@ -31,6 +38,7 @@ When diagnosing OpenCode slowness or high resource usage, choose the relevant re
 ### Speech-to-text latency
 
 - Read the renderer's `[speech-to-text] timings` first. Separate preparation, transcription, improvement and insertion; automatic improvement runs before insertion and can dominate the wait even with fast ASR.
+- Classify `[speech-to-text] failed phase=` before blaming insertion: `improving` with "output token budget exhausted" is the improvement model spending its whole output budget on reasoning (model/variant setting, not focus or insertion); `insert=0ms` timings mean Send mode, where the send preparation owns the insertion, while a real external insertion takes roughly 1–2 s of PowerShell helper time. "automatic clipboard copy failed" only means the renderer was unfocused (the desktop host clipboard write covers it). External insertion into covered, minimized and foreign-foreground windows is proven by the opt-in live test `OPENCODE_LIVE_INPUT_TEST=1 bun test src/main/windows-foreground-input.test.ts` from `packages/desktop` (opens two short-lived test windows); insertion failures are logged in `main.log` as `desktop text insertion failed`.
 - Compare the same authorized recording repeatedly in rotated model order. Reject truncated transcripts and unintended translations as speed winners. Report both direct-provider and real host/UI timings; they are not interchangeable.
 - Successful dictation audio is not archived by the Speech plugin. For an explicit diagnostic recording, run `bun run script/speech-recorder.ts` from `packages/opencode`; its loopback-only page saves a private fixture under `.agent-tmp/speech-benchmark`. Never commit audio, auth files or raw private transcripts.
 - Some OpenRouter ASR endpoints are absent from its text-model catalog. Declare explicit audio-input/transcription-output model capabilities and verify the live `/provider` catalog before accepting an `Unknown transcription model` fix. Check the exact endpoint ID, including suffixes such as `-stt`.

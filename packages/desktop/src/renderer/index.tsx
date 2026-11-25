@@ -30,6 +30,7 @@ import { availableStartupServer, readyWslConnections } from "./wsl/connections"
 import "./styles.css"
 import { Splash } from "@opencode-ai/ui/logo"
 import { useTheme } from "@opencode-ai/ui/theme/context"
+import { ServerStatus } from "./server-status"
 
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
@@ -246,6 +247,7 @@ const createPlatform = (): Platform => {
     },
 
     storage,
+    sessionAttention: window.api.sessionAttention,
 
     updater: {
       state: updaterState,
@@ -307,6 +309,7 @@ const createPlatform = (): Platform => {
 
     webviewZoom,
     embeddedBrowser: "webview",
+    browserTransfer: (action, id, ticket) => window.api.browserTransfer(action, id, ticket),
 
     getPinchZoomEnabled: () => window.api.getPinchZoomEnabled(),
 
@@ -348,6 +351,8 @@ const createPlatform = (): Platform => {
       }
     },
 
+    writeClipboardText: (text) => window.api.writeClipboardText(text),
+
     checkAppExists: async (appName: string) => {
       return window.api.checkAppExists(appName)
     },
@@ -388,7 +393,7 @@ render(() => {
 
   const [windowCount] = createResource(() => window.api.getWindowCount())
 
-  // Fetch sidecar credentials (available immediately, before health check)
+  // Wait for verified sidecar health before mounting API-backed providers.
   const [sidecar] = createResource(() => window.api.awaitInitialization())
 
   const [defaultServer] = createResource(() => platform.getDefaultServer?.())
@@ -473,6 +478,7 @@ render(() => {
   return (
     <PlatformProvider value={platform}>
       <AppBaseProviders locale={locale.latest}>
+        <ServerStatus />
         <Show when={true}>{(_) => <App />}</Show>
       </AppBaseProviders>
     </PlatformProvider>

@@ -3,6 +3,9 @@ import { existsSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ShellEnvironment } from "@opencode-ai/core/shell-environment"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { bootstrap as cliBootstrap } from "../../src/cli/bootstrap"
 import { InstanceLayer } from "../../src/project/instance-layer"
@@ -11,7 +14,7 @@ import { disposeAllInstances, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { waitGlobalBusEvent } from "../server/global-bus"
 
-const it = testEffect(Layer.mergeAll(InstanceLayer.layer, CrossSpawnSpawner.defaultLayer))
+const it = testEffect(Layer.mergeAll(InstanceLayer.layer, CrossSpawnSpawner.defaultLayer, LocationServiceMap.layer))
 
 // InstanceBootstrap must run before any code touches the instance —
 // originally tracked by PRs #25389 and #25449, now a permanent
@@ -38,6 +41,7 @@ const bootstrapFixture = Effect.gen(function* () {
         "  config: async () => {",
         '    await Bun.write(MARKER, "ran")',
         "  },",
+        '  "shell.env": (input, output) => { output.env.BINDING = input.sessionID + ":" + input.callID },',
         "})",
         "",
       ].join("\n"),
@@ -80,6 +84,19 @@ it.live("CLI bootstrap runs InstanceBootstrap before callback", () =>
     yield* Effect.promise(() => cliBootstrap(tmp.directory, async () => "ok"))
 
     expect(existsSync(tmp.marker)).toBe(true)
+  }),
+)
+
+it.live("InstanceStore bootstrap registers shell.env before use without explicit Plugin.init", () =>
+  Effect.gen(function* () {
+    const tmp = yield* bootstrapFixture
+    const store = yield* InstanceStore.Service
+    const environment = yield* ShellEnvironment.Service
+    const env = yield* store.provide({ directory: tmp.directory }, environment.get({
+        directory: tmp.directory, cwd: tmp.directory,
+        sessionID: SessionSchema.ID.make("ses_bootstrap_fixture"), callID: "bootstrap",
+      }))
+    expect(env).toEqual({ BINDING: "ses_bootstrap_fixture:bootstrap" })
   }),
 )
 

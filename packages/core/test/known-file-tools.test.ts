@@ -6,6 +6,10 @@ import { sql } from "drizzle-orm"
 import { FileMutationPendingTable } from "@opencode-ai/core/file-knowledge.sql"
 import { FileKnowledge } from "@opencode-ai/core/file-knowledge"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionInputTable } from "@opencode-ai/core/session/sql"
+import { WorkspaceCheckout } from "@opencode-ai/core/session/workspace/checkout"
+import { SessionOrchestratorTable, SessionOrchestratorTaskTable } from "@opencode-ai/core/session/legacy-delegation/sql"
 import { withKnownFileTools } from "./fixture/known-file-tools"
 import { tmpdir } from "./fixture/tmpdir"
 import { KnownFileMutation } from "@opencode-ai/core/tool/known-file-mutation"
@@ -17,6 +21,134 @@ const run = async <A, E>(body: (directory: string) => Effect.Effect<A, E>) => {
 const value = (result: { result: { type: string; value: unknown } }) => String(result.result.value)
 
 describe("native file knowledge enforcement", () => {
+  test("downstream bounding of a full-line page grants no knowledge until a smaller page is delivered", () =>
+    run((directory) =>
+      Effect.gen(function* () {
+        const long = "ü".repeat(25_000)
+        yield* Effect.promise(() => fs.writeFile(path.join(directory, "bounded.txt"), `${long}\ntail\n`))
+        yield* withKnownFileTools(directory, ({ call }) =>
+          Effect.gen(function* () {
+            const read = yield* call({ name: "read", input: { path: "bounded.txt", fullLines: true } })
+            expect(value(read)).not.toContain(long)
+            expect((yield* call({ name: "write", input: { path: "bounded.txt", content: "erase" } })).result.type).toBe(
+              "error",
+            )
+            expect(
+              (yield* call({ name: "edit", input: { path: "bounded.txt", oldString: "tail", newString: "changed" } }))
+                .result.type,
+            ).toBe("error")
+            yield* call({ name: "read", input: { path: "bounded.txt", offset: 2, limit: 1, fullLines: true } })
+            expect(
+              (yield* call({ name: "edit", input: { path: "bounded.txt", oldString: "tail", newString: "changed" } }))
+                .result.type,
+            ).toBe("text")
+            expect(yield* Effect.promise(() => fs.readFile(path.join(directory, "bounded.txt"), "utf8"))).toBe(
+              `${long}\nchanged\n`,
+            )
+          }),
+        )
+      }),
+    ))
+
+  test("explicit full-line reads allow a guarded edit but not unread lines or stale versions", () =>
+    run((directory) =>
+      Effect.gen(function* () {
+        const long = "ü".repeat(3000)
+        yield* Effect.promise(() => fs.writeFile(path.join(directory, "long.txt"), `${long}\nhidden\n`))
+        yield* withKnownFileTools(directory, ({ call }) =>
+          Effect.gen(function* () {
+            const ordinary = yield* call({ name: "read", input: { path: "long.txt", limit: 1 } })
+            expect(value(ordinary)).toContain("line truncated")
+            expect(
+              (yield* call({ name: "edit", input: { path: "long.txt", oldString: long, newString: "changed" } })).result
+                .type,
+            ).toBe("error")
+            const full = yield* call({ name: "read", input: { path: "long.txt", limit: 1, fullLines: true } })
+            expect(value(full)).toContain(long)
+            expect(value(full)).not.toContain("line truncated")
+            expect(
+              (yield* call({ name: "edit", input: { path: "long.txt", oldString: long, newString: "changed" } })).result
+                .type,
+            ).toBe("text")
+            expect((yield* call({ name: "write", input: { path: "long.txt", content: "erase" } })).result.type).toBe(
+              "error",
+            )
+            yield* call({ name: "read", input: { path: "long.txt", fullLines: true } })
+            yield* Effect.promise(() => fs.writeFile(path.join(directory, "long.txt"), "human\nhidden\n"))
+            expect((yield* call({ name: "write", input: { path: "long.txt", content: "erase" } })).result.type).toBe(
+              "error",
+            )
+            expect(yield* Effect.promise(() => fs.readFile(path.join(directory, "long.txt"), "utf8"))).toBe(
+              "human\nhidden\n",
+            )
+          }),
+        )
+      }),
+    ))
+
+  test("a delivered complete full-line read permits deletion through the existing patch guard", () =>
+    run((directory) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => fs.writeFile(path.join(directory, "long.txt"), "x".repeat(4000)))
+        yield* withKnownFileTools(directory, ({ call }) =>
+          Effect.gen(function* () {
+            const read = yield* call({ name: "read", input: { path: "long.txt", fullLines: true } })
+            expect(value(read)).toContain("x".repeat(4000))
+            expect(
+              (yield* call({
+                name: "apply_patch",
+                input: { patchText: "*** Begin Patch\n*** Delete File: long.txt\n*** End Patch" },
+              })).result.type,
+            ).toBe("text")
+            expect(
+              yield* Effect.promise(() =>
+                fs.access(path.join(directory, "long.txt")).then(
+                  () => true,
+                  () => false,
+                ),
+              ),
+            ).toBe(false)
+          }),
+        )
+      }),
+    ))
+
+  for (const name of ["write", "edit", "apply_patch"] as const) {
+    test(`${name} refuses a historical child before any native file effect`, () =>
+      run((directory) => withKnownFileTools(directory, ({ call, database, newSession, afterPermission }) => Effect.gen(function* () {
+        yield* call({ name: "write", input: { path: "a.txt", content: "old\n" } })
+        const main = SessionSchema.ID.make("ses_guard_main")
+        const child = SessionSchema.ID.make("ses_known_tools")
+        const origin = SessionMessage.ID.make("msg_guard_origin")
+        const checkout = WorkspaceCheckout.pathKey(directory)
+        yield* newSession(main)
+        const db = database.db
+        yield* db.insert(SessionInputTable).values({ id: origin, session_id: main, prompt: { text: "guard" }, delivery: "steer", admitted_seq: 1, promoted_seq: 2 }).run().pipe(Effect.orDie)
+        yield* db.insert(SessionOrchestratorTable).values({ main_session_id: main, checkout_id: checkout, workspace_mode: "shared" }).run().pipe(Effect.orDie)
+        yield* db.insert(SessionOrchestratorTaskTable).values({ id: "guard-task", main_session_id: main, request_id: "guard-request", checkout_id: checkout,
+          origin_input_id: origin, origin_user_message_id: origin, goal: "guard", acceptance: "guard", resources: ["project:*"], dependencies: [],
+          state: "running", slot_claimed: true, workspace_mode: "shared", child_session_id: child,
+        }).run().pipe(Effect.orDie)
+        afterPermission(db.update(SessionOrchestratorTaskTable).set({ state: "paused" }).run().pipe(Effect.orDie, Effect.asVoid))
+        const input = name === "write" ? { path: "a.txt", content: "new\n" }
+          : name === "edit" ? { path: "a.txt", oldString: "old", newString: "new" }
+          : { patchText: "*** Begin Patch\n*** Add File: b.txt\n+not allowed\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch" }
+        expect((yield* call({ name, input })).result.type).toBe("error")
+        expect(yield* Effect.promise(() => fs.readFile(path.join(directory, "a.txt"), "utf8"))).toBe("old\n")
+        expect(yield* Effect.promise(() => fs.access(path.join(directory, "b.txt")).then(() => true, () => false))).toBe(false)
+        expect(yield* db.select().from(FileMutationPendingTable).all().pipe(Effect.orDie)).toHaveLength(0)
+        afterPermission(Effect.void)
+        yield* db.update(SessionOrchestratorTaskTable).set({ state: "running" }).run().pipe(Effect.orDie)
+        const retired = yield* call({ name, input })
+        expect(retired.result.type).toBe("error")
+        expect(value(retired)).toContain("Legacy Main-Orchestrator execution has been removed")
+        expect(yield* Effect.promise(() => fs.readFile(path.join(directory, "a.txt"), "utf8"))).toBe("old\n")
+        expect(yield* Effect.promise(() => fs.access(path.join(directory, "b.txt")).then(() => true, () => false))).toBe(false)
+        expect(yield* db.select().from(FileMutationPendingTable).all().pipe(Effect.orDie)).toHaveLength(0)
+      }))),
+    )
+  }
+
   test("permission approval and a supplied current hash do not replace a delivered read", () =>
     run((directory) =>
       Effect.gen(function* () {
@@ -265,6 +397,44 @@ describe("native file knowledge enforcement", () => {
         )
       }),
     ))
+
+  test("reads through an external junction and refuses a write if the junction is retargeted during permission", () =>
+    run((directory) => Effect.gen(function* () {
+      const outside = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+      const active = path.join(directory, "active")
+      const second = path.join(directory, "second")
+      const link = path.join(active, "linked")
+      const kind = process.platform === "win32" ? "junction" : "dir"
+      yield* Effect.promise(async () => {
+        await fs.mkdir(active)
+        await fs.mkdir(second)
+        await fs.writeFile(path.join(outside.path, "a.txt"), "outside original")
+        await fs.writeFile(path.join(second, "a.txt"), "second original")
+        await fs.symlink(outside.path, link, kind)
+      })
+      yield* withKnownFileTools(active, ({ call, afterPermission }) => Effect.gen(function* () {
+        const alias = "linked/a.txt"
+        expect(value(yield* call({ name: "read", input: { path: alias } }))).toContain("outside original")
+        expect((yield* call({ name: "write", input: { path: alias, content: "confirmed" } })).result.type).toBe("text")
+
+        let moved = false
+        afterPermission(Effect.promise(async () => {
+          if (moved) return
+          moved = true
+          await fs.unlink(link)
+          await fs.symlink(second, link, kind)
+        }))
+        const rejected = yield* call({ name: "write", input: { path: alias, content: "not written" } })
+        expect(rejected.result.type).toBe("error")
+        expect(value(rejected)).toContain("File target changed")
+        expect(yield* Effect.promise(() => fs.readFile(path.join(outside.path, "a.txt"), "utf8"))).toBe("confirmed")
+        expect(yield* Effect.promise(() => fs.readFile(path.join(second, "a.txt"), "utf8"))).toBe("second original")
+      }))
+    }).pipe(Effect.scoped)),
+  )
 
   test("uncertainty needs fresh full coverage, not an old full receipt plus one fresh line", () =>
     run((directory) =>

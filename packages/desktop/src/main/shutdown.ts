@@ -9,9 +9,12 @@ export function createShutdownCoordinator(input: {
       if (completion) return completion
       completion = Promise.resolve()
         .then(input.cleanup)
-        .catch((error) => input.onCleanupError(error))
         .then(onComplete)
-        .catch((error) => input.onCleanupError(error))
+        .catch((error) => {
+          // An unconfirmed sidecar exit must not become a parent-process kill.
+          completion = undefined
+          input.onCleanupError(error)
+        })
       return completion
     },
   }

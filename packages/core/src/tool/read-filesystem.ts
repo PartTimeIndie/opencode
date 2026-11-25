@@ -31,11 +31,21 @@ export class MediaIngestLimitError extends Error {
   }
 }
 
+export class FullLineLimitError extends Error {
+  constructor(resource: string, line: number) {
+    super(
+      `Line ${line} in ${resource} exceeds the ${MAX_READ_BYTES} byte full-line page limit; no complete line was returned`,
+    )
+    this.name = "FullLineLimitError"
+  }
+}
+
 export type ReadError = FSUtil.Error | BinaryFileError | MediaIngestLimitError | Error
 
 export const PageInput = Schema.Struct({
   offset: PositiveInt.pipe(Schema.optional),
   limit: PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_READ_LINES)).pipe(Schema.optional),
+  fullLines: Schema.Boolean.pipe(Schema.optional),
 })
 export type PageInput = typeof PageInput.Type
 
@@ -49,7 +59,15 @@ export class TextPage extends Schema.Class<TextPage>("ReadTool.TextPage")({
   sha256: Schema.String.pipe(Schema.optional),
   lineCount: Schema.Number.pipe(Schema.optional),
   totalLines: Schema.Number.pipe(Schema.optional),
+  fullLines: Schema.Boolean.pipe(Schema.optional),
 }) {}
+
+/** Renderer and read receipts must agree before removing the per-line cap.
+ * The reader sets this flag only on bounded, complete-line text pages. */
+export const rendersFullLines = (page: TextPage) =>
+  page.fullLines === true &&
+  Buffer.byteLength(page.content, "utf8") <= MAX_READ_BYTES &&
+  page.content.split(/\r?\n/).length <= MAX_READ_LINES
 
 export class ListPage extends Schema.Class<ListPage>("ReadTool.ListPage")({
   entries: Schema.Array(FileSystem.Entry),
@@ -216,7 +234,8 @@ export const read = Effect.fn("ReadTool.read")(function* (
         }
       }
       if (binary(resource, first)) return yield* Effect.fail(new BinaryFileError(resource))
-      const paged = info.size > MAX_READ_BYTES || page.offset !== undefined || page.limit !== undefined
+      const paged =
+        info.size > MAX_READ_BYTES || page.offset !== undefined || page.limit !== undefined || page.fullLines === true
       if (!paged) {
         const decoder = new TextDecoder("utf-8", { fatal: true })
         const hash = createHash("sha256").update(first)
@@ -240,6 +259,7 @@ export const read = Effect.fn("ReadTool.read")(function* (
       }
       const offset = page.offset ?? 1
       const limit = Math.min(page.limit ?? MAX_READ_LINES, MAX_READ_LINES)
+      const maxLineLength = page.fullLines ? MAX_READ_BYTES + 1 : MAX_LINE_LENGTH
       const lines: string[] = []
       const hash = createHash("sha256").update(first)
       const decoder = new TextDecoder("utf-8", { fatal: true })
@@ -261,9 +281,11 @@ export const read = Effect.fn("ReadTool.read")(function* (
           return
         }
         found = true
-        const text = input.length > MAX_LINE_LENGTH ? input.slice(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : input
+        const text =
+          !page.fullLines && input.length > MAX_LINE_LENGTH ? input.slice(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : input
         const size = Buffer.byteLength(text, "utf-8") + (lines.length > 0 ? 1 : 0)
         if (bytes + size > MAX_READ_BYTES) {
+          if (page.fullLines && lines.length === 0) return new FullLineLimitError(resource, line)
           truncated = true
           next ??= line++
           return
@@ -292,8 +314,8 @@ export const read = Effect.fn("ReadTool.read")(function* (
           if (index === -1) {
             if (!discard) {
               pending += text.slice(cursor)
-              if (pending.length > MAX_LINE_LENGTH) {
-                pending = pending.slice(0, MAX_LINE_LENGTH + 1)
+              if (pending.length > maxLineLength) {
+                pending = pending.slice(0, maxLineLength + 1)
                 discard = true
               }
             }
@@ -303,7 +325,8 @@ export const read = Effect.fn("ReadTool.read")(function* (
           pending = ""
           discard = false
           cursor = index + 1
-          append(current.endsWith("\r") ? current.slice(0, -1) : current)
+          const error = append(current.endsWith("\r") ? current.slice(0, -1) : current)
+          if (error) return error
           if (truncated) {
             saturated = true
             return
@@ -321,7 +344,10 @@ export const read = Effect.fn("ReadTool.read")(function* (
       }
       const tail = yield* flushDecoder(decoder, resource)
       if (!discard) pending += tail
-      if (pending) append(pending.endsWith("\r") ? pending.slice(0, -1) : pending)
+      if (pending) {
+        const error = append(pending.endsWith("\r") ? pending.slice(0, -1) : pending)
+        if (error) return yield* Effect.fail(error)
+      }
       if (!found && offset !== 1) return yield* Effect.fail(new Error(`Offset ${offset} is out of range`))
       return new TextPage({
         type: "text-page",
@@ -331,6 +357,7 @@ export const read = Effect.fn("ReadTool.read")(function* (
         truncated,
         sha256: hash.digest("hex"),
         lineCount: lines.length,
+        ...(page.fullLines ? { fullLines: true } : {}),
         ...(!truncated ? { totalLines: line - 1 } : {}),
         ...(next === undefined ? {} : { next }),
       })

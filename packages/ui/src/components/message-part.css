@@ -1,3 +1,42 @@
+[data-component="fanout-details"] {
+  min-width: 0;
+  max-width: 100%;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: var(--font-size-small);
+
+  pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    margin: 0;
+  }
+  a {
+    color: var(--text-interactive-base);
+    text-decoration: underline;
+  }
+  [data-slot="fanout-reviewer"] {
+    border-top: 1px solid var(--border-weak-base);
+    padding-top: 12px;
+  }
+  [data-slot="fanout-reviewer-heading"] {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: space-between;
+  }
+  [data-slot="fanout-result"] {
+    margin-top: 8px;
+  }
+}
+
+[data-slot="tool-detail-meta"] {
+  color: var(--text-weak);
+  font-size: var(--font-size-small);
+  overflow-wrap: anywhere;
+}
+
 [data-component="assistant-message"] {
   content-visibility: auto;
   width: 100%;
@@ -390,10 +429,11 @@
 
   [data-slot="bash-copy"] {
     position: absolute;
+    z-index: 1;
     top: 4px;
     right: 4px;
-    opacity: 0;
-    pointer-events: none;
+    opacity: 1;
+    pointer-events: auto;
     transition: opacity 0.15s ease;
   }
 
@@ -426,7 +466,7 @@
 
   [data-slot="bash-pre"] {
     margin: 0;
-    padding: 12px;
+    padding: 12px 44px 12px 12px;
   }
 
   [data-slot="bash-pre"] code {
@@ -436,6 +476,17 @@
     line-height: var(--line-height-large);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  [data-slot="tool-detail-meta"] {
+    margin: 8px 44px 8px 12px;
+  }
+
+  @media (hover: none) {
+    [data-slot="bash-copy"] {
+      opacity: 1;
+      pointer-events: auto;
+    }
   }
 }
 
@@ -2340,10 +2391,13 @@
 
   [data-slot="question-form-video"] {
     display: block;
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    min-height: 105px;
-    max-height: min(125px, 20dvh);
+    /* Bound both dimensions using the metadata ratio. A height-only cap leaves
+       a wide box around portrait media; auto width alone cannot enlarge it. */
+    width: min(100%, calc(min(640px, 60dvh) * var(--question-video-ratio, 1.7777778)));
+    height: auto;
+    max-width: 100%;
+    max-height: min(640px, 60dvh);
+    margin-inline: auto;
     background: #000;
     object-fit: contain;
   }

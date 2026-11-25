@@ -2,7 +2,7 @@ import { createEffect, onCleanup } from "solid-js"
 import type { SlotItem } from "./app-runtime"
 import { mountPluginElement } from "./mount-lifecycle"
 
-export function PluginSlotMount(props: { item: SlotItem }) {
+export function PluginSlotMount(props: { item: SlotItem; context?: { slot: string; directory: string; sessionID: string } }) {
   let root: HTMLDivElement | undefined
   let cleanup: (() => void) | undefined
 
@@ -21,7 +21,7 @@ export function PluginSlotMount(props: { item: SlotItem }) {
     dispose()
     cleanup = mountPluginElement({
       element,
-      mount: (signal) => props.item.mount({ element, signal }),
+      mount: (signal) => props.item.mount?.({ element, signal, context: props.context }),
       onError: (error) => {
         console.error("[app-plugin] slot mount failed", { id: props.item.id, slot: props.item.slot, error })
         element.replaceChildren()

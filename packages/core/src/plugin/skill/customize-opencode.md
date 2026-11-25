@@ -48,19 +48,22 @@ already-loaded config until then.
 | External skills (auto-loaded) | `~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`                                                    |
 
 General config fields are deep-merged, with project settings overriding global
-settings. Structured agent `tools` policies (`mode` plus optional `entries`) are
-replaced as a whole by a more specific JSON or agent/mode Markdown definition;
-they are not merged into the global allowlist. Legacy inline `mode` definitions
-are migrated within each document before scope merging, so an older global mode
-cannot overwrite a later project agent. The same replacement applies to the
-normalized `options.__agentTools` copy, including migrated agents with an empty
-legacy `tools` map. Malformed normalized policies fail with a sourced config error.
-Project saves use the same atomic replacement and persist only the canonical policy.
+settings. Use `tools.mode: inherit` by default for new and existing agents.
+Inherited `entries` override only named tools and fields; unmentioned tools and
+restrictions continue to inherit from earlier global/project definitions. Changing
+one tool in Settings must not switch modes or snapshot the whole catalog.
+Use `explicit` only for a deliberately requested exceptional closed list: it
+replaces the previous tool policy, and empty or omitted entries expose no tools.
+Keep bounded bot/reviewer profiles restricted with a wildcard deny plus named
+exceptions, rather than granting tools as an incidental result of migration.
+Legacy inline `mode` definitions are migrated within each document before scope
+merging, so an older global mode cannot overwrite a later project agent. Keep the
+normalized `options.__agentTools` copy consistent with the resolved policy.
+Malformed normalized policies fail with a sourced config error. Project saves
+replace only the saved local policy and persist no normalized aliases.
 
-An explicit policy with empty or omitted entries exposes no inherited tools.
-An `inherit` policy also replaces earlier policy entries, including per-tool denies
-stored only in that earlier policy. Keep mandatory restrictions in separate
-permission rules or central project availability/per-project Deny settings.
+Keep mandatory restrictions in separate permission rules or central project
+availability/per-project Deny settings.
 Legacy boolean tool maps remain partial permission overrides; they cannot edit
 a structured policy's entry list.
 

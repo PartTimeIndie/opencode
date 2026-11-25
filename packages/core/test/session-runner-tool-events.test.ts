@@ -8,11 +8,12 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { createLLMEventPublisher } from "@opencode-ai/core/session/runner/publish-llm-event"
+import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater"
 
 const sessionID = SessionV2.ID.make("ses_tool_event_test")
 const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
-const capture = () => {
+const capture = (onPublish?: (event: unknown) => Effect.Effect<void>, publishLiveProgress = true) => {
   const published: Array<{ readonly type: string; readonly data: unknown }> = []
   const events = EventV2.Service.of({
     publish: (definition, data) =>
@@ -23,7 +24,7 @@ const capture = () => {
           data,
         })
         return event
-      }),
+      }).pipe(Effect.tap((event) => onPublish?.(event) ?? Effect.void)),
     subscribe: () => Stream.empty,
     all: () => Stream.empty,
     aggregateEvents: () => Stream.empty,
@@ -51,11 +52,56 @@ const capture = () => {
         providerID: ProviderV2.ID.make("provider"),
       },
       cost: [],
+      publishLiveProgress,
     }),
   }
 }
 
 const call = LLMEvent.toolCall({ id: "call-image", name: "read", input: { path: "pixel.png" } })
+test("projects publisher progress and preserves it on failure without accepting late updates", async () => {
+  const state: SessionMessageUpdater.MemoryState = { messages: [] }
+  const adapter = SessionMessageUpdater.memory(state)
+  const { publisher } = capture((event) =>
+    Schema.is(SessionEvent.All)(event) ? SessionMessageUpdater.update(adapter, event) : Effect.void,
+  )
+  const shell = LLMEvent.toolCall({ id: "live-shell", name: "bash", input: { command: "echo first" } })
+  await Effect.runPromise(publisher.publish(shell))
+  await Effect.runPromise(publisher.progress(shell.id, { structured: { output: "first" }, content: [] }))
+  expect(JSON.stringify(state.messages)).toContain('"output":"first"')
+  await Effect.runPromise(
+    publisher.publish(
+      LLMEvent.toolResult({ id: shell.id, name: shell.name, result: { type: "error", value: "Interrupted" } }),
+    ),
+  )
+  await Effect.runPromise(publisher.progress(shell.id, { structured: { output: "late" }, content: [] }))
+  const projected = JSON.stringify(state.messages)
+  expect(projected).toContain('"status":"error"')
+  expect(projected).toContain('"output":"first"')
+  expect(projected).not.toContain('"output":"late"')
+})
+
+test("publishes progress only for a called local tool and ignores foreign or terminal calls", async () => {
+  const { published, publisher } = capture()
+  const snapshot = { structured: { output: "first line" }, content: [] }
+  await Effect.runPromise(publisher.progress("foreign-call", snapshot))
+  await Effect.runPromise(publisher.publish(call))
+  await Effect.runPromise(publisher.progress(call.id, snapshot))
+  expect(published.filter((event) => event.type === "session.next.tool.progress.1")).toMatchObject([
+    { data: { sessionID, callID: call.id, structured: snapshot.structured } },
+  ])
+  await Effect.runPromise(
+    publisher.publish(
+      LLMEvent.toolResult({
+        id: call.id,
+        name: call.name,
+        result: { type: "text", value: "done" },
+      }),
+    ),
+  )
+  await Effect.runPromise(publisher.progress(call.id, { structured: { output: "stale" }, content: [] }))
+  expect(published.filter((event) => event.type === "session.next.tool.progress.1")).toHaveLength(1)
+})
+
 const result = LLMEvent.toolResult({
   id: "call-image",
   name: "read",
@@ -157,13 +203,48 @@ test("binary failure emits no success event", async () => {
 test("runner interruption publishes explicit provenance", async () => {
   const { published, publisher } = capture()
   await Effect.runPromise(publisher.publish(call))
-  await Effect.runPromise(
-    publisher.failUnsettledTools("Tool execution interrupted", false, { source: "session" }),
-  )
+  await Effect.runPromise(publisher.failUnsettledTools("Tool execution interrupted", false, { source: "session" }))
 
   expect(published.find((event) => event.type === "session.next.tool.failed.2")?.data).toMatchObject({
     interruption: { source: "session" },
   })
+})
+
+test("persists completed fanout receipts before the first terminal failure even when live progress is off", async () => {
+  const state: SessionMessageUpdater.MemoryState = { messages: [] }
+  const adapter = SessionMessageUpdater.memory(state)
+  const { published, publisher } = capture(
+    (event) => Schema.is(SessionEvent.All)(event) ? SessionMessageUpdater.update(adapter, event) : Effect.void,
+    false,
+  )
+  const fanout = LLMEvent.toolCall({ id: "fanout-interrupted", name: "multi_agent_fanout", input: { workflow: "review" } })
+  await Effect.runPromise(publisher.publish(fanout))
+  await Effect.runPromise(publisher.progress(fanout.id, {
+    structured: { partial_results: [{ reviewer: { model: "fake/model" }, status: "success", result: { findings: ["saved"] } }] },
+    content: [],
+  }))
+  expect(published.some((event) => event.type === "session.next.tool.progress.1")).toBe(false)
+  await Effect.runPromise(publisher.failUnsettledTools("Tool execution interrupted", false, { source: "session" }))
+  expect(published.filter((event) => event.type === "session.next.tool.progress.1")).toHaveLength(1)
+  expect(published.map((event) => event.type).slice(-2)).toEqual([
+    "session.next.tool.progress.1", "session.next.tool.failed.2",
+  ])
+  expect(JSON.stringify(state.messages)).toContain('"findings":["saved"]')
+  expect(JSON.stringify(state.messages)).toContain('"status":"error"')
+})
+
+test("persists a repair claim before dispatch even when live progress is disabled", async () => {
+  const state: SessionMessageUpdater.MemoryState = { messages: [] }
+  const adapter = SessionMessageUpdater.memory(state)
+  const { published, publisher } = capture(
+    (event) => Schema.is(SessionEvent.All)(event) ? SessionMessageUpdater.update(adapter, event) : Effect.void,
+    false,
+  )
+  const fanout = LLMEvent.toolCall({ id: "fanout-claim", name: "multi_agent_fanout", input: { workflow: "review" } })
+  await Effect.runPromise(publisher.publish(fanout))
+  await Effect.runPromise(publisher.progress(fanout.id, { structured: { reviewers: [{ repairClaim: "saved" }] }, content: [] }))
+  expect(published.filter((event) => event.type === "session.next.tool.progress.1")).toHaveLength(1)
+  expect(JSON.stringify(state.messages)).toContain('"repairClaim":"saved"')
 })
 
 test("tool-error for a started but uncalled call persists the failed invocation", async () => {

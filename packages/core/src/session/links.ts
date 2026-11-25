@@ -293,6 +293,8 @@ const make = Effect.gen(function* () {
         delivery,
         // No agent/model/system overrides: the existing target keeps its policies.
         prompt: new Prompt({ text }),
+        // Plugin-dispatched work is never a human instruction in the target.
+        origin: "plugin",
       })
     }).pipe(Effect.uninterruptible, operations.withLock(input.sourceSessionID)),
   )
@@ -343,6 +345,7 @@ const make = Effect.gen(function* () {
             sessionID: link.source_session_id,
             delivery: "queue",
             prompt: new Prompt({ text: result }),
+            origin: "plugin",
           })
           yield* db
             .update(SessionDispatchTable)

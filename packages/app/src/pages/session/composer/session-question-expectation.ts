@@ -4,6 +4,8 @@ const prefix = /^\s*Erwartet:\s*\S/i
 
 export function questionExpectation(question: QuestionV2Info | undefined, type: QuestionControlType | undefined) {
   if (question?.showExpectation === false) return
+  if (question?.chatSend?.text && type !== "form")
+    return "Erwartet: Freigabe-Klick sendet den hinterlegten Text in den Chat und bestätigt die Frage."
   if (type === "form") return `Erwartet: ${question?.form?.submitLabel ?? "Formular ausfüllen und absenden"}`
   if (type === "pick_many" || question?.multiple === true)
     return "Erwartet: Eine oder mehrere Optionen auswählen und bestätigen."

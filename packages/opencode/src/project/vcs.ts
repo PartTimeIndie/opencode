@@ -8,6 +8,7 @@ import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Git } from "@/git"
+import { GitHistory } from "./git-history"
 import { HeadlessAI } from "@/headless-ai"
 import { Provider } from "@/provider/provider"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -335,6 +336,11 @@ export const GitBranch = Schema.Struct({
   name: Schema.String,
   current: Schema.Boolean,
   remote: Schema.Boolean,
+  // Canonical full refname (refs/heads/... or refs/remotes/...). Optional for
+  // compatibility with older clients; the server always populates it. History
+  // filtering must use this exact value instead of reconstructing refs from
+  // the abbreviated display name.
+  ref: Schema.optional(Schema.String),
   upstream: Schema.optional(Schema.String),
   tracking: Schema.optional(Schema.String),
   hash: Schema.optional(Schema.String),
@@ -373,6 +379,69 @@ export const GitOperation = Schema.Struct({
   type: Schema.optional(Schema.Literals(["merge", "cherry-pick", "rebase", "revert"])),
 }).annotate({ identifier: "VcsGitOperation" })
 export type GitOperation = Schema.Schema.Type<typeof GitOperation>
+
+export const GitHistoryRequest = Schema.Struct({
+  selector: Schema.optional(Schema.Literals(["all", "head", "branch"])),
+  ref: Schema.optional(Schema.String),
+  firstParent: Schema.optional(Schema.Boolean),
+  limit: Schema.optional(
+    Schema.Finite.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(GitHistory.HISTORY_PAGE_LIMIT_MAX)),
+  ),
+  cursor: Schema.optional(Schema.String),
+}).annotate({ identifier: "VcsGitHistoryRequest" })
+export type GitHistoryRequest = Schema.Schema.Type<typeof GitHistoryRequest>
+
+export const GitHistoryCommit = Schema.Struct({
+  hash: Schema.String,
+  short: Schema.String,
+  parents: Schema.Array(Schema.String),
+  author: Schema.String,
+  email: Schema.String,
+  date: Schema.String,
+  refs: Schema.Array(Schema.String),
+  subject: Schema.String,
+  body: Schema.String,
+  bodyTruncated: Schema.Boolean,
+  boundary: Schema.Literals(["none", "shallow", "missing"]),
+}).annotate({ identifier: "VcsGitHistoryCommit" })
+export type GitHistoryCommit = Schema.Schema.Type<typeof GitHistoryCommit>
+
+export const GitHistoryPage = Schema.Struct({
+  commits: Schema.Array(GitHistoryCommit),
+  hasMore: Schema.Boolean,
+  selector: Schema.Literals(["all", "head", "branch"]),
+  firstParent: Schema.Boolean,
+  headOid: Schema.optional(Schema.String),
+  refLabels: Schema.Array(Schema.Struct({ hash: Schema.String, label: Schema.String })),
+  nextCursor: Schema.optional(Schema.String),
+}).annotate({ identifier: "VcsGitHistoryPage" })
+export type GitHistoryPage = Schema.Schema.Type<typeof GitHistoryPage>
+
+export const GitCommitMessageRequest = Schema.Struct({
+  hash: Schema.optional(Schema.String),
+  cursor: Schema.optional(Schema.String),
+}).annotate({ identifier: "VcsGitCommitMessageRequest" })
+export type GitCommitMessageRequest = Schema.Schema.Type<typeof GitCommitMessageRequest>
+
+export const GitCommitMessagePage = Schema.Struct({
+  text: Schema.String,
+  truncated: Schema.Boolean,
+  nextCursor: Schema.optional(Schema.String),
+}).annotate({ identifier: "VcsGitCommitMessagePage" })
+export type GitCommitMessagePage = Schema.Schema.Type<typeof GitCommitMessagePage>
+
+export class GitHistoryFailure extends Schema.TaggedErrorClass<GitHistoryFailure>()("VcsGitHistoryFailure", {
+  code: Schema.Literals([
+    "invalid_ref",
+    "invalid_cursor",
+    "history_unavailable",
+    "shallow_changed",
+    "output_limit",
+    "process_failed",
+  ]),
+  message: Schema.String,
+  recovery: Schema.Literals(["refresh", "retry", "change-selection", "none"]),
+}) {}
 
 export const GitSnapshot = Schema.Struct({
   info: Info,
@@ -501,6 +570,8 @@ export interface Interface {
   readonly apply: (input: ApplyInput) => Effect.Effect<ApplyResult, PatchApplyError>
   readonly discoverRepositories: (input?: GitDiscoverQuery) => Effect.Effect<GitDiscoverResult>
   readonly gitSnapshot: (input?: GitHistoryQuery) => Effect.Effect<GitSnapshot>
+  readonly gitHistory: (input?: GitHistoryRequest) => Effect.Effect<GitHistoryPage, GitHistoryFailure>
+  readonly gitCommitMessage: (input?: GitCommitMessageRequest) => Effect.Effect<GitCommitMessagePage, GitHistoryFailure>
   readonly gitAction: (input: GitActionInput) => Effect.Effect<GitActionResult>
 }
 
@@ -1217,6 +1288,169 @@ const live: Layer.Layer<Service, never, Git.Service | EventV2Bridge.Service | He
           operation,
         } satisfies GitSnapshot
       }),
+      gitHistory: Effect.fn("Vcs.gitHistory")(function* (input?: GitHistoryRequest) {
+        const ctx = yield* InstanceState.context
+        const cwd = ctx.directory
+        if (ctx.project.vcs !== "git") {
+          return {
+            commits: [],
+            hasMore: false,
+            selector: input?.selector ?? "head",
+            firstParent: false,
+            refLabels: [],
+          }
+        }
+        if (input?.cursor) {
+          if (input.selector !== undefined || input.ref !== undefined || input.limit !== undefined || input.firstParent !== undefined) {
+            return yield* failHistory("invalid_cursor", "Cursor continuations must not repeat filter parameters", "refresh")
+          }
+          const decoded = GitHistory.decodeHistoryCursor(input.cursor, { repo: ctx.worktree, kind: "page" })
+          if (!decoded.ok) return yield* failHistory(decoded.failure.code, decoded.failure.message, decoded.failure.recovery)
+          const payload = decoded.payload
+          const before = yield* readShallowInfo(git, cwd)
+          if (before.fingerprint !== payload.shallow) {
+            return yield* failHistory("shallow_changed", "The local history boundary changed; refresh to reload the history", "refresh")
+          }
+          const walked = yield* walkHistoryPage(git, cwd, payload.roots ?? [], payload.firstParent ?? false, payload.offset ?? 0, payload.pageSize ?? 200)
+          if (walked.failure) return yield* failHistory(walked.failure.code, walked.failure.message, walked.failure.recovery)
+          const pageSize = payload.pageSize ?? 200
+          const pageRecords = walked.records.slice(0, pageSize)
+          const hasMore = walked.records.length > pageSize
+          const page = yield* buildHistoryPage(git, cwd, pageRecords, before.commits)
+          const after = yield* readShallowInfo(git, cwd)
+          if (after.fingerprint !== payload.shallow) {
+            return yield* failHistory("shallow_changed", "The local history boundary changed while reading; refresh to reload", "refresh")
+          }
+          if (page.failure) return yield* failHistory(page.failure.code, page.failure.message, page.failure.recovery)
+          const encoded = hasMore
+            ? GitHistory.encodeHistoryCursor({
+                v: 1,
+                repo: ctx.worktree,
+                kind: "page",
+                mode: payload.mode,
+                firstParent: payload.firstParent,
+                roots: payload.roots,
+                pageSize,
+                offset: (payload.offset ?? 0) + pageRecords.length,
+                shallow: after.fingerprint,
+              })
+            : undefined
+          if (encoded && typeof encoded !== "string") {
+            return yield* failHistory(encoded.code, encoded.message, encoded.recovery)
+          }
+          return {
+            commits: page.commits,
+            hasMore,
+            selector: payload.mode ?? "head",
+            firstParent: payload.firstParent ?? false,
+            headOid: undefined,
+            refLabels: [],
+            nextCursor: encoded ?? undefined,
+          }
+        }
+        const validated = GitHistory.validateHistoryRequest(input)
+        if (!validated.ok) return yield* failHistory(validated.failure.code, validated.failure.message, validated.failure.recovery)
+        const anchors = yield* resolveHistoryAnchors(git, cwd, validated.value.selector, validated.value.ref)
+        if (anchors.failure) return yield* failHistory(anchors.failure.code, anchors.failure.message, anchors.failure.recovery)
+        if (anchors.roots.length === 0) {
+          return {
+            commits: [],
+            hasMore: false,
+            selector: validated.value.selector,
+            firstParent: validated.value.firstParent,
+            headOid: anchors.headOid,
+            refLabels: anchors.refLabels,
+          }
+        }
+        const shallowBefore = yield* readShallowInfo(git, cwd)
+        const walked = yield* walkHistoryPage(git, cwd, anchors.roots, validated.value.firstParent, 0, validated.value.limit)
+        if (walked.failure) return yield* failHistory(walked.failure.code, walked.failure.message, walked.failure.recovery)
+        const pageRecords = walked.records.slice(0, validated.value.limit)
+        const hasMore = walked.records.length > validated.value.limit
+        const page = yield* buildHistoryPage(git, cwd, pageRecords, shallowBefore.commits)
+        const shallowAfter = yield* readShallowInfo(git, cwd)
+        if (shallowAfter.fingerprint !== shallowBefore.fingerprint) {
+          return yield* failHistory("shallow_changed", "The local history boundary changed while reading; refresh to reload", "refresh")
+        }
+        if (page.failure) return yield* failHistory(page.failure.code, page.failure.message, page.failure.recovery)
+        const encoded = hasMore
+          ? GitHistory.encodeHistoryCursor({
+              v: 1,
+              repo: ctx.worktree,
+              kind: "page",
+              mode: validated.value.selector,
+              firstParent: validated.value.firstParent,
+              roots: anchors.roots,
+              pageSize: validated.value.limit,
+              offset: pageRecords.length,
+              shallow: shallowAfter.fingerprint,
+            })
+          : undefined
+        if (encoded && typeof encoded !== "string") {
+          return yield* failHistory(encoded.code, encoded.message, encoded.recovery)
+        }
+        return {
+          commits: page.commits,
+          hasMore,
+          selector: validated.value.selector,
+          firstParent: validated.value.firstParent,
+          headOid: anchors.headOid,
+          refLabels: anchors.refLabels,
+          nextCursor: encoded ?? undefined,
+        }
+      }),
+      gitCommitMessage: Effect.fn("Vcs.gitCommitMessage")(function* (input?: GitCommitMessageRequest) {
+        const ctx = yield* InstanceState.context
+        const cwd = ctx.directory
+        if (ctx.project.vcs !== "git") return { text: "", truncated: false }
+        const validated = GitHistory.validateMessageRequest(input)
+        if (!validated.ok) return yield* failHistory(validated.failure.code, validated.failure.message, validated.failure.recovery)
+        let oid: string
+        let byteOffset: number
+        if (validated.value.cursor) {
+          const decoded = GitHistory.decodeHistoryCursor(validated.value.cursor, { repo: ctx.worktree, kind: "message" })
+          if (!decoded.ok) return yield* failHistory(decoded.failure.code, decoded.failure.message, decoded.failure.recovery)
+          oid = decoded.payload.oid ?? ""
+          byteOffset = decoded.payload.byteOffset ?? 0
+        } else {
+          oid = validated.value.hash ?? ""
+          byteOffset = 0
+        }
+        const parser = GitHistory.createMessageWindowParser({ byteOffset, maxBytes: GitHistory.HISTORY_MESSAGE_CHUNK_BYTES })
+        const result = yield* git.runStreamed(GitHistory.buildBatchArgs(), {
+          cwd,
+          env: historyPageLimitGuardEnv,
+          onChunk: (chunk) => parser.feed(chunk),
+          maxOutputBytes: 64 * 1024,
+          stdin: gitStdin(`${oid}\n`),
+        })
+        if (parser.failed) return yield* failHistory("process_failed", parser.failed, "retry")
+        if (result.exitCode !== 0) {
+          return yield* failHistory("process_failed", `git cat-file failed: ${stderrSnippet(result.stderr)}`, "retry")
+        }
+        if (result.eofTimeout) return yield* failHistory("process_failed", "git cat-file output did not finish", "retry")
+        if (parser.oid !== oid || parser.type !== "commit") {
+          return yield* failHistory("process_failed", "git cat-file returned an unexpected object", "retry")
+        }
+        if (parser.messageStartAbs === -1) {
+          return yield* failHistory("process_failed", "Commit message boundary was not found", "retry")
+        }
+        const total = parser.size - parser.messageStartAbs
+        if (byteOffset > total) {
+          return yield* failHistory("invalid_cursor", "Commit text offset is past the end of the message", "refresh")
+        }
+        const safeEnd = GitHistory.utf8SafeByteCount(parser.collected)
+        const text = parser.collected.subarray(0, safeEnd).toString("utf8")
+        const endOffset = byteOffset + safeEnd
+        const truncated = endOffset < total
+        const encoded = truncated
+          ? GitHistory.encodeHistoryCursor({ v: 1, repo: ctx.worktree, kind: "message", oid, byteOffset: endOffset })
+          : undefined
+        if (encoded && typeof encoded !== "string") {
+          return yield* failHistory(encoded.code, encoded.message, encoded.recovery)
+        }
+        return { text, truncated, nextCursor: encoded ?? undefined }
+      }),
       gitAction: Effect.fn("Vcs.gitAction")(function* (input: GitActionInput) {
         const ctx = yield* InstanceState.context
         if (ctx.project.vcs !== "git") return { ok: false, message: "Project is not a git repository" }
@@ -1269,7 +1503,7 @@ const gitBranches = Effect.fnUntraced(function* (git: Git.Interface, cwd: string
   const result = yield* git.run(
     [
       "for-each-ref",
-      "--format=%(refname)\x1f%(refname:short)\x1f%(HEAD)\x1f%(upstream:short)\x1f%(upstream:track)\x1f%(objectname:short)\x1f%(committerdate:iso-strict)\x1e",
+      "--format=%(refname)\x1f%(refname:short)\x1f%(HEAD)\x1f%(upstream:short)\x1f%(upstream:track)\x1f%(objectname:short)\x1f%(committerdate:iso-strict)\x1f%(symref)\x1e",
       "refs/heads",
       "refs/remotes",
     ],
@@ -1280,10 +1514,13 @@ const gitBranches = Effect.fnUntraced(function* (git: Git.Interface, cwd: string
     const item = fields(record)
     const fullName = item[0]
     const name = item[1]
-    if (!name || name.endsWith("/HEAD")) return []
+    // Remote HEAD aliases (origin/HEAD) are symbolic refs; local branches named
+    // like "topic/HEAD" are regular refs and must stay visible.
+    if (!name || (fullName.startsWith("refs/remotes/") && item[7])) return []
     return [
       {
         name,
+        ref: fullName,
         current: item[2] === "*",
         remote: fullName.startsWith("refs/remotes/"),
         upstream: item[3] || undefined,
@@ -1293,6 +1530,234 @@ const gitBranches = Effect.fnUntraced(function* (git: Git.Interface, cwd: string
       } satisfies GitBranch,
     ]
   })
+})
+
+const historyPageLimitGuardEnv = { ...GitHistory.GIT_LAZY_FETCH_GUARD }
+
+const gitStdin = (text: string) => Stream.make(new TextEncoder().encode(text))
+
+const readShallowInfo = Effect.fnUntraced(function* (git: Git.Interface, cwd: string) {
+  const result = yield* git.run(["rev-parse", "--git-path", "shallow"], { cwd })
+  if (result.exitCode !== 0) return { fingerprint: GitHistory.computeShallowFingerprint(undefined), commits: new Set<string>() }
+  const rel = result.text().trim()
+  if (!rel) return { fingerprint: GitHistory.computeShallowFingerprint(undefined), commits: new Set<string>() }
+  const file = path.isAbsolute(rel) ? rel : path.join(cwd, rel)
+  const content = yield* Effect.promise(() =>
+    readFile(file, "utf8").then(
+      (value) => value,
+      () => undefined,
+    ),
+  )
+  const commits = new Set(
+    (content ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => GitHistory.isValidFullOid(line)),
+  )
+  return { fingerprint: GitHistory.computeShallowFingerprint(content), commits }
+})
+
+const stderrSnippet = (stderr: Buffer | undefined, max = 200) => {
+  const text = (stderr ?? Buffer.alloc(0)).toString("utf8").trim()
+  return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+const failHistory = (code: GitHistory.HistoryErrorCode, message: string, recovery?: GitHistory.HistoryRecovery) =>
+  new GitHistoryFailure({ ...GitHistory.historyFailure(code, message, recovery) })
+
+type HistoryAnchors = {
+  roots: string[]
+  headOid: string | undefined
+  refLabels: { hash: string; label: string }[]
+  failure?: GitHistoryFailure
+}
+
+const resolveHistoryAnchors = Effect.fnUntraced(function* (
+  git: Git.Interface,
+  cwd: string,
+  selector: GitHistory.HistorySelector,
+  ref: string | undefined,
+) {
+  const refsResult = yield* git.run(GitHistory.buildRefListArgs(), { cwd, maxOutputBytes: 4_000_000, env: historyPageLimitGuardEnv })
+  if (refsResult.exitCode !== 0) {
+    return { roots: [], headOid: undefined, refLabels: [], failure: failHistory("process_failed", `Unable to list refs: ${stderrSnippet(refsResult.stderr)}`) }
+  }
+  const branches: { fullName: string; oid: string }[] = []
+  for (const line of refsResult.text().split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const [fullName, symref, oid] = trimmed.split("\t")
+    if (!fullName || !GitHistory.isValidFullOid(oid ?? "")) continue
+    if (fullName.startsWith("refs/remotes/") && symref) continue
+    branches.push({ fullName, oid })
+  }
+  const headResult = yield* git.run(["rev-parse", "--verify", "HEAD^{commit}"], { cwd })
+  const headOid = headResult.exitCode === 0 && GitHistory.isValidFullOid(headResult.text().trim()) ? headResult.text().trim() : undefined
+  const labelsByHash = new Map<string, string[]>()
+  for (const branch of branches) {
+    const label = GitHistory.historyRefLabel(branch.fullName)
+    const existing = labelsByHash.get(branch.oid) ?? []
+    if (!existing.includes(label)) existing.push(label)
+    labelsByHash.set(branch.oid, existing)
+  }
+  const labelsFor = (hashes: string[]) =>
+    hashes.flatMap((hash) => (labelsByHash.get(hash) ?? []).map((label) => ({ hash, label })))
+
+  if (selector === "branch") {
+    const match = branches.find((branch) => branch.fullName === ref)
+    if (!match) {
+      return {
+        roots: [],
+        headOid,
+        refLabels: [],
+        failure: failHistory("invalid_ref", `Branch ${ref} does not exist`, "change-selection"),
+      }
+    }
+    return { roots: [match.oid], headOid, refLabels: labelsFor([match.oid]) }
+  }
+  const roots =
+    selector === "head"
+      ? headOid
+        ? [headOid]
+        : []
+      : [...new Set([...branches.map((branch) => branch.oid), ...(headOid ? [headOid] : [])])].sort()
+  return { roots, headOid, refLabels: labelsFor(roots) }
+})
+
+const walkHistoryPage = Effect.fnUntraced(function* (
+  git: Git.Interface,
+  cwd: string,
+  roots: string[],
+  firstParent: boolean,
+  offset: number,
+  limit: number,
+) {
+  if (roots.length === 0) return { records: [] }
+  const result = yield* git.run(GitHistory.buildWalkArgs({ firstParent, offset, limit }), {
+    cwd,
+    env: historyPageLimitGuardEnv,
+    maxOutputBytes: 2_000_000,
+    stdin: gitStdin(`${roots.join("\n")}\n`),
+  })
+  if (result.exitCode !== 0) {
+    return { records: [], failure: failHistory("process_failed", `git log failed: ${stderrSnippet(result.stderr)}`) }
+  }
+  if (result.truncated) {
+    return { records: [], failure: failHistory("output_limit", "History page exceeded the output budget", "retry") }
+  }
+  const parsed = GitHistory.parseWalkRecords(result.text())
+  if (!parsed.ok) return { records: [], failure: parsed.failure }
+  return { records: parsed.records }
+})
+
+const readPageObjects = Effect.fnUntraced(function* (
+  git: Git.Interface,
+  cwd: string,
+  oids: string[],
+) {
+  if (oids.length === 0) return { objects: new Map() }
+  const parser = GitHistory.createBatchContentParser()
+  const result = yield* git.runStreamed(GitHistory.buildBatchArgs(), {
+    cwd,
+    env: historyPageLimitGuardEnv,
+    onChunk: (chunk) => parser.feed(chunk),
+    maxOutputBytes: 256 * 1024,
+    stdin: gitStdin(`${oids.join("\n")}\n`),
+  })
+  if (parser.failed) return { objects: new Map(), failure: failHistory("process_failed", parser.failed) }
+  if (result.exitCode !== 0) {
+    return { objects: new Map(), failure: failHistory("process_failed", `git cat-file failed: ${stderrSnippet(result.stderr)}`) }
+  }
+  if (result.eofTimeout) {
+    return { objects: new Map(), failure: failHistory("process_failed", "git cat-file output did not finish", "retry") }
+  }
+  if (parser.objects.length !== oids.length) {
+    return { objects: new Map(), failure: failHistory("process_failed", "Unexpected git cat-file framing for the requested page", "retry") }
+  }
+  const objects = new Map<string, GitHistory.BatchObject>()
+  for (const [index, object] of parser.objects.entries()) {
+    if (object.oid !== oids[index] || object.type !== "commit") {
+      return { objects: new Map(), failure: failHistory("process_failed", "git cat-file returned an unexpected object", "retry") }
+    }
+    objects.set(object.oid, object)
+  }
+  return { objects }
+})
+
+const checkParentPresence = Effect.fnUntraced(function* (
+  git: Git.Interface,
+  cwd: string,
+  oids: string[],
+) {
+  const unique = [...new Set(oids)]
+  if (unique.length === 0) return { present: new Map() }
+  const result = yield* git.run(GitHistory.buildBatchCheckArgs(), {
+    cwd,
+    env: historyPageLimitGuardEnv,
+    maxOutputBytes: unique.length * 64 + 4096,
+    stdin: gitStdin(`${unique.join("\n")}\n`),
+  })
+  if (result.exitCode !== 0) {
+    return { present: new Map(), failure: failHistory("process_failed", `git cat-file --batch-check failed: ${stderrSnippet(result.stderr)}`) }
+  }
+  const parsed = GitHistory.parseBatchCheck(result.text())
+  if (!parsed.ok) return { present: new Map(), failure: parsed.failure }
+  const present = new Map<string, boolean>()
+  for (const oid of unique) present.set(oid, parsed.entries.get(oid) !== "missing")
+  return { present }
+})
+
+const buildHistoryPage = Effect.fnUntraced(function* (
+  git: Git.Interface,
+  cwd: string,
+  records: GitHistory.WalkRecord[],
+  shallowCommits: Set<string>,
+) {
+  if (records.length === 0) return { commits: [] }
+  const objectsResult = yield* readPageObjects(git, cwd, records.map((record) => record.hash))
+  if (objectsResult.failure) return { commits: [], failure: objectsResult.failure }
+  const parentOids = records.flatMap((record) => {
+    const object = objectsResult.objects.get(record.hash)
+    return object ? GitHistory.parseCommitObject(object.kept).parents : []
+  })
+  const presenceResult = yield* checkParentPresence(git, cwd, parentOids)
+  if (presenceResult.failure) return { commits: [], failure: presenceResult.failure }
+  const commits: GitHistoryCommit[] = []
+  for (const record of records) {
+    const object = objectsResult.objects.get(record.hash)
+    if (!object) return { commits: [], failure: failHistory("process_failed", "Commit object vanished while building the page", "retry") }
+    const parsed = GitHistory.parseCommitObject(object.kept)
+    if (parsed.headerOverflow) {
+      return { commits: [], failure: failHistory("process_failed", "Commit header exceeds the supported size", "retry") }
+    }
+    if (parsed.messageStart === -1) {
+      return { commits: [], failure: failHistory("process_failed", "Commit message boundary was not found", "retry") }
+    }
+    const { subject, bodyStart } = GitHistory.splitCommitMessage(object.kept, parsed.messageStart)
+    const bodyPreview = GitHistory.truncateUtf8Safe(object.kept.subarray(bodyStart), GitHistory.HISTORY_BODY_PREVIEW_BYTES)
+    const bodyFullBytes = object.size - bodyStart
+    const previewBytes = Buffer.byteLength(bodyPreview.text, "utf8")
+    const parents = parsed.parents.length > 0 ? parsed.parents : record.logParents
+    const person = parsed.author
+    commits.push({
+      hash: record.hash,
+      short: record.short,
+      parents,
+      author: person?.name ?? record.authorName,
+      email: person?.email ?? record.authorEmail,
+      date: person?.date ?? record.authorDate,
+      refs: [],
+      subject,
+      body: bodyPreview.text,
+      bodyTruncated: bodyFullBytes > previewBytes,
+      boundary: shallowCommits.has(record.hash)
+        ? "shallow"
+        : parents.some((parent) => presenceResult.present.get(parent) === false)
+          ? "missing"
+          : "none",
+    })
+  }
+  return { commits }
 })
 
 const gitRemotes = Effect.fnUntraced(function* (git: Git.Interface, cwd: string) {
@@ -1377,6 +1842,48 @@ const runGitAction = Effect.fnUntraced(function* (
     maxOutputBytes: 1_000_000,
   })
   return gitResult(result, fallback)
+})
+
+const pullRefusals = [
+  {
+    diagnostic: /^fatal: refusing to merge unrelated histories\r?$/m,
+    message:
+      "Pull refused: the branches have no common commit. Check out a branch based on the intended upstream and pull there.",
+  },
+  {
+    diagnostic: /^There is no tracking information for the current branch\.\r?$/m,
+    message:
+      "Pull refused: this branch has no upstream branch. Set the intended upstream or pull a specific remote and branch.",
+  },
+  {
+    diagnostic: /^fatal: Not possible to fast-forward, aborting\.\r?$/m,
+    message:
+      "Pull refused: the current branch cannot be fast-forwarded. Compare it with the upstream before integrating changes.",
+  },
+]
+
+const pull = Effect.fnUntraced(function* (
+  git: Git.Interface,
+  cwd: string,
+  input: { remote?: string; branch?: string },
+) {
+  const result = yield* git.run(input.remote && input.branch ? ["pull", input.remote, input.branch] : ["pull"], {
+    cwd,
+    env: { LC_ALL: "C" },
+    maxOutputBytes: 1_000_000,
+  })
+  if (result.exitCode === 0) return gitResult(result, "Pull failed")
+
+  // Remote and credential helpers can put sensitive values in either output stream.
+  // Translate known Git diagnostics without forwarding either stream on failure.
+  const stderr = result.stderr.toString("utf8")
+  const failure: GitActionResult = {
+    ok: false,
+    message:
+      pullRefusals.find((refusal) => refusal.diagnostic.test(stderr))?.message ??
+      "Pull failed. Check Git status, the upstream branch, and remote access before retrying.",
+  }
+  return failure
 })
 
 const gitPathKey = (value: string) => {
@@ -1697,13 +2204,7 @@ const gitAction = Effect.fnUntraced(function* (
       input.remote ? ["fetch", input.remote, "--prune"] : ["fetch", "--all", "--prune"],
       "Fetch failed",
     )
-  if (input.action === "pull")
-    return yield* runGitAction(
-      git,
-      cwd,
-      input.remote && input.branch ? ["pull", input.remote, input.branch] : ["pull"],
-      "Pull failed",
-    )
+  if (input.action === "pull") return yield* pull(git, cwd, input)
   if (input.action === "push") {
     const args = [
       "push",
@@ -1714,13 +2215,8 @@ const gitAction = Effect.fnUntraced(function* (
     return yield* runGitAction(git, cwd, args, "Push failed")
   }
   if (input.action === "sync") {
-    const pull = yield* runGitAction(
-      git,
-      cwd,
-      input.remote && input.branch ? ["pull", input.remote, input.branch] : ["pull"],
-      "Pull failed",
-    )
-    if (!pull.ok) return pull
+    const pulled = yield* pull(git, cwd, input)
+    if (!pulled.ok) return pulled
     const push = yield* runGitAction(
       git,
       cwd,
@@ -1732,7 +2228,7 @@ const gitAction = Effect.fnUntraced(function* (
       ],
       "Push failed",
     )
-    return { ...push, output: [pull.output, push.output].filter(Boolean).join("\n") }
+    return { ...push, output: [pulled.output, push.output].filter(Boolean).join("\n") }
   }
   if (input.action === "merge") {
     if (!input.ref) return { ok: false, message: "Merge ref is required" }

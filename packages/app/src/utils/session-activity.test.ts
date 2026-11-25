@@ -73,6 +73,20 @@ describe("session activity registry", () => {
     finishSessionActivity(directory, "ses_duplicate", "activity_same")
   })
 
+  test("keeps the start evidence when the evidence-free reducer start arrives first", () => {
+    const directory = "C:/GitRepros/activity-evidence-merge"
+    const sessionID = "ses_evidence_merge"
+    expect(startSessionActivity(directory, sessionID, "activity_same")).toBeTrue()
+    const generation = sessionActivityGeneration(directory, sessionID)
+    try {
+      expect(startSessionActivity(directory, sessionID, "activity_same", { timestamp: 1_780_000_050_000 })).toBeFalse()
+      expect(sessionActivityStartedAt(directory, sessionID)).toBe(1_780_000_050_000)
+      expect(sessionActivityGeneration(directory, sessionID)).toBe(generation)
+    } finally {
+      finishSessionActivity(directory, sessionID, "activity_same")
+    }
+  })
+
   test("keeps an unseen terminal as ordering evidence against its delayed start", () => {
     const directory = "C:/GitRepros/activity-reorder"
     expect(finishSessionActivity(directory, "ses_reorder", "activity_b", { timestamp: 2, eventID: "evt_2" })).toBeTrue()

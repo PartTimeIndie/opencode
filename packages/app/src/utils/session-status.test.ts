@@ -45,6 +45,44 @@ describe("hasActiveSessionTool", () => {
   })
 })
 
+describe("idleSignalSettlesActivity", () => {
+  const startedAt = 1_780_000_050_000
+  const store = (completed: number, finish = "stop") => ({
+    message: { ses: [{ id: "msg", role: "assistant", finish, time: { created: completed - 1_000, completed } }] },
+    part: { msg: [{ type: "text" }] },
+  })
+
+  test("uses a 45-second missed-terminal grace period", async () => {
+    const { MISSED_TERMINAL_GRACE_MS } = await import("./session-status")
+    expect(MISSED_TERMINAL_GRACE_MS).toBe(45_000)
+  })
+
+  test("ignores idle after a previous-turn completion inside the grace period", async () => {
+    const { idleSignalSettlesActivity } = await import("./session-status")
+    expect(idleSignalSettlesActivity(store(startedAt - 5_000), "ses", startedAt, startedAt + 44_999)).toBeFalse()
+  })
+
+  test("accepts idle after a previous-turn completion at the grace boundary", async () => {
+    const { idleSignalSettlesActivity } = await import("./session-status")
+    expect(idleSignalSettlesActivity(store(startedAt - 5_000), "ses", startedAt, startedAt + 45_000)).toBeTrue()
+  })
+
+  test("accepts idle when the assistant completed after the activity started", async () => {
+    const { idleSignalSettlesActivity } = await import("./session-status")
+    expect(idleSignalSettlesActivity(store(startedAt + 5_000), "ses", startedAt, startedAt + 6_000)).toBeTrue()
+  })
+
+  test("accepts idle after completion when the activity start time is unknown", async () => {
+    const { idleSignalSettlesActivity } = await import("./session-status")
+    expect(idleSignalSettlesActivity(store(startedAt - 5_000), "ses", undefined, startedAt)).toBeTrue()
+  })
+
+  test("ignores idle while the assistant has not settled", async () => {
+    const { idleSignalSettlesActivity } = await import("./session-status")
+    expect(idleSignalSettlesActivity(store(startedAt + 5_000, "tool-calls"), "ses", startedAt, startedAt + 45_000)).toBeFalse()
+  })
+})
+
 describe("sessionIsWorking", () => {
   const store = {
     message: { ses: [{ id: "msg" }] },

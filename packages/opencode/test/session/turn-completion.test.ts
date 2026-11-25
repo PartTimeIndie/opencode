@@ -240,6 +240,131 @@ describe("TurnCompletion", () => {
     )
   }
 
+  const commitSHA = "a".repeat(40)
+  const commitTask = `Dieser Commit-Review ist strikt report-only. Antworte ausschliesslich als JSON.\nAusgewaehlte Commits: ["${commitSHA}"]\nSchema: reviewedCommitShas, findings, notes.`
+  const commitFinding = { commitSha: commitSHA, file: "code.ts", title: "Missing fallback", evidence: "The fallback is not implemented.", suggestedFix: "Implement the fallback.", testRequirement: "Verify the fallback after the fix." }
+  it.effect("keeps the full commit binding beyond the evaluator prompt excerpt", () => Effect.gen(function* () {
+    currentTodos = []
+    completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+    modelRequests.length = 0
+    const shas = Array.from({ length: 400 }, (_, index) => index.toString(16).padStart(40, "0"))
+    const supplied: TurnCompletion.CompletionMessage[] = [
+      { info: { role: "user" }, parts: [{ type: "text", text: `Strict report-only. Return only JSON.\nAusgewaehlte Commits: ${JSON.stringify(shas)}\nSchema: committed report` }] },
+      { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: JSON.stringify({ reviewedCommitShas: shas.toReversed(), findings: [], notes: [] }) }] },
+    ]
+    const completion = yield* TurnCompletion.Service
+    expect(yield* completion.resolve(SessionID.make("ses_many_commits"), { messages: supplied })).toBe("done")
+    expect(modelRequests).toHaveLength(0)
+  }))
+  for (const findings of [[], [commitFinding]]) {
+    it.effect(`completes the bound committed report with ${findings.length} findings`, () => Effect.gen(function* () {
+      currentTodos = []
+      completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+      modelRequests.length = 0
+      const supplied: TurnCompletion.CompletionMessage[] = [
+        { info: { role: "user" }, parts: [{ type: "text", text: commitTask }] },
+        { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: JSON.stringify({ reviewedCommitShas: [commitSHA], findings, notes: [] }) }] },
+      ]
+      const completion = yield* TurnCompletion.Service
+      expect(yield* completion.resolve(SessionID.make("ses_committed_report"), { messages: supplied })).toBe("done")
+      expect(modelRequests).toHaveLength(0)
+    }))
+  }
+  it.effect("completes a paged committed report without discarding its page receipt", () => Effect.gen(function* () {
+    currentTodos = []
+    completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+    modelRequests.length = 0
+    const supplied: TurnCompletion.CompletionMessage[] = [
+      { info: { role: "user" }, parts: [{ type: "text", text: commitTask }] },
+      { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: JSON.stringify({
+        reviewedCommitShas: [commitSHA], reviewedPatchPages: ["patches/commit-0001.txt"], findings: [commitFinding], notes: [],
+      }) }] },
+    ]
+    const completion = yield* TurnCompletion.Service
+    expect(yield* completion.resolve(SessionID.make("ses_committed_paged_report"), { messages: supplied })).toBe("done")
+    expect(modelRequests).toHaveLength(0)
+  }))
+  it.effect("accepts an honest read-only test boundary in a completed commit review", () => Effect.gen(function* () {
+    currentTodos = []
+    completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+    modelRequests.length = 0
+    const supplied: TurnCompletion.CompletionMessage[] = [
+      { info: { role: "user" }, parts: [{ type: "text", text: commitTask }] },
+      { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: JSON.stringify({
+        reviewedCommitShas: [commitSHA], findings: [], notes: [
+          "Beide Patchseiten geprüft. Laufzeittests wurden nicht ausgeführt.",
+        ],
+      }) }] },
+    ]
+    const completion = yield* TurnCompletion.Service
+    expect(yield* completion.resolve(SessionID.make("ses_committed_read_only"), { messages: supplied })).toBe("done")
+    expect(modelRequests).toHaveLength(0)
+  }))
+  it.effect("keeps binary and visual limits separate from a completed code review", () => Effect.gen(function* () {
+    currentTodos = []
+    completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+    modelRequests.length = 0
+    const supplied: TurnCompletion.CompletionMessage[] = [
+      { info: { role: "user" }, parts: [{ type: "text", text: commitTask }] },
+      { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: JSON.stringify({
+        reviewedCommitShas: [commitSHA], findings: [], notes: [
+          "Alle ausgewählten Code-Patchseiten gelesen. Die LFS-/Binäränderungen wurden nur anhand ihrer Patchdarstellung geprüft. Ihre visuellen Auswirkungen und binären Nutzdaten wurden nicht verifiziert; dies ist keine visuelle Freigabe.",
+        ],
+      }) }] },
+    ]
+    const completion = yield* TurnCompletion.Service
+    expect(yield* completion.resolve(SessionID.make("ses_committed_binary_limit"), { messages: supplied })).toBe("done")
+    expect(modelRequests).toHaveLength(0)
+  }))
+  it.effect("accepts a static review note without Unity execution or builds", () => Effect.gen(function* () {
+    currentTodos = []
+    completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+    modelRequests.length = 0
+    const supplied: TurnCompletion.CompletionMessage[] = [
+      { info: { role: "user" }, parts: [{ type: "text", text: commitTask }] },
+      { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: JSON.stringify({
+        reviewedCommitShas: [commitSHA], findings: [], notes: [
+          "Alle 100 ausgewählten Patchseiten wurden in Reihenfolge gelesen. Das Review beschränkt sich auf diese Änderungen und gezielt gelesenen committed Kontext unter source/.",
+          "Statisches Review; keine Unity-Ausführung, Builds oder Tests gestartet und keine Dateien verändert.",
+        ],
+      }) }] },
+    ]
+    const completion = yield* TurnCompletion.Service
+    expect(yield* completion.resolve(SessionID.make("ses_committed_static_boundary"), { messages: supplied })).toBe("done")
+    expect(modelRequests).toHaveLength(0)
+  }))
+  for (const input of [
+    { name: "missing commits", shas: [] },
+    { name: "foreign commits", shas: ["b".repeat(40)] },
+    { name: "duplicate commits", shas: [commitSHA, commitSHA] },
+    { name: "foreign finding", finding: { ...commitFinding, commitSha: "b".repeat(40) } },
+    { name: "missing fields", finding: { title: "not a finding" } },
+    { name: "unfinished notes", notes: ["The review is not completed."] },
+    { name: "unread context despite read-only note", notes: ["Kontextlücke: Die Zielimplementierung konnte nicht verifiziert werden. Laufzeittests wurden nicht ausgeführt."] },
+    { name: "promised work", finding: { ...commitFinding, suggestedFix: "I will implement the fix." } },
+    { name: "pending todo", todo: true },
+    { name: "truncated output", finish: "length" },
+    { name: "failed tool", toolError: true },
+    { name: "malformed JSON", truncate: true },
+    { name: "extra fields", extra: true },
+    { name: "unbound report", task: "Strict report-only. Return only JSON.\nSchema: reviewedCommitShas, findings, notes." },
+  ]) {
+    it.effect(`rejects committed review completion with ${input.name}`, () => Effect.gen(function* () {
+      currentTodos = input.todo ? [{ content: "Finish review", status: "pending", priority: "high" }] : []
+      completionConfig = { session: { turn_completion: { enabled: true, model: "test/verdict" } } } as ConfigV1.Info
+      const body = JSON.stringify({ reviewedCommitShas: input.shas ?? [commitSHA], findings: [input.finding ?? commitFinding], notes: input.notes ?? [], ...(input.extra ? { promisedWork: "later" } : {}) })
+      const supplied: TurnCompletion.CompletionMessage[] = [
+        { info: { role: "user" }, parts: [{ type: "text", text: input.task ?? commitTask }] },
+        { info: { role: "assistant", finish: input.finish ?? "stop" }, parts: [
+          { type: "text", text: input.truncate ? body.slice(0, -1) : body },
+          ...(input.toolError ? [{ type: "tool", tool: "read", state: { status: "error" } }] : []),
+        ] },
+      ]
+      const completion = yield* TurnCompletion.Service
+      expect(yield* completion.resolve(SessionID.make("ses_committed_invalid"), { messages: supplied })).toBe("incomplete")
+    }))
+  }
+
   const reviewTask = "Du bist ein Reviewer. Dieser Nachtlauf ist strikt report-only. Fuehre keinen Fix aus. Antworte ausschliesslich als JSON ohne Markdown.\nSchema: findings, notes."
   const reviewFinding = {
     title: "Ein belegter Befund", userQuestion: "Soll die beschriebene Regel angepasst werden?", track: "code_review",

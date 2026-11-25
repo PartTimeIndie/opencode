@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Context } from "effect"
 import path from "path"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
+import { ignoreEntryPath } from "../../src/server/routes/instance/httpapi/handlers/file"
 import { FilePaths } from "../../src/server/routes/instance/httpapi/groups/file"
 import { InstancePaths } from "../../src/server/routes/instance/httpapi/groups/instance"
 import { resetDatabase } from "../fixture/db"
@@ -72,5 +73,52 @@ describe("file HttpApi", () => {
 
     expect(symbols.status).toBe(200)
     expect(await symbols.json()).toEqual([])
+  })
+})
+
+describe("ignoreEntryPath", () => {
+  test("prefers the project-relative path for matching ignore rules", () => {
+    const key = ignoreEntryPath({
+      projectDirectory: "C:/repo",
+      directory: "C:/repo/worktree",
+      absolute: "C:/repo/worktree/node_modules",
+      isDirectory: true,
+      pathModule: path.posix,
+    })
+    expect(key).toBe("worktree/node_modules/")
+  })
+
+  test("falls back to the instance-relative path when roots cannot be relativized", () => {
+    // Windows mount/drive aliases can expose one checkout under two roots; the
+    // ignore library throws a RangeError for the absolute path path.relative
+    // returns in that case, so the key must stay relative to the instance.
+    const key = ignoreEntryPath({
+      projectDirectory: "E:\\GitRepros\\opencode",
+      directory: "C:\\GitRepros\\opencode",
+      absolute: "C:\\GitRepros\\opencode\\.agent-tmp",
+      isDirectory: true,
+      pathModule: path.win32,
+    })
+    expect(key).toBe(".agent-tmp/")
+    expect(path.win32.isAbsolute(key)).toBe(false)
+  })
+
+  test("appends the directory suffix only for directories", () => {
+    const file = ignoreEntryPath({
+      projectDirectory: "C:/repo",
+      directory: "C:/repo",
+      absolute: "C:/repo/hello.txt",
+      isDirectory: false,
+      pathModule: path.posix,
+    })
+    const dir = ignoreEntryPath({
+      projectDirectory: "C:/repo",
+      directory: "C:/repo",
+      absolute: "C:/repo/hello",
+      isDirectory: true,
+      pathModule: path.posix,
+    })
+    expect(file).toBe("hello.txt")
+    expect(dir).toBe("hello/")
   })
 })

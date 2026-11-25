@@ -162,6 +162,10 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                       duration: transactionTimeoutMs,
                       orElse: () => Effect.die(new EffectSQLiteTransactionTimeoutError(transactionTimeoutMs)),
                     }),
+                    // Restore the caller's status for the supervising race too.
+                    // Forcing interruption here would cancel masked cleanup writes;
+                    // the inner interruptible body still enforces their deadline.
+                    restore,
                   )
             const transaction = this.executeTransactionStatement(
               connection,

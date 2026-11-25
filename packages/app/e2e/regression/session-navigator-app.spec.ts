@@ -489,6 +489,60 @@ test.describe("session navigator app plugin", () => {
     await expect.poll(storedProjectOrder).toEqual([dirB, dirA])
   })
 
+  test("decodes an existing ICO and persists exact Navigator-only project hiding", async ({ page }) => {
+    const pixels = Buffer.from(generatedIcon.split(",")[1], "base64")
+    const header = Buffer.from([0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 22, 0, 0, 0])
+    header.writeUInt32LE(pixels.length, 14)
+    const ico = `data:image/vnd.microsoft.icon;base64,${Buffer.concat([header, pixels]).toString("base64")}`
+    const sessions = seedSessions()
+    const mutations: { method: string; sessionID: string; directory?: string }[] = []
+    await mockOpenCodeServer(page, {
+      directory: dirA,
+      project: [
+        { ...project("proj-a", dirA, "Project A"), icon: { url: ico, color: "purple" } },
+        project("proj-b", dirB, "Project B"),
+      ],
+      provider: provider(), sessions, pageMessages: () => ({ items: [] }),
+    })
+    await mockNavigatorPlugin(page)
+    await mockNavigatorData(page, { sessions, archived: new Set(), deleted: new Set(), mutations })
+    await configurePage(page, { preserveServerOnReload: true, seedNavigatorDock: true, favoriteSessionID: sessionID })
+    await page.setViewportSize({ width: 1280, height: 840 })
+    await page.goto("/")
+    await addDockPane(page, "left", "Session Navigator")
+
+    const nav = page.locator(".oc-session-nav")
+    const projectA = nav.locator(`.oc-session-nav__project-toggle[title="${dirA}"]`)
+    const projectB = nav.locator(`.oc-session-nav__project-toggle[title="${dirB}"]`)
+    const icon = projectA.locator("img")
+    await expect(icon).toHaveAttribute("src", ico)
+    await expect.poll(() => icon.evaluate((node: HTMLImageElement) => node.complete && node.naturalWidth)).toBe(1)
+    const favorite = nav.locator('[data-group-key="favorites"]').getByText("A Session 1", { exact: true })
+    await expectAppVisible(favorite)
+    const manage = nav.getByRole("button", { name: "Manage hidden projects" })
+    await manage.click()
+    await nav.getByRole("button", { name: `Hide ${dirA} in Navigator`, exact: true }).click()
+    const restore = nav.getByRole("button", { name: `Show ${dirA} in Navigator`, exact: true })
+    await expect(restore).toBeFocused()
+    await manage.click()
+    await expect(projectA).toHaveCount(0)
+    await expectAppVisible(projectB)
+    await expect(nav.getByText("A Session 1", { exact: true })).toHaveCount(0)
+
+    await page.reload()
+    await expectAppVisible(projectB)
+    await expect(projectA).toHaveCount(0)
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}"))
+    expect(stored.projects.local.map((row: { worktree: string }) => row.worktree)).toEqual([dirA, dirB])
+    await manage.click()
+    await restore.click()
+    await manage.click()
+    await expectAppVisible(projectA)
+    await expect(icon).toHaveAttribute("src", ico)
+    await expectAppVisible(favorite)
+    expect(mutations).toEqual([])
+  })
+
   test("shows remove action for favorited session tabs", async ({ page }) => {
     const sessions = seedSessions()
     await mockOpenCodeServer(page, {
@@ -706,7 +760,7 @@ test.describe("session navigator app plugin", () => {
     await expectAppVisible(nav.getByText("A Session 2 restored", { exact: true }))
   })
 
-  test("rejects a stale favorite before navigation so the current session stays visible", async ({ page }) => {
+  test("keeps a stale favorite listed without navigating so the current session stays visible", async ({ page }) => {
     const errors = trackPageErrors(page)
     const sessions = seedSessions()
     await mockOpenCodeServer(page, {
@@ -747,7 +801,8 @@ test.describe("session navigator app plugin", () => {
 
     await stale.locator(".oc-session-nav__session-main").click()
 
-    await expect(stale).toHaveCount(0)
+    await expect(stale).toHaveCount(1)
+    await expect(stale).toHaveClass(/oc-session-nav__session--missing/)
     await expect
       .poll(() =>
         page.evaluate(() => {
@@ -1531,6 +1586,130 @@ test.describe("session navigator app plugin", () => {
     expect(networkFailures).toEqual([])
   })
 
+  test("keeps a fresh run spinning in the navigator and tab when the status poll reports no activity", async ({ page }) => {
+    const sessions = seedSessions()
+    const events: EventPayload[] = []
+    const consoleErrors: string[] = []
+    const networkFailures: string[] = []
+    let statusResponses = 0
+    let eventSeq = 0
+    const emitActivity = (status: "started" | "completed") => {
+      eventSeq++
+      const activity = {
+        sessionID,
+        activityID: "activity_v2_fresh_run",
+        timestamp: Date.now(),
+        ...(status === "started" ? { kind: "prompt" } : {}),
+      }
+      events.push(
+        {
+          directory: dirA,
+          payload: {
+            id: `activity_fresh_run_${status}_${eventSeq}`,
+            type: `session.next.activity.${status}`,
+            properties: activity,
+          },
+        },
+        {
+          directory: dirA,
+          payload: {
+            id: `activity_fresh_run_${status}_${eventSeq}_sync`,
+            type: "sync",
+            syncEvent: {
+              id: `activity_fresh_run_${status}_${eventSeq}`,
+              type: `session.next.activity.${status}.1`,
+              seq: eventSeq,
+              aggregateID: sessionID,
+              data: activity,
+            },
+          },
+        },
+      )
+    }
+
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text())
+    })
+    page.on("pageerror", (error) => consoleErrors.push(error.message))
+    page.on("requestfailed", (request) => {
+      // Project lookup can be cancelled when the optimistic prompt updates the route state.
+      if (
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/project/resolve" &&
+        request.failure()?.errorText === "net::ERR_ABORTED"
+      ) return
+      networkFailures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "failed"}`)
+    })
+    page.on("response", (response) => {
+      if (new URL(response.url()).pathname === "/session/status") statusResponses++
+      if (response.status() >= 400) networkFailures.push(`${response.status()} ${response.url()}`)
+    })
+    await mockOpenCodeServer(page, {
+      directory: dirA,
+      project: project("proj-a", dirA, "Project A"),
+      provider: provider(),
+      sessions,
+      // The server never reports the fresh run as busy: every poll answers without the session.
+      sessionStatus: () => ({}),
+      // The newest assistant message is still the previous turn's finished answer when the run
+      // starts, so the idle snapshot alone must not settle the activity that just began.
+      pageMessages: (id) => ({ items: id === sessionID ? [settledAssistantMessage(id)] : [] }),
+      globalEvents: () => events.splice(0, events.length),
+      events: () => [],
+      eventRetry: 16,
+      onSessionPrompt: (input) => {
+        emitActivity("started")
+        return { data: { sessionID: input.sessionID, messageID: "msg_v2_fresh_run", admittedSeq: 1 } }
+      },
+    })
+    await mockNavigatorPlugin(page)
+    await mockNavigatorData(page, { sessions, archived: new Set(), deleted: new Set() })
+    await configurePage(page, { seedNavigatorDock: true })
+
+    await page.setViewportSize({ width: 1280, height: 840 })
+    await page.goto(`/${base64Encode(dirA)}/session/${sessionID}`)
+    await addDockPane(page, "left", "Session Navigator")
+    const nav = page.locator(".oc-session-nav")
+    const runningRow = nav.locator(".oc-session-nav__session").filter({ hasText: "A Session 1" }).first()
+    const runningTab = page.locator(
+      `[data-dock-area="middle"] [data-dock-tab][data-session-id="${sessionID}"]`,
+    )
+    const composer = page.locator('[data-component="session-composer"]')
+    const input = composer.locator('[data-component="prompt-input"]')
+    const submit = composer.locator('[data-action="prompt-submit"]').last()
+    await expectAppVisible(input)
+    await expectAppVisible(runningRow)
+    await expect(runningTab.getByRole("tab")).toHaveAttribute("aria-selected", "true")
+    // The bootstrap status read must be answered before the run starts, so the first poll
+    // counted below belongs to the run and not to the initial page load.
+    await expect.poll(() => statusResponses).toBeGreaterThan(0)
+
+    await input.fill("Keep the fresh run spinning")
+    await submit.click()
+
+    await expect.poll(() => eventSeq).toBe(1)
+    await expect.poll(() => events.length).toBe(0)
+    await expectAppVisible(runningRow.locator(".oc-session-nav__spinner"))
+    await expectAppVisible(runningTab.locator('[data-slot="project-avatar-loader"]'))
+
+    const responsesBefore = statusResponses
+    await expect.poll(() => statusResponses).toBeGreaterThan(responsesBefore + 1)
+    await expectAppVisible(runningRow.locator(".oc-session-nav__spinner"))
+    await expectAppVisible(runningTab.locator('[data-slot="project-avatar-loader"]'))
+    await expect(submit).toHaveAttribute("aria-label", /Stop|Stopp/)
+
+    emitActivity("completed")
+    events.push({
+      directory: dirA,
+      payload: { type: "session.turn.completed", properties: { sessionID, status: "done" } },
+    })
+    await expect(runningRow.locator(".oc-session-nav__spinner")).toHaveCount(0)
+    await expect(runningTab.locator('[data-slot="project-avatar-loader"]')).toHaveCount(0)
+    await expect(submit).toHaveAttribute("aria-label", /Send|Senden/)
+    expect(consoleErrors).toEqual([])
+    expect(networkFailures).toEqual([])
+  })
+
   test("hides favorited subagents saved without parent metadata", async ({ page }) => {
     const sessions = [
       ...seedSessions(),
@@ -2169,6 +2348,30 @@ function runningToolMessage(sessionID: string) {
         },
       },
     ],
+  }
+}
+
+// A finished assistant turn: `finish` plus `time.completed` mark it as settled. This is what the
+// client store still holds right after a new run starts (the previous turn's answer).
+function settledAssistantMessage(sessionID: string) {
+  const messageID = `${sessionID}-assistant`
+  return {
+    info: {
+      id: messageID,
+      sessionID,
+      role: "assistant",
+      parentID: `${sessionID}-user`,
+      time: { created: 1_700_000_000_000, completed: 1_700_000_005_000 },
+      finish: "stop",
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: "claude-opus-4-6",
+      providerID: "opencode",
+      mode: "build",
+      agent: "build",
+      path: { cwd: dirA, root: dirA },
+    },
+    parts: [{ id: `${messageID}-text`, sessionID, messageID, type: "text", text: "Previous turn finished." }],
   }
 }
 

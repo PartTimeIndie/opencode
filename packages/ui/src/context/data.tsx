@@ -49,6 +49,8 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
     onNavigateToSession?: NavigateToSessionFn
     onSessionHref?: SessionHrefFn
     resolveMediaUrl?: (part: FilePart, representation: "content" | "preview") => Promise<string>
+    onAnnotateImage?: (part: FilePart) => void
+    annotateImageLabel?: string
   }) => {
     return {
       get store() {
@@ -60,6 +62,8 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
       navigateToSession: props.onNavigateToSession,
       sessionHref: props.onSessionHref,
       resolveMediaUrl: props.resolveMediaUrl,
+      onAnnotateImage: props.onAnnotateImage,
+      annotateImageLabel: props.annotateImageLabel,
     }
   },
 })

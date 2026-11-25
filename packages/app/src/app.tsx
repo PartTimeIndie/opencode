@@ -38,10 +38,13 @@ import { GlobalProvider } from "@/context/global"
 import { HighlightsProvider } from "@/context/highlights"
 import { LanguageProvider, type Locale, useLanguage } from "@/context/language"
 import { LayoutProvider, useLayout } from "@/context/layout"
+import { WebDocksProvider } from "@/context/web-docks"
 import { MOBILE_DOCK_MEDIA_QUERY } from "@/context/layout-dock"
 import { ModelsProvider } from "@/context/models"
 import { ModelChainSafetyReviewBridge } from "@/context/model-chain-safety-review-bridge"
 import { NotificationProvider } from "@/context/notification"
+import { SessionAttentionProvider } from "@/context/session-attention"
+import { SessionAttentionNotices } from "@/components/session-attention-notices"
 import { PermissionProvider } from "@/context/permission"
 import { PromptProvider } from "@/context/prompt"
 import { ServerConnection, ServerProvider, serverName, useServer } from "@/context/server"
@@ -363,7 +366,9 @@ function SharedProviders(props: ParentProps) {
     <SettingsProvider>
       <BodyDesignClass />
       <CommandProvider>
-        <HighlightsProvider>{props.children}</HighlightsProvider>
+        <WebDocksProvider>
+          <HighlightsProvider>{props.children}</HighlightsProvider>
+        </WebDocksProvider>
       </CommandProvider>
     </SettingsProvider>
   )
@@ -387,6 +392,7 @@ function ServerScopedShell(props: ParentProps) {
     <ActiveSessionRouteProvider>
       <PermissionProvider>
         <LayoutProvider>
+          <SessionAttentionProvider>
           <NotificationProvider>
             <ModelsProvider>
               <ModelChainSafetyReviewBridge />
@@ -400,9 +406,11 @@ function ServerScopedShell(props: ParentProps) {
                   </DockContentProvider>
                 </Layout>
                 <AppPluginLoadingOverlay />
+                <SessionAttentionNotices />
               </AppPluginRuntimeProvider>
             </ModelsProvider>
           </NotificationProvider>
+          </SessionAttentionProvider>
         </LayoutProvider>
       </PermissionProvider>
     </ActiveSessionRouteProvider>
@@ -420,7 +428,7 @@ function SessionDockShellHost(props: ParentProps) {
   return (
     <Show when={tabs.active()} fallback={props.children}>
       <div class="relative size-full overflow-hidden flex flex-col">
-        {dockContent.parts()?.header}
+        {dockContent.parts()?.header()}
         <SessionDockShell middle={props.children} />
       </div>
     </Show>

@@ -50,7 +50,7 @@ function harness() {
   return { controller, dispatch, sessionID, store }
 }
 
-function startRunningTool(test: ReturnType<typeof harness>) {
+function startRunningTool(test: ReturnType<typeof harness>, tool = "read") {
   test.dispatch("evt_step", "session.next.step.started", {
     timestamp: 2,
     assistantMessageID: "msg_assistant",
@@ -61,33 +61,94 @@ function startRunningTool(test: ReturnType<typeof harness>) {
     timestamp: 3,
     assistantMessageID: "msg_assistant",
     callID: "call_1",
-    tool: "read",
+    tool,
     input: { path: "README.md" },
     provider: { executed: false },
   })
 }
 
 describe("session live projection", () => {
+  test.each(["bash", "multi_agent_fanout"])(
+    "preserves %s detail snapshots through failure and ignores late progress",
+    (tool) => {
+      const h = harness()
+      startRunningTool(h, tool)
+      const structured =
+        tool === "bash"
+          ? { command: "bun test", cwd: "C:/project", output: "first line", truncated: false, privateRuntime: "secret" }
+          : {
+              workflow: "review",
+              reviewers: [{ reviewer: { model: "configured/reviewer" }, state: "running", sessionID: "ses_child" }],
+              privateRuntime: "secret",
+            }
+      h.dispatch("evt_progress", "session.next.tool.progress", {
+        timestamp: 4,
+        assistantMessageID: "msg_assistant",
+        callID: "call_1",
+        structured,
+        content: [],
+      })
+      const before = h.store.part.msg_assistant?.[0]
+      expect(before?.type).toBe("tool")
+      if (before?.type !== "tool" || before.state.status !== "running") throw new Error("Missing running tool")
+      expect(before.state.metadata).not.toHaveProperty("privateRuntime")
+      h.dispatch("evt_failed", "session.next.tool.failed", {
+        timestamp: 5,
+        assistantMessageID: "msg_assistant",
+        callID: "call_1",
+        error: { message: "Interrupted" },
+        provider: { executed: false },
+      })
+      const failed = h.store.part.msg_assistant?.[0]
+      expect(failed).toMatchObject({ state: { status: "error", metadata: before.state.metadata } })
+      h.dispatch("evt_late", "session.next.tool.progress", {
+        timestamp: 6,
+        assistantMessageID: "msg_assistant",
+        callID: "call_1",
+        structured: {},
+        content: [],
+      })
+      expect(h.store.part.msg_assistant?.[0]).toEqual(failed)
+    },
+  )
   test("reconciles externalized clipboard files when the promotion arrives before a page refresh", () => {
     const test = harness()
     const aliases: Part[] = [0, 1].map((index) => ({
-      id: `prt_alias_${index}`, sessionID: test.sessionID, messageID: "msg_user", type: "file",
-      mime: "image/png", filename: "image.png", url: `data:image/png;base64,${index}`,
+      id: `prt_alias_${index}`,
+      sessionID: test.sessionID,
+      messageID: "msg_user",
+      type: "file",
+      mime: "image/png",
+      filename: "image.png",
+      url: `data:image/png;base64,${index}`,
     }))
     test.store.part.msg_user = aliases
-    const action = test.controller.handle({
-      id: "evt_promoted", type: "session.next.prompt.promoted", data: {
-        sessionID: test.sessionID, messageID: "msg_user", timestamp: 2,
-        prompt: { text: "Inspect these images", files: [0, 1].map((index) => ({
-          uri: `attachment://att_${index}`, mime: "image/png", name: "image.png",
-        })) },
+    const action = test.controller.handle(
+      {
+        id: "evt_promoted",
+        type: "session.next.prompt.promoted",
+        data: {
+          sessionID: test.sessionID,
+          messageID: "msg_user",
+          timestamp: 2,
+          prompt: {
+            text: "Inspect these images",
+            files: [0, 1].map((index) => ({
+              uri: `attachment://att_${index}`,
+              mime: "image/png",
+              name: "image.png",
+            })),
+          },
+        },
       },
-    }, test.store)
+      test.store,
+    )
     expect(action?.kind).toBe("message")
     if (action?.kind !== "message") throw new Error("promoted user message required")
     const parts = mergePartsPreservingText(aliases, action.parts ?? [], {})
     expect(parts.filter((part) => part.type === "file").map((part) => part.id)).toEqual([
-      "msg_user:file:0", "msg_user:file:1",
+      "msg_user:file:0",
+      "msg_user:file:1",
     ])
   })
 
@@ -809,20 +870,24 @@ describe("session live projection", () => {
       structured: { state: "running" },
     })
 
-    expect(test.dispatch("evt_0003", "session.next.tool.called.1", {
-      timestamp: 3,
-      assistantMessageID: "msg_assistant",
-      callID: "call_1",
-      tool: "read",
-      input: { path: "old.md" },
-    })).toEqual({ kind: "handled", sessionID: test.sessionID })
+    expect(
+      test.dispatch("evt_0003", "session.next.tool.called.1", {
+        timestamp: 3,
+        assistantMessageID: "msg_assistant",
+        callID: "call_1",
+        tool: "read",
+        input: { path: "old.md" },
+      }),
+    ).toEqual({ kind: "handled", sessionID: test.sessionID })
     test.controller.clear()
-    expect(test.dispatch("evt_0004", "session.next.tool.progress.1", {
-      timestamp: 4,
-      assistantMessageID: "msg_assistant",
-      callID: "call_1",
-      input: { path: "older.md" },
-    })).toEqual({ kind: "handled", sessionID: test.sessionID })
+    expect(
+      test.dispatch("evt_0004", "session.next.tool.progress.1", {
+        timestamp: 4,
+        assistantMessageID: "msg_assistant",
+        callID: "call_1",
+        input: { path: "older.md" },
+      }),
+    ).toEqual({ kind: "handled", sessionID: test.sessionID })
     expect(test.store.part.msg_assistant?.find((part) => part.id === "call_1")).toMatchObject({
       type: "tool",
       state: { status: "running", input: { path: "new.md" } },
@@ -840,11 +905,13 @@ describe("session live projection", () => {
       tokens: { input: 5, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
     })
     test.controller.clear()
-    expect(test.dispatch("evt_0004", "session.next.step.failed.1", {
-      timestamp: 4,
-      assistantMessageID: "msg_assistant",
-      error: { message: "stale" },
-    })).toEqual({ kind: "handled", sessionID: test.sessionID })
+    expect(
+      test.dispatch("evt_0004", "session.next.step.failed.1", {
+        timestamp: 4,
+        assistantMessageID: "msg_assistant",
+        error: { message: "stale" },
+      }),
+    ).toEqual({ kind: "handled", sessionID: test.sessionID })
     test.dispatch("evt_0006", "session.next.step.failed.1", {
       timestamp: 5,
       assistantMessageID: "msg_assistant",

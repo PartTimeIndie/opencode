@@ -9,7 +9,7 @@ import { Skill } from "@/skill"
 import { Cause, Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ApiVcsApplyError, ApiVcsGitActionError } from "../groups/instance"
+import { ApiVcsApplyError, ApiVcsGitActionError, ApiVcsGitHistoryErrors } from "../groups/instance"
 import { markInstanceForDisposal } from "../lifecycle"
 
 export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance", (handlers) =>
@@ -77,6 +77,35 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
       return yield* vcs.gitSnapshot({ limit: ctx.query.limit })
     })
 
+    const mapGitHistoryError = (failure: Vcs.GitHistoryFailure) => {
+      const data = { message: failure.message, code: failure.code, recovery: failure.recovery }
+      const [invalid, stale, limit, process] = ApiVcsGitHistoryErrors
+      switch (failure.code) {
+        case "invalid_ref":
+        case "invalid_cursor":
+          return new invalid({ name: "VcsGitHistoryError", data })
+        case "history_unavailable":
+        case "shallow_changed":
+          return new stale({ name: "VcsGitHistoryError", data })
+        case "output_limit":
+          return new limit({ name: "VcsGitHistoryError", data })
+        case "process_failed":
+          return new process({ name: "VcsGitHistoryError", data })
+      }
+    }
+
+    const postVcsGitHistory = Effect.fn("InstanceHttpApi.vcsGitHistory")(function* (ctx: {
+      payload: Vcs.GitHistoryRequest
+    }) {
+      return yield* vcs.gitHistory(ctx.payload).pipe(Effect.mapError(mapGitHistoryError))
+    })
+
+    const postVcsGitCommitMessage = Effect.fn("InstanceHttpApi.vcsGitCommitMessage")(function* (ctx: {
+      payload: Vcs.GitCommitMessageRequest
+    }) {
+      return yield* vcs.gitCommitMessage(ctx.payload).pipe(Effect.mapError(mapGitHistoryError))
+    })
+
     const discoverVcsGit = Effect.fn("InstanceHttpApi.vcsGitDiscover")(function* (ctx: {
       query: Vcs.GitDiscoverQuery
     }) {
@@ -127,6 +156,8 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
       .handle("vcsDiffRaw", getVcsDiffRaw)
       .handle("vcsApply", applyVcs)
       .handle("vcsGit", getVcsGit)
+      .handle("vcsGitHistory", postVcsGitHistory)
+      .handle("vcsGitCommitMessage", postVcsGitCommitMessage)
       .handle("vcsGitDiscover", discoverVcsGit)
       .handle("vcsGitAction", runVcsGitAction)
       .handle("command", getCommand)

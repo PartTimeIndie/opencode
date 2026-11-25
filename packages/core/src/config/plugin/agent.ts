@@ -33,6 +33,7 @@ const agentKeys = new Set([
   "system",
   "instructions",
   "tools",
+  "skills",
   "completion",
   "description",
   "mode",
@@ -184,9 +185,23 @@ export const Plugin = PluginV2.define({
               if (item.instructions !== undefined) {
                 agent.instructions = { mode: item.instructions.mode, files: [...(item.instructions.files ?? [])] }
               }
+              if (item.skills !== undefined) {
+                // Per-agent skill policy overrides. Sparse by field; an absent
+                // entry or field inherits the global skill policy.
+                agent.skills = Object.fromEntries(
+                  Object.entries(item.skills).map(([skillName, entry]) => [
+                    skillName,
+                    {
+                      ...(entry.visible === undefined ? {} : { visible: entry.visible }),
+                      ...(entry.invocation === undefined ? {} : { invocation: entry.invocation }),
+                    },
+                  ]),
+                )
+              }
               if (switches.tools !== undefined) {
+                const tools = ConfigAgent.mergeTools(agent.tools, switches.tools)
                 const entries = Object.fromEntries(
-                  Object.entries(switches.tools.entries ?? {}).map(([name, value]) => [
+                  Object.entries(tools.entries ?? {}).map(([name, value]) => [
                     name,
                     {
                       visible: value.visible ?? true,
@@ -197,7 +212,7 @@ export const Plugin = PluginV2.define({
                     },
                   ]),
                 )
-                agent.tools = { mode: switches.tools.mode, entries }
+                agent.tools = { mode: tools.mode, entries }
                 for (const [name, value] of Object.entries(entries)) {
                   if (name === ConfigAgent.SWITCH_TOOL && value.visible && value.permission !== "deny") continue
                   agent.permissions.push({

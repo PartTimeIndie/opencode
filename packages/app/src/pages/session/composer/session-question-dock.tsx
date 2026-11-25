@@ -3,6 +3,7 @@ import {
   Match,
   Show,
   Switch,
+  batch,
   createEffect,
   createMemo,
   createSignal,
@@ -14,7 +15,7 @@ import {
 } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Portal } from "solid-js/web"
-import { fullscreenCloseButtonRight, shouldCloseVideoFullscreenOnEscape } from "./session-question-video"
+import { fullscreenCloseButtonRight, shouldCloseVideoFullscreenOnEscape, videoPreviewRatio } from "./session-question-video"
 import { Button } from "@opencode-ai/ui/button"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { Dialog } from "@opencode-ai/ui/dialog"
@@ -49,6 +50,7 @@ import { makeEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { useServerSDK } from "@/context/server-sdk"
 import { ScopedKey } from "@/utils/server-scope"
+import { Identifier } from "@/utils/id"
 
 import { attachmentMime } from "@/components/prompt-input/files"
 import { imageAttachmentRequestPart } from "@/components/prompt-input/build-request-parts"
@@ -72,6 +74,16 @@ import {
   type SurfaceRequestStatus,
 } from "./session-question-retry"
 import { shouldAutofocusQuestionDock } from "./session-question-autofocus"
+import {
+  choiceControl,
+  controlType,
+  dangerAnswer,
+  questionChatSend,
+  quickApproveAnswers,
+  requestChatSend,
+  textControl,
+} from "./session-question-approve"
+import { questionFormValue } from "./session-question-form-values"
 import { QuestionDockMenu } from "./question-dock-menu"
 import {
   isFormExpectation,
@@ -316,11 +328,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function controlType(question: QuestionV2Info | undefined): QuestionControlType {
-  if (question?.type) return question.type
-  return question?.multiple ? "pick_many" : "pick_one"
-}
-
 function controlOptions(question: QuestionV2Info | undefined): QuestionOption[] {
   if (!question) return []
   if (question.type === "confirm" && !question.options?.length) {
@@ -343,16 +350,6 @@ function controlOptions(question: QuestionV2Info | undefined): QuestionOption[] 
   }
   if (question.type === "emoji_react" && question.emojis?.length) return question.emojis.map((label) => ({ label }))
   return question.options ?? []
-}
-
-function choiceControl(type: QuestionControlType | undefined) {
-  return (
-    type !== undefined && ["pick_one", "pick_many", "confirm", "show_options", "thumbs", "emoji_react"].includes(type)
-  )
-}
-
-function textControl(type: QuestionControlType | undefined) {
-  return type !== undefined && ["ask_text", "ask_code", "ask_file", "ask_image"].includes(type)
 }
 
 function reviewControl(type: QuestionControlType | undefined) {
@@ -455,10 +452,6 @@ function optionKey(option: QuestionOption) {
 function formTooltip(value: string | undefined) {
   const trimmed = value?.trim()
   return trimmed ? trimmed : undefined
-}
-
-function dangerAnswer(value: string) {
-  return /\b(cancel|abort|reject|decline|stop)\b|abbrechen|ablehnen/i.test(value)
 }
 
 function reviewSubmitAction(question: QuestionV2Info | undefined, type: QuestionControlType | undefined) {
@@ -1452,9 +1445,13 @@ export const SessionQuestionDock: Component<{
     ) as Record<string, QuestionFormValue>
   }
 
-  const formValue = (field: QuestionFormField) => formValues(store.tab)[field.id] ?? formInitialValue(field)
+  const formValue = (field: QuestionFormField) => questionFormValue(store.forms[store.tab], field, formInitialValue)
+  const formValueById = (id: string) => {
+    const field = formFieldById(id)
+    return field ? formValue(field) : undefined
+  }
 
-  const setFormField = (field: QuestionFormField, value: QuestionFormValue) => {
+  const setFormField = (field: QuestionFormField, value: QuestionFormValue) => batch(() => {
     setStore("forms", store.tab, (current = {}) => ({ ...current, [field.id]: value }))
     const form = currentForm()
     const values = { ...formValues(store.tab), [field.id]: value }
@@ -1462,7 +1459,7 @@ export const SessionQuestionDock: Component<{
     runLocalFormActions(form, "change", field.id, values, value)
     const action = matchingChangeAction(form, field, values)
     if (form && action) void submitFormAction(form, values, action, false, field.id)
-  }
+  })
 
   const formSurfaceState = () =>
     Object.fromEntries(
@@ -1481,9 +1478,11 @@ export const SessionQuestionDock: Component<{
     values: Record<string, QuestionFormValue>,
     fallback: unknown,
   ) => {
-    for (const action of matchingSurfaceActions(form?.actions, event, source, values)) {
-      for (const step of action.steps) runLocalFormActionStep(step, values, fallback)
-    }
+    batch(() => {
+      for (const action of matchingSurfaceActions(form?.actions, event, source, values)) {
+        for (const step of action.steps) runLocalFormActionStep(step, values, fallback)
+      }
+    })
   }
 
   const runLocalFormActionStep = (step: SurfaceActionStep, values: Record<string, QuestionFormValue>, fallback: unknown, result?: Record<string, unknown>) => {
@@ -1498,7 +1497,9 @@ export const SessionQuestionDock: Component<{
   }
 
   const runActionSetValueSteps = (action: SurfaceAction, values: Record<string, QuestionFormValue>, result?: Record<string, unknown>) => {
-    for (const step of action.steps) runLocalFormActionStep(step, values, undefined, result)
+    batch(() => {
+      for (const step of action.steps) runLocalFormActionStep(step, values, undefined, result)
+    })
   }
 
   const formInputKey = (field: QuestionFormField) => `${store.tab}:${field.id}`
@@ -1905,16 +1906,105 @@ export const SessionQuestionDock: Component<{
     void reply(questions().map((_, i) => answerFor(i)))
   }
 
+  const submitQuickApprove = () => {
+    const approve = quickApprove()
+    if (!approve || sending()) return
+    batch(() => {
+      approve.forEach((labels, index) => {
+        setStore("answers", index, [...labels])
+        setStore("customOn", index, false)
+        // Cached free text must not ride along as feedback on the approval.
+        setStore("custom", index, "")
+      })
+    })
+    setStore("editing", false)
+    submit()
+  }
+
+  // Admission is retried with one stable message id per request: the server treats a
+  // repeated prompt with the same id as already admitted, so a lost response or a
+  // retry after the timeout never queues the chat message twice.
+  const CHAT_SEND_TIMEOUT_MS = 20000
+  let chatSendMessageID: string | undefined
+
+  const submitChatSend = async () => {
+    const send = chatSend()
+    if (!send || sending()) return
+    const client = sdk().client
+    const sessionID = props.request.sessionID
+    const currentTab = store.tab
+    const type = currentType()
+    chatSendMessageID ??= Identifier.ascending("message")
+    setRequestStatus({ type: "submitting", attempt: 0 })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        client.v2.session.prompt({
+          sessionID,
+          id: chatSendMessageID,
+          prompt: { text: send.text },
+          delivery: "queue",
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "The chat message could not be confirmed in time. Check the session chat before retrying; a retry reuses the same message and cannot send it twice.",
+                ),
+              ),
+            CHAT_SEND_TIMEOUT_MS,
+          )
+        }),
+      ])
+    } catch (err) {
+      if (!disposed) {
+        setRequestStatus({ type: "idle" })
+        fail(err)
+      }
+      return
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+    // The chat message is durably admitted; settle the question even if this view
+    // unmounts while the admission was in flight.
+    setRequestStatus({ type: "idle" })
+    batch(() => {
+      setStore("answers", currentTab, [send.text])
+      setStore("customOn", currentTab, false)
+      setStore("custom", currentTab, textControl(type) ? send.text : "")
+    })
+    setStore("editing", false)
+    submit()
+  }
+
   const answered = (i: number) => {
     const q = questions()[i] as QuestionV2Info | undefined
     const type = controlType(q)
     if (type === "slider" || type === "rank" || type === "rate") return true
     if (type === "form")
-      return !!q?.form && q.form.fields.every((field) => !formFieldValidationError(field, formValues(i)[field.id]))
+      return !!q?.form && q.form.fields.every((field) => !formFieldValidationError(field, questionFormValue(store.forms[i], field, formInitialValue)))
     if (textControl(type)) return (store.custom[i] ?? "").trim().length >= (q?.minLength ?? 1) || questionAttachmentAnswers(i).length > 0
     if ((store.answers[i]?.length ?? 0) > 0) return true
     return store.customOn[i] === true && ((store.custom[i] ?? "").trim().length > 0 || questionAttachmentAnswers(i).length > 0)
   }
+
+  // One-click chat approval: sends the recorded text into the session chat and answers
+  // its question with exactly that text, so the blocked run resumes without retyping.
+  // It is offered once every other question of the request is answered.
+  const chatSend = createMemo(() => {
+    const send = questionChatSend(question())
+    if (!send) return
+    const ready = questions().every((_, i) => i === store.tab || answered(i))
+    return ready ? send : undefined
+  })
+  // One-click recommendation approval for ordinary choice questions; refused when any
+  // question of the request carries a chat approval, for rejecting answers, or when
+  // manual input is needed.
+  const quickApprove = createMemo(() => {
+    if (detached() || requestChatSend(questions() as QuestionV2Info[])) return undefined
+    return quickApproveAnswers(questions() as QuestionV2Info[], controlOptions)
+  })
 
   const finalizeRemaining = createMemo(() => {
     if (detached() || !questions().some((_, index) => !answered(index))) return
@@ -2748,13 +2838,17 @@ export const SessionQuestionDock: Component<{
               src={src()}
               poster={formMediaSrc(String(surfaceTargetValue(currentForm()?.effects, `ui.${field.id}.poster`, formSurfaceContext()) ?? field.poster ?? ""))}
               style={surfaceStyle(currentForm()?.effects, field.id, formSurfaceContext())}
-              onLoadedMetadata={(event) =>
+              onLoadedMetadata={(event) => {
+                event.currentTarget.style.setProperty(
+                  "--question-video-ratio",
+                  String(videoPreviewRatio(event.currentTarget.videoWidth, event.currentTarget.videoHeight)),
+                )
                 setVideoFieldState(field, {
                   current: event.currentTarget.currentTime,
                   duration: event.currentTarget.duration,
                   paused: event.currentTarget.paused,
                 })
-              }
+              }}
               onTimeUpdate={(event) => setVideoFieldState(field, { current: event.currentTarget.currentTime })}
               onPlay={() => setVideoFieldState(field, { paused: false })}
               onPause={() => setVideoFieldState(field, { paused: true })}
@@ -2935,7 +3029,7 @@ export const SessionQuestionDock: Component<{
   }
 
   const renderFormNode = (form: QuestionFormSpec, node: QuestionFormLayoutNode): JSX.Element => {
-    if (node.when && String(formValues(store.tab)[node.when.field] ?? "") !== node.when.equals) return <></>
+    if (node.when && String(formValueById(node.when.field) ?? "") !== node.when.equals) return <></>
     if (node.type === "field") return renderFormField(form, node.field)
     if (isFormExpectation(node)) return <></>
     const embeddedReview = embeddedFormReview(node.text)
@@ -2978,7 +3072,7 @@ export const SessionQuestionDock: Component<{
         </Show>
         <For each={node.children ?? []}>
           {(child) => (
-            <Show when={!child.when || String(formValues(store.tab)[child.when.field] ?? "") === child.when.equals}>
+            <Show when={!child.when || String(formValueById(child.when.field) ?? "") === child.when.equals}>
               <div data-slot="question-form-node" style={formChildStyle(node, child)}>
                 {renderFormNode(form, child)}
               </div>
@@ -3126,6 +3220,20 @@ export const SessionQuestionDock: Component<{
             <Show when={statusText()}>{(text) => <span data-slot="question-submit-status">{text()}</span>}</Show>
           </div>
           <div data-slot="question-footer-actions">
+            <Show when={quickApprove()}>
+              {(approve) => (
+                <Button
+                  variant="secondary"
+                  size="large"
+                  data-slot="question-quick-approve"
+                  disabled={sending()}
+                  onClick={submitQuickApprove}
+                  title={approve().map((labels) => labels.join(", ")).join(" · ")}
+                >
+                  {language.t("session.question.quickApprove")}
+                </Button>
+              )}
+            </Show>
             <Show when={finalizeRemaining()}>
               {(option) => (
                 <Button
@@ -3145,8 +3253,22 @@ export const SessionQuestionDock: Component<{
                 {language.t("ui.common.back")}
               </Button>
             </Show>
+            <Show when={chatSend()}>
+              {(send) => (
+                <Button
+                  variant="primary"
+                  size="large"
+                  data-slot="question-chat-send"
+                  disabled={sending()}
+                  onClick={submitChatSend}
+                  title={send().description ?? send().text}
+                >
+                  {send().label ?? language.t("session.question.chatSend")}
+                </Button>
+              )}
+            </Show>
             <Button
-              variant={last() ? "primary" : "secondary"}
+              variant={last() && !chatSend() ? "primary" : "secondary"}
               size="large"
               disabled={sending() || formAdvanceBlocked() || submitBlocked()}
               onClick={next}

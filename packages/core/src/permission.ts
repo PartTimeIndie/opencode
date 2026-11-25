@@ -72,6 +72,12 @@ export const AssertInput = Schema.Struct({
   id: ID.pipe(Schema.optional),
   ...RequestFields,
   agent: AgentV2.ID.pipe(Schema.optional),
+  /**
+   * Internal, non-model-supplied rule layer evaluated together with configured
+   * and inherited rules (for example the skill invocation ask). Deny always
+   * wins; full access and approve-for-me treat it like any configured ask.
+   */
+  extraRules: PermissionSchema.Ruleset.pipe(Schema.optional),
 }).annotate({ identifier: "PermissionV2.AssertInput" })
 export type AssertInput = typeof AssertInput.Type
 
@@ -142,9 +148,24 @@ export function merge(...rulesets: Ruleset[]): Ruleset {
   return rulesets.flat()
 }
 
+export type PolicySnapshot = {
+  readonly configured: Ruleset
+  readonly inherited: readonly Ruleset[]
+  readonly accessControl: ConfigAccessControl.Info
+  readonly remembered: Ruleset
+  readonly safetyReviewAvailable: boolean
+  readonly reviewed: readonly string[]
+  readonly rejected: readonly string[]
+}
+
 export interface Interface {
+  /** Optional for legacy embeddings. Managed execution refuses missing evidence. */
+  readonly policySnapshot?: (input: { sessionID: SessionV2.ID; agent?: AgentV2.ID }) =>
+    EffectRuntime.Effect<PolicySnapshot, SessionV2.NotFoundError>
   readonly ask: (input: AssertInput) => EffectRuntime.Effect<AskResult, SessionV2.NotFoundError>
   readonly assert: (input: AssertInput) => EffectRuntime.Effect<void, Error | SessionV2.NotFoundError>
+  /** Native host receipt; returns the actual joined request ID, never the caller's proposed ID. */
+  readonly assertSingleUse?: (input: AssertInput) => EffectRuntime.Effect<ID, Error | SessionV2.NotFoundError>
   readonly reply: (input: ReplyInput) => EffectRuntime.Effect<void, NotFoundError | RejectedError>
   readonly materializationRules: (input: {
     sessionID: SessionV2.ID
@@ -371,7 +392,7 @@ export const layer = Layer.effect(
     const evaluateInput = EffectRuntime.fnUntraced(function* (input: AssertInput) {
       const profile = yield* accessControl(input.sessionID)
       const rules = yield* configured(input.sessionID, input.agent)
-      const layers = [rules, ...(yield* inherited(input.sessionID))]
+      const layers = [rules, ...(yield* inherited(input.sessionID)), ...(input.extraRules ? [input.extraRules] : [])]
       const allRules = layers.flat()
       if (layers.some((layer) => denied(input, layer))) return { effect: "deny" as const, rules: allRules }
       const cacheKey = (profile.mode === "approve_for_me" && safety._tag === "Some") || rejectedSafetyRequests.size
@@ -512,7 +533,7 @@ export const layer = Layer.effect(
       return { id: reviewed.id, effect: result.effect }
     })
 
-    const assert = EffectRuntime.fn("PermissionV2.assert")((input: AssertInput) =>
+    const assertWithReceipt = EffectRuntime.fn("PermissionV2.assertWithReceipt")((input: AssertInput) =>
       EffectRuntime.uninterruptibleMask((restore) =>
         EffectRuntime.gen(function* () {
           const scoped = yield* scopeInput(input)
@@ -531,6 +552,7 @@ export const layer = Layer.effect(
             scoped.agent,
           )
           return yield* restore(Deferred.await(item.deferred)).pipe(
+            EffectRuntime.as(item.request.id),
             EffectRuntime.onInterrupt(() =>
               pending.has(item.request.id)
                 ? events.publish(Event.Replied, {
@@ -550,6 +572,14 @@ export const layer = Layer.effect(
         }),
       ),
     )
+
+    const assert: Interface["assert"] = (input) => assertWithReceipt(input).pipe(EffectRuntime.asVoid)
+    const assertSingleUse = EffectRuntime.fn("PermissionV2.assertSingleUse")(function* (input: AssertInput) {
+      const receipt = yield* assertWithReceipt(singleUse(input))
+      // An allow shortcut is not evidence of a real host answer.
+      if (receipt === undefined) return yield* new RejectedError()
+      return receipt
+    })
 
     const reply = EffectRuntime.fn("PermissionV2.reply")((input: ReplyInput) =>
       EffectRuntime.uninterruptible(
@@ -645,7 +675,25 @@ export const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
     })
 
-    return Service.of({ ask, assert, reply, materializationRules, get, forSession, list })
+    const policySnapshot = EffectRuntime.fn("PermissionV2.policySnapshot")(function* (input: {
+      sessionID: SessionV2.ID
+      agent?: AgentV2.ID
+    }) {
+      return {
+        configured: yield* configured(input.sessionID, input.agent),
+        inherited: yield* inherited(input.sessionID),
+        accessControl: yield* accessControl(input.sessionID),
+        // Saved grants are all allow rules: ordering is not a policy change.
+        remembered: (yield* savedRules()).toSorted((a, b) =>
+          JSON.stringify([a.action, a.resource]).localeCompare(JSON.stringify([b.action, b.resource]))),
+        safetyReviewAvailable: safety._tag === "Some",
+        reviewed: [...reviewCache].filter(([key, approved]) => approved && key.startsWith(`${input.sessionID}\0`))
+          .map(([key]) => key).sort(),
+        rejected: [...rejectedSafetyRequests.keys()].filter((key) => key.startsWith(`${input.sessionID}\0`)).sort(),
+      }
+    })
+
+    return Service.of({ ask, assert, assertSingleUse, reply, materializationRules, policySnapshot, get, forSession, list })
   }),
 )
 

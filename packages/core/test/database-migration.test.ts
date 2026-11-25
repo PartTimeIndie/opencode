@@ -46,6 +46,65 @@ const runOnFile = <A, E>(filename: string, effect: Effect.Effect<A, E, SqlClient
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
 
 describe("DatabaseMigration", () => {
+  test("repairs missing question provenance without converting old receipts to user answers", async () => {
+    await run(Effect.gen(function* () {
+      const db = yield* makeDb
+      yield* DatabaseMigration.apply(db)
+      expect(yield* db.get("SELECT id FROM migration WHERE id LIKE '%_question_answer_source'")).toBeDefined()
+      yield* db.run("ALTER TABLE session_question DROP COLUMN answer_source")
+      yield* DatabaseMigration.apply(db)
+      expect(yield* db.all("SELECT name FROM pragma_table_info('session_question') WHERE name = 'answer_source'"))
+        .toEqual([{ name: "answer_source" }])
+    }))
+  })
+  test("repairs a missing orchestrator result column without fabricating a review", async () => {
+    await run(Effect.gen(function* () {
+      const db = yield* makeDb
+      yield* DatabaseMigration.apply(db)
+      expect(yield* db.get("SELECT id FROM migration WHERE id LIKE '%_orchestrator_task_result'")).toBeDefined()
+      yield* db.run("ALTER TABLE session_orchestrator_task DROP COLUMN result")
+      yield* DatabaseMigration.apply(db)
+      expect(yield* db.all("SELECT result FROM session_orchestrator_task")).toEqual([])
+      expect(yield* db.all("SELECT name FROM pragma_table_info('session_orchestrator_task') WHERE name = 'result'"))
+        .toEqual([{ name: "result" }])
+    }))
+  })
+  test("repairs missing job cleanup columns without attesting terminal legacy jobs", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        yield* db.run(
+          "INSERT INTO background_job (id, type, status, owner_id, time_created, time_updated) VALUES ('job_legacy', 'task', 'completed', 'owner_legacy', 1, 1)",
+        )
+        yield* db.run("ALTER TABLE background_job DROP COLUMN cleanup_token")
+        yield* db.run("ALTER TABLE background_job DROP COLUMN time_owner_settled")
+        expect(
+          yield* db.get("SELECT id FROM migration WHERE id LIKE '%_background_job_owner_settlement'"),
+        ).toBeDefined()
+        yield* DatabaseMigration.apply(db)
+        expect(
+          yield* db.get(
+            "SELECT status, owner_id, cleanup_token, time_owner_settled FROM background_job WHERE id = 'job_legacy'",
+          ),
+        ).toEqual({ status: "completed", owner_id: "owner_legacy", cleanup_token: null, time_owner_settled: null })
+      }),
+    )
+  })
+
+  test("repairs a missing session_input origin column while legacy admissions stay unattested", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.get("SELECT id FROM migration WHERE id LIKE '%_good_madame_masque'")).toBeDefined()
+        yield* db.run("ALTER TABLE session_input DROP COLUMN origin")
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.all("SELECT origin FROM session_input")).toEqual([])
+      }),
+    )
+  })
+
   test("repairs missing file knowledge metadata without inventing historical receipts", async () => {
     await run(
       Effect.gen(function* () {
@@ -61,6 +120,31 @@ describe("DatabaseMigration", () => {
         expect(
           yield* db.get("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'file_knowledge_source_idx'"),
         ).toBeDefined()
+      }),
+    )
+  })
+
+  test("repairs a missing project directory icon table after the journal says applied", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.get("SELECT id FROM migration WHERE id LIKE '%_project_directory_icon'")).toBeDefined()
+        yield* db.run(
+          "INSERT INTO project_directory_icon (directory, url, time_updated) VALUES ('E:/GitRepros/Skills', 'data:image/png;base64,AA==', 1)",
+        )
+        // The journal still says applied. Only the additive startup repair can
+        // restore the table for folders that have no project row of their own.
+        yield* db.run("DROP TABLE project_directory_icon")
+        yield* DatabaseMigration.apply(db)
+        expect(
+          yield* db.all('SELECT name, "notnull", pk FROM pragma_table_info(\'project_directory_icon\')'),
+        ).toEqual([
+          { name: "directory", notnull: 0, pk: 1 },
+          { name: "url", notnull: 1, pk: 0 },
+          { name: "time_updated", notnull: 1, pk: 0 },
+        ])
+        expect(yield* db.all("SELECT * FROM project_directory_icon")).toEqual([])
       }),
     )
   })
@@ -99,6 +183,140 @@ describe("DatabaseMigration", () => {
         )
         expect(columns.find((column) => column.name === "min_cache_read_ratio")?.dflt_value).toBe("0.8")
         expect(yield* db.all("SELECT * FROM session_orchestrator")).toEqual([])
+      }),
+    )
+  })
+
+  test("repairs an absent commission table without manufacturing approvals or cache families", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.all("SELECT * FROM session_orchestrator_commission")).toEqual([])
+        expect(yield* db.get("SELECT id FROM migration WHERE id LIKE '%_orchestrator_commission'")).toBeDefined()
+        yield* db.run("DROP TABLE session_orchestrator_commission")
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.all("SELECT * FROM session_orchestrator_commission")).toEqual([])
+        expect(
+          yield* db.get(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'session_orchestrator_commission_origin_idx'",
+          ),
+        ).toBeDefined()
+        yield* db.run("DROP INDEX session_orchestrator_commission_family_idx")
+        yield* db.run("ALTER TABLE session_orchestrator_commission DROP COLUMN revoked")
+        yield* DatabaseMigration.apply(db)
+        expect(
+          yield* db.get(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'session_orchestrator_commission_family_idx'",
+          ),
+        ).toBeDefined()
+        expect(
+          (yield* db.all<{ name: string; dflt_value: string | null }>(
+            "PRAGMA table_info(session_orchestrator_commission)",
+          )).find((column) => column.name === "revoked")?.dflt_value,
+        ).toBe("true")
+      }),
+    )
+  })
+
+  test("repair revokes populated commissions when their revocation evidence is lost", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: ProjectV2.ID.global, worktree: AbsolutePath.make("/commission-repair"), sandboxes: [] })
+          .run()
+        yield* db
+          .insert(SessionTable)
+          .values({
+            id: SessionSchema.ID.make("ses_commission_repair"),
+            project_id: ProjectV2.ID.global,
+            directory: "/commission-repair",
+            slug: "repair",
+            title: "repair",
+            version: "test",
+          })
+          .run()
+        yield* db.run(
+          `INSERT INTO session_orchestrator (main_session_id, time_created, time_updated) VALUES ('ses_commission_repair', 1, 1)`,
+        )
+        yield* db.run(
+          `INSERT INTO session_input (id, session_id, prompt, delivery, admitted_seq, time_created) VALUES ('msg_commission_repair', 'ses_commission_repair', '{"text":"scope"}', 'steer', 1, 1)`,
+        )
+        yield* db.run(`INSERT INTO session_orchestrator_commission (id, main_session_id, origin_input_id, origin_digest, scope, source_assistant_id,
+        source_call_id, agent, model, policy_digest, settings, cache_family, revoked, time_created)
+        VALUES ('receipt', 'ses_commission_repair', 'msg_commission_repair', 'digest', 'scope', 'msg_source', 'call', 'build', '{}', 'policy', '{}', 'family', 0, 1)`)
+        expect(yield* db.get("SELECT revoked FROM session_orchestrator_commission")).toEqual({ revoked: 0 })
+        yield* db.run("ALTER TABLE session_orchestrator_commission DROP COLUMN revoked")
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.get("SELECT id, cache_family, revoked FROM session_orchestrator_commission")).toEqual({
+          id: "receipt",
+          cache_family: "family",
+          revoked: 1,
+        })
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.get("SELECT revoked FROM session_orchestrator_commission")).toEqual({ revoked: 1 })
+      }),
+    )
+  })
+
+  test("upgrades populated commission receipts without changing approval or family identity", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        yield* db.run("DROP TABLE session_orchestrator_commission")
+        yield* db.run(
+          "DELETE FROM migration WHERE id IN ('20261027072654_orchestrator_commission', '20261027072948_commission_repair_guard')",
+        )
+        const first = migrations.find((migration) => migration.id === "20261027072654_orchestrator_commission")
+        if (!first) throw new Error("Missing commission migration")
+        yield* DatabaseMigration.applyOnly(db, [first], { deferStartupRepairs: true })
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: ProjectV2.ID.global, worktree: AbsolutePath.make("/commission-upgrade"), sandboxes: [] })
+          .run()
+        yield* db
+          .insert(SessionTable)
+          .values({
+            id: SessionSchema.ID.make("ses_commission_upgrade"),
+            project_id: ProjectV2.ID.global,
+            directory: "/commission-upgrade",
+            slug: "upgrade",
+            title: "upgrade",
+            version: "test",
+          })
+          .run()
+        yield* db.run(
+          "INSERT INTO session_orchestrator (main_session_id, time_created, time_updated) VALUES ('ses_commission_upgrade', 1, 1)",
+        )
+        for (const revoked of [0, 1]) {
+          const id = `receipt-${revoked}`
+          const origin = `msg_upgrade_${revoked}`
+          yield* db.run(sql`INSERT INTO session_input (id, session_id, prompt, delivery, admitted_seq, time_created)
+          VALUES (${origin}, 'ses_commission_upgrade', '{"text":"scope"}', 'steer', ${revoked + 1}, 1)`)
+          yield* db.run(sql`INSERT INTO session_orchestrator_commission (id, main_session_id, origin_input_id, origin_digest, scope, source_assistant_id,
+          source_call_id, agent, model, policy_digest, settings, cache_family, revoked, time_created)
+          VALUES (${id}, 'ses_commission_upgrade', ${origin}, 'digest', 'scope', 'msg_source', 'call', 'build', '{}', 'policy', '{}', ${`family-${revoked}`}, ${revoked}, 1)`)
+        }
+        const before = yield* db.all("SELECT * FROM session_orchestrator_commission ORDER BY id")
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.all("SELECT * FROM session_orchestrator_commission ORDER BY id")).toEqual(before)
+        expect(
+          (yield* db.all<{ name: string; dflt_value: string | null }>(
+            "PRAGMA table_info(session_orchestrator_commission)",
+          )).find((column) => column.name === "revoked")?.dflt_value,
+        ).toBe("true")
+        expect(yield* db.all("PRAGMA foreign_key_list(session_orchestrator_commission)")).toHaveLength(2)
+        expect(yield* db.all("PRAGMA foreign_key_check")).toEqual([])
+        for (const name of ["session_orchestrator_commission_origin_idx", "session_orchestrator_commission_family_idx"])
+          expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ${name}`)).toEqual({
+            name,
+          })
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.all("SELECT * FROM session_orchestrator_commission ORDER BY id")).toEqual(before)
       }),
     )
   })
@@ -907,6 +1125,7 @@ describe("DatabaseMigration", () => {
           { name: "icon_generation_error" },
           { name: "icon_generation_mode" },
           { name: "icon_generation_status" },
+          { name: "icon_generation_style" },
         ])
       }),
     )
@@ -1296,11 +1515,34 @@ describe("DatabaseMigration", () => {
           )
         }
 
+        yield* db.run(sql`CREATE TABLE session_file_mutation (
+          id text PRIMARY KEY, session_id text NOT NULL, assistant_message_id text NOT NULL,
+          call_id text NOT NULL, target text NOT NULL, resource text NOT NULL,
+          before_exists integer NOT NULL, before_bytes integer, before_sha256 text,
+          after_exists integer NOT NULL, after_bytes integer, after_sha256 text,
+          time_created integer NOT NULL
+        )`)
+        yield* db.run(sql`INSERT INTO session_file_mutation VALUES (
+          'sfm_mode_legacy', 'ses_existing', 'msg_legacy', 'call_legacy', '/project/file', 'file',
+          1, 4, 'before-hash', 1, 5, 'after-hash', 1
+        )`)
         yield* DatabaseMigration.applyOnly(db, migrations)
+        yield* DatabaseMigration.applyOnly(db, migrations)
+        expect(yield* db.get(sql`SELECT before_mode, after_mode, before_sha256, after_sha256
+          FROM session_file_mutation WHERE id = 'sfm_mode_legacy'`)).toEqual({
+          before_mode: null, after_mode: null, before_sha256: "before-hash", after_sha256: "after-hash",
+        })
 
         expect(yield* db.get(sql`SELECT agent FROM session_context_epoch WHERE session_id = 'ses_existing'`)).toEqual({
           agent: "build",
         })
+        expect(yield* db.get(sql`SELECT name FROM pragma_table_info('session') WHERE name = 'fork_history_seq'`))
+          .toEqual({ name: "fork_history_seq" })
+        expect(yield* db.get(sql`SELECT name FROM pragma_table_info('session') WHERE name = 'fork_dispatch_digest'`))
+          .toEqual({ name: "fork_dispatch_digest" })
+        expect(yield* db.all(sql`SELECT name FROM pragma_table_info('session_file_mutation')
+          WHERE name IN ('before_mode', 'after_mode') ORDER BY name`))
+          .toEqual([{ name: "after_mode" }, { name: "before_mode" }])
         expect(
           yield* db.get(
             sql`SELECT name FROM pragma_table_info('session_context_epoch') WHERE name = 'replacement_seq'`,
@@ -1557,7 +1799,18 @@ describe("DatabaseMigration", () => {
         expect(yield* db.all(sql`SELECT id FROM session_input`)).toEqual([])
         expect(
           (yield* db.all<{ name: string }>(sql`PRAGMA table_info(session_input)`)).map((column) => column.name),
-        ).toEqual(["id", "session_id", "prompt", "delivery", "admitted_seq", "promoted_seq", "time_created"])
+        ).toEqual([
+          "id",
+          "session_id",
+          "prompt",
+          "delivery",
+          "admitted_seq",
+          "promoted_seq",
+          "time_created",
+          "execution_prompt",
+          "origin",
+          "held_at",
+        ])
         expect(
           (yield* db.all<{ name: string; unique: number }>(sql`PRAGMA index_list(session_message)`)).find(
             (index) => index.name === "session_message_session_seq_idx",

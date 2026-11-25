@@ -322,6 +322,13 @@ export const layer = Layer.effect(
         Effect.map((sets) => new Map(sets.flat(2).map((item) => [item.directory, item] as const)).values().toArray()),
       )
       const removed = checked.filter((item) => !item.exists).map((item) => item.directory)
+      const registered = new Map(stored.map((item) => [item.directory, item.strategy]))
+      // Discovery is advisory metadata, not execution authority. An unchanged
+      // snapshot must not acquire SQLite's writer just because a Location booted:
+      // another connection may be admitting its Session on this same event loop.
+      if (removed.length === 0 && discovered.every((item) =>
+        registered.has(item.directory) && registered.get(item.directory) === item.strategy,
+      )) return { updated: [], removed: [] }
       const result = yield* db
         .transaction((tx) =>
           Effect.all({

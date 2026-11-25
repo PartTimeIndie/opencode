@@ -2,11 +2,11 @@ import { describe, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Effect } from "effect"
-import { OrchestratorCheckout } from "@opencode-ai/core/session/orchestrator/checkout"
+import { WorkspaceCheckout } from "@opencode-ai/core/session/workspace/checkout"
 import { tmpdir } from "./fixture/tmpdir"
 import { it } from "./lib/effect"
 
-describe("orchestrator physical checkout identity", () => {
+describe("native physical checkout identity", () => {
   it.live("shares a root/subdirectory key but keeps independent checkout directories separate", () =>
     Effect.promise(async () => {
       await using tmp = await tmpdir()
@@ -19,8 +19,8 @@ describe("orchestrator physical checkout identity", () => {
       const resolve = (directory: string) =>
         Effect.runPromise(
           Effect.gen(function* () {
-            return yield* (yield* OrchestratorCheckout.Service).resolve(directory)
-          }).pipe(Effect.provide(OrchestratorCheckout.layer)),
+            return yield* (yield* WorkspaceCheckout.Service).resolve(directory)
+          }).pipe(Effect.provide(WorkspaceCheckout.layer)),
         )
       const root = await resolve(first)
       expect(await resolve(path.join(first, "src"))).toBe(root)

@@ -60,8 +60,11 @@ const baseLayer = Layer.effect(
     })
 
     const currentState = Effect.fn("SessionFileMutation.currentState")(function* (target: string) {
-      return yield* fs.readFile(target).pipe(
-        Effect.map(checkpointState),
+      return yield* Effect.gen(function* () {
+        const content = yield* fs.readFile(target)
+        const info = yield* fs.stat(target)
+        return { ...checkpointState(content), mode: info.mode & 0o777 }
+      }).pipe(
         Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed({ exists: false })),
         Effect.catch(() => Effect.succeed({ exists: true })),
       )
@@ -102,9 +105,11 @@ const baseLayer = Layer.effect(
             before_exists: mutation.before.exists,
             before_bytes: mutation.before.bytes ?? null,
             before_sha256: mutation.before.sha256 ?? null,
+            before_mode: mutation.before.mode ?? null,
             after_exists: mutation.after.exists,
             after_bytes: mutation.after.bytes ?? null,
             after_sha256: mutation.after.sha256 ?? null,
+            after_mode: mutation.after.mode ?? null,
           })
           .run()
           .pipe(Effect.orDie)
@@ -213,10 +218,17 @@ const baseLayer = Layer.effect(
           (change, index): FileMutation.TransactionChange[] => {
             if (!change.expected.exists && !change.desired.exists) return []
             const target = { canonical: change.target, resource: change.resource }
-            if (!change.expected.exists) return [{ type: "add" as const, target, content: contents[index]! }]
-            const expected = { exists: true as const, sha256: change.expected.sha256! }
-            if (!change.desired.exists) return [{ type: "delete" as const, target, expected }]
-            return [{ type: "update" as const, target, content: contents[index]!, expected }]
+            const content = contents[index]
+            if (change.desired.exists && content === undefined) throw new Error(`Missing file mutation content: ${change.target}`)
+            if (!change.expected.exists) {
+              if (content === undefined) return []
+              return [{ type: "add", target, content, mode: change.desired.mode }]
+            }
+            if (change.expected.sha256 === undefined) throw new Error(`Missing file mutation expected hash: ${change.target}`)
+            const expected = { exists: true as const, sha256: change.expected.sha256, mode: change.expected.mode }
+            if (!change.desired.exists) return [{ type: "delete", target, expected }]
+            if (content === undefined) return []
+            return [{ type: "update", target, content, mode: change.desired.mode, expected }]
           },
         )
         const stale = yield* fileMutation.transact(transactions).pipe(
@@ -308,20 +320,21 @@ function groupedChanges(mutations: MutationRow[], mode: RestoreMode) {
 
 function beforeState(row: MutationRow): FileMutation.CheckpointState {
   return row.before_exists
-    ? { exists: true, bytes: row.before_bytes ?? undefined, sha256: row.before_sha256 ?? undefined }
+    ? { exists: true, bytes: row.before_bytes ?? undefined, sha256: row.before_sha256 ?? undefined, mode: row.before_mode ?? undefined }
     : { exists: false }
 }
 
 function afterState(row: MutationRow): FileMutation.CheckpointState {
   return row.after_exists
-    ? { exists: true, bytes: row.after_bytes ?? undefined, sha256: row.after_sha256 ?? undefined }
+    ? { exists: true, bytes: row.after_bytes ?? undefined, sha256: row.after_sha256 ?? undefined, mode: row.after_mode ?? undefined }
     : { exists: false }
 }
 
 function sameCheckpoint(actual: FileMutation.CheckpointState, expected: FileMutation.CheckpointState) {
   if (actual.exists !== expected.exists) return false
   if (!actual.exists) return true
-  return actual.sha256 !== undefined && actual.sha256 === expected.sha256
+  return actual.sha256 !== undefined && actual.sha256 === expected.sha256 &&
+    (expected.mode === undefined || actual.mode === expected.mode)
 }
 
 export const defaultLayer: Layer.Layer<Service, never, never> = layer.pipe(

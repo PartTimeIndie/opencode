@@ -11,6 +11,8 @@ const overlayStates: unknown[] = []
 const insertedText: string[] = []
 let overlayOptions: Record<string, unknown> | undefined
 let nextInsertError = ""
+let pendingClipboardRead: (() => Promise<string>) | undefined
+let nextClipboardWriteError = ""
 const overlays: FakeOverlay[] = []
 
 class FakeOverlay {
@@ -59,7 +61,14 @@ class FakeOverlay {
 
 mock.module("electron", () => ({
   BrowserWindow: FakeOverlay,
-  clipboard: { readText: () => clipboardWrites.at(-1) ?? "", writeText: (text: string) => clipboardWrites.push(text) },
+  clipboard: {
+    readText: () => pendingClipboardRead?.() ?? Promise.resolve(clipboardWrites.at(-1) ?? ""),
+    writeText: async (text: string) => {
+      await Promise.resolve()
+      if (nextClipboardWriteError) throw new Error(nextClipboardWriteError)
+      clipboardWrites.push(text)
+    },
+  },
   globalShortcut: {
     register: (accelerator: string, callback: () => void) => {
       if (accelerator === "Ctrl+Alt+Conflict" || shortcuts.has(accelerator)) return false
@@ -170,6 +179,39 @@ describe("plugin desktop services validation", () => {
 })
 
 describe("plugin desktop service lifecycle", () => {
+  test("rechecks ownership after an asynchronous clipboard read and propagates failed writes", async () => {
+    const sender = createSender(103)
+    const manager = createPluginDesktopServices({ getMainWindow: () => null, logger: { warn() {}, error() {} } })
+    const registration = await manager.register(sender, { pluginID: "speech", serviceID: "clipboard", accelerator: "Ctrl+Shift+Space" })
+    if (!registration.ok) throw new Error(registration.error)
+    try {
+      shortcuts.get("Ctrl+Shift+Space")?.()
+      await Bun.sleep(5)
+      const invocationID = sender.sent[0]!.payload.invocation.id
+      nextClipboardWriteError = "Clipboard unavailable"
+      await expect(manager.writeClipboard(sender, registration.registrationID, invocationID, "text"))
+        .rejects.toThrow("Clipboard unavailable")
+      nextInsertError = "Cannot insert"
+      await expect(manager.insertText(sender, registration.registrationID, invocationID, "fallback text"))
+        .rejects.toThrow("Clipboard unavailable")
+      clipboardWrites.push("x".repeat(200_001))
+      await expect(manager.readClipboard(sender, registration.registrationID, invocationID))
+        .rejects.toThrow("Clipboard text is too large")
+      const pending = Promise.withResolvers<string>()
+      pendingClipboardRead = () => pending.promise
+      const reading = manager.readClipboard(sender, registration.registrationID, invocationID)
+      manager.update(sender, registration.registrationID, invocationID, { phase: "success", label: "Completed" })
+      pending.resolve("stale clipboard content")
+      await expect(reading).rejects.toThrow("already settled")
+    } finally {
+      pendingClipboardRead = undefined
+      nextClipboardWriteError = ""
+      nextInsertError = ""
+      clipboardWrites.length = 0
+      manager.dispose()
+    }
+  })
+
   test("routes pass-through double taps to the owner and releases them on destruction", async () => {
     const helpers: Array<ReturnType<typeof createHelper>> = []
     const manager = createPluginDesktopServices({
@@ -201,14 +243,14 @@ describe("plugin desktop service lifecycle", () => {
     expect(other.sent).toHaveLength(0)
     clipboardWrites.push("copied external selection")
     const invocationID = sender.sent[0]!.payload.invocation.id
-    expect(manager.readClipboard(sender, first.registrationID, invocationID)).toBe("copied external selection")
-    expect(() => manager.readClipboard(other, first.registrationID, invocationID)).toThrow()
+    expect(await manager.readClipboard(sender, first.registrationID, invocationID)).toBe("copied external selection")
+    await expect(manager.readClipboard(other, first.registrationID, invocationID)).rejects.toThrow()
     expect(() => manager.writeClipboard(other, first.registrationID, invocationID, "wrong owner")).toThrow()
     expect(() => manager.writeClipboard(sender, first.registrationID, invocationID, "x".repeat(200_001))).toThrow()
-    manager.writeClipboard(sender, first.registrationID, invocationID, "polished selection")
+    await manager.writeClipboard(sender, first.registrationID, invocationID, "polished selection")
     expect(clipboardWrites.at(-1)).toBe("polished selection")
     manager.update(sender, first.registrationID, invocationID, { phase: "success", label: "Completed" })
-    expect(() => manager.readClipboard(sender, first.registrationID, invocationID)).toThrow("already settled")
+    await expect(manager.readClipboard(sender, first.registrationID, invocationID)).rejects.toThrow("already settled")
     expect(() => manager.writeClipboard(sender, first.registrationID, invocationID, "late write")).toThrow("already settled")
     tap(150); tap(180)
     await Bun.sleep(5)
@@ -389,6 +431,50 @@ describe("plugin desktop service lifecycle", () => {
       recoveredToClipboard: true,
     })
     expect(clipboardWrites).toEqual(["cancel pending"])
+    manager.dispose()
+  })
+
+  test("logs a failed insertion once with the plugin and error, never the dictated text", async () => {
+    clipboardWrites.length = 0
+    insertedText.length = 0
+    nextInsertError = "Windows did not allow the original application to regain focus."
+    const warnings: Array<{ message: string; meta: unknown }> = []
+    const sender = createSender(14)
+    const manager = createPluginDesktopServices({
+      getMainWindow: () => null,
+      logger: {
+        warn: (message, meta) => warnings.push({ message, meta }),
+        error: (message, meta) => warnings.push({ message, meta }),
+      },
+    })
+    const registration = await manager.register(sender, {
+      pluginID: "speech-to-text-app",
+      serviceID: "global-dictation",
+      accelerator: "Ctrl+Shift+Space",
+    })
+    if (!registration.ok) throw new Error(registration.error)
+    shortcuts.get("Ctrl+Shift+Space")?.()
+    await Bun.sleep(5)
+    const invocationID = sender.sent[0]!.payload.invocation.id
+
+    const inserted = await manager.insertText(sender, registration.registrationID, invocationID, "secret dictated words")
+    expect(inserted.ok).toBe(false)
+    const logged = warnings.filter((entry) => entry.message === "desktop text insertion failed")
+    expect(logged).toHaveLength(1)
+    expect(logged[0]!.meta).toEqual({
+      pluginID: "speech-to-text-app",
+      error: "Windows did not allow the original application to regain focus.",
+    })
+    expect(JSON.stringify(warnings)).not.toContain("secret dictated words")
+    expect(clipboardWrites).toEqual(["secret dictated words"])
+
+    // Refusals before the helper runs are not insertion failures.
+    expect(await manager.insertText(sender, registration.registrationID, invocationID, "secret dictated words")).toEqual({
+      ok: false,
+      error: "Text insertion was already attempted for this invocation.",
+    })
+    expect(warnings.filter((entry) => entry.message === "desktop text insertion failed")).toHaveLength(1)
+    nextInsertError = ""
     manager.dispose()
   })
 })

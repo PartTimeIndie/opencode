@@ -1,0 +1,17 @@
+{
+  "name": "goal-plugin",
+  "version": "0.1.0",
+  "description": "In-repo session goal plugin: /goal workflow with bounded auto-continuation.",
+  "type": "module",
+  "private": true,
+  "main": "./index.ts",
+  "exports": { ".": "./index.ts", "./server": "./index.ts" },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "@typescript/native-preview": "catalog:"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsgo --noEmit"
+  }
+}

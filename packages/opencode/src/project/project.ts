@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { and, eq, sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
-import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
+import { ProjectDirectoryIconTable, ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
@@ -22,13 +22,14 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionEvent } from "@opencode-ai/core/session/event"
+import { ProjectIcon } from "./icon"
 
 const ProjectVcs = Schema.Literal("git")
 
 const isDatabaseLockCause = (cause: Cause.Cause<unknown>) =>
   /database is locked|database table is locked|locktimeouterror|sqlite_busy/i.test(Cause.pretty(cause))
 
-const ProjectIcon = Schema.Struct({
+const Icon = Schema.Struct({
   url: optionalOmitUndefined(Schema.String),
   override: optionalOmitUndefined(Schema.String),
   color: optionalOmitUndefined(Schema.String),
@@ -61,16 +62,60 @@ export const Info = Schema.Struct({
   worktree: Schema.String,
   vcs: optionalOmitUndefined(ProjectVcs),
   name: optionalOmitUndefined(Schema.String),
-  icon: optionalOmitUndefined(ProjectIcon),
+  icon: optionalOmitUndefined(Icon),
   iconGeneration: optionalOmitUndefined(ProjectIconGeneration),
   commands: optionalOmitUndefined(ProjectCommands),
   time: ProjectTime,
   sandboxes: Schema.Array(Schema.String),
+  sessionDirectories: optionalOmitUndefined(Schema.Array(Schema.String)),
 }).annotate({ identifier: "Project" })
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
 
+// Icons for folders that have no project row of their own (non-git directories
+// resolve to the `global` project) are addressed by their canonical directory.
+const DirectoryIconOverride = Schema.Struct({ override: Schema.String })
+
+export const DirectoryIcon = Schema.Struct({
+  directory: Schema.String,
+  icon: DirectoryIconOverride,
+}).annotate({ identifier: "ProjectDirectoryIcon" })
+export type DirectoryIcon = Types.DeepMutable<Schema.Schema.Type<typeof DirectoryIcon>>
+
+// A cleared icon reports the directory without `icon`, in the response and the event alike.
+export const DirectoryIconUpdate = Schema.Struct({
+  directory: Schema.String,
+  icon: optionalOmitUndefined(DirectoryIconOverride),
+}).annotate({ identifier: "ProjectDirectoryIconUpdate" })
+export type DirectoryIconUpdate = Types.DeepMutable<Schema.Schema.Type<typeof DirectoryIconUpdate>>
+
+export const DirectoryIconInput = Schema.Struct({
+  directory: Schema.String,
+  url: Schema.optional(Schema.String),
+}).annotate({ identifier: "ProjectDirectoryIconInput" })
+export type DirectoryIconInput = Types.DeepMutable<Schema.Schema.Type<typeof DirectoryIconInput>>
+export const DirectoryIcons = Schema.Array(DirectoryIcon).annotate({ identifier: "ProjectDirectoryIcons" })
+
+export const ResolvedDirectory = Schema.Struct({
+  directory: Schema.String,
+  real: Schema.String,
+  exists: Schema.Boolean,
+}).annotate({ identifier: "ProjectResolvedDirectory" })
+export type ResolvedDirectory = Types.DeepMutable<Schema.Schema.Type<typeof ResolvedDirectory>>
+export const ResolvedDirectories = Schema.Array(ResolvedDirectory).annotate({
+  identifier: "ProjectResolvedDirectories",
+})
+
+export const ResolveDirectoriesInput = Schema.Struct({
+  directories: Schema.Array(Schema.String),
+}).annotate({ identifier: "ProjectResolveDirectoriesInput" })
+export type ResolveDirectoriesInput = Types.DeepMutable<Schema.Schema.Type<typeof ResolveDirectoriesInput>>
+
 export const Event = {
   Updated: EventV2.define({ type: "project.updated", schema: Info.fields }),
+  DirectoryIconUpdated: EventV2.define({
+    type: "project.directoryIcon.updated",
+    schema: DirectoryIconUpdate.fields,
+  }),
 }
 
 type Row = typeof ProjectTable.$inferSelect
@@ -112,7 +157,7 @@ export function fromRow(row: Row): Info {
 export const UpdateInput = Schema.Struct({
   projectID: ProjectV2.ID,
   name: Schema.optional(Schema.String),
-  icon: Schema.optional(ProjectIcon),
+  icon: Schema.optional(Icon),
   iconGeneration: Schema.optional(Schema.Struct({ mode: ProjectIconGeneration.fields.mode })),
   commands: Schema.optional(ProjectCommands),
 })
@@ -120,7 +165,7 @@ export type UpdateInput = Types.DeepMutable<Schema.Schema.Type<typeof UpdateInpu
 
 export const UpdatePayload = Schema.Struct({
   name: Schema.optional(Schema.String),
-  icon: Schema.optional(ProjectIcon),
+  icon: Schema.optional(Icon),
   iconGeneration: Schema.optional(Schema.Struct({ mode: ProjectIconGeneration.fields.mode })),
   commands: Schema.optional(ProjectCommands),
 }).annotate({ identifier: "ProjectUpdateInput" })
@@ -145,7 +190,13 @@ export interface Interface {
   readonly discover: (input: Info) => Effect.Effect<void>
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: ProjectV2.ID) => Effect.Effect<Info | undefined>
-  readonly update: (input: UpdateInput) => Effect.Effect<Info, NotFoundError>
+  readonly update: (input: UpdateInput) => Effect.Effect<Info, NotFoundError | ProjectIcon.InvalidIconError>
+  readonly directoryIcons: () => Effect.Effect<DirectoryIcon[]>
+  readonly setDirectoryIcon: (input: {
+    directory: string
+    url?: string
+  }) => Effect.Effect<DirectoryIconUpdate, ProjectIcon.InvalidIconError>
+  readonly resolveDirectories: (directories: readonly string[]) => Effect.Effect<ResolvedDirectory[]>
   readonly initGit: (input: { directory: string; project: Info }) => Effect.Effect<Info>
   readonly setInitialized: (id: ProjectV2.ID) => Effect.Effect<void>
   readonly sandboxes: (id: ProjectV2.ID) => Effect.Effect<string[]>
@@ -476,11 +527,39 @@ export const layer = Layer.effect(
       const url = `data:${mime};base64,${base64}`
       yield* update({ projectID: input.id, icon: { url } }).pipe(
         Effect.catchTag("Project.NotFoundError", () => Effect.void),
+        Effect.catchTag("Project.InvalidIconError", () => Effect.void),
       )
     })
 
+    // Subagent mirror workspaces keep their project row and sessions after the
+    // folder is gone; only the listings hide them. A failed existence check
+    // keeps the project visible instead of hiding it on a transient FS error.
+    const worktreeExists = (worktree: string) => fs.exists(worktree).pipe(Effect.orElseSucceed(() => true))
+
     const list = Effect.fn("Project.list")(function* () {
-      return (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).map(fromRow)
+      const rows = yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)
+      const aliases = yield* db.selectDistinct({ id: SessionTable.project_id, directory: SessionTable.directory })
+        .from(SessionTable).all().pipe(Effect.orDie)
+      const directories = new Map<ProjectV2.ID, string[]>()
+      for (const { id, directory } of aliases) {
+        const entries = directories.get(id)
+        if (entries) entries.push(directory)
+        else directories.set(id, [directory])
+      }
+      // Session directories are query keys, not worktree candidates: even a
+      // deleted mirror can still contain durable child sessions in SQLite.
+      const listed = (row: (typeof rows)[number]): Info => ({
+        ...fromRow(row),
+        sessionDirectories: directories.get(row.id)?.sort(),
+      })
+      return yield* Effect.forEach(
+        rows,
+        (row) =>
+          row.id === ProjectV2.ID.global
+            ? Effect.succeed(listed(row))
+            : worktreeExists(row.worktree).pipe(Effect.map((exists) => (exists ? listed(row) : undefined))),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.map((projects) => projects.filter((project): project is Info => project !== undefined)))
     })
 
     const get = Effect.fn("Project.get")(function* (id: ProjectV2.ID) {
@@ -489,6 +568,8 @@ export const layer = Layer.effect(
     })
 
     const update = Effect.fn("Project.update")(function* (input: UpdateInput) {
+      const override =
+        input.icon?.override === undefined ? undefined : yield* ProjectIcon.normalize(input.icon.override)
       const before = input.icon
         ? yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, input.projectID)).get().pipe(Effect.orDie)
         : undefined
@@ -496,7 +577,7 @@ export const layer = Layer.effect(
         !!input.icon &&
         !!before &&
         ((input.icon.url !== undefined && (input.icon.url || undefined) !== (before.icon_url || undefined)) ||
-          (input.icon.override !== undefined && (input.icon.override || undefined) !== (before.icon_url_override || undefined)) ||
+          (override !== undefined && (override || undefined) !== (before.icon_url_override || undefined)) ||
           (input.icon.color !== undefined && (input.icon.color || undefined) !== (before.icon_color || undefined)) ||
           (input.icon.generated !== undefined &&
             (input.icon.generated || undefined) !== (before.icon_generated_url || undefined)))
@@ -505,9 +586,11 @@ export const layer = Layer.effect(
         .set({
           name: input.name,
           icon_url: input.icon?.url,
-          icon_url_override: input.icon?.override,
+          icon_url_override: override,
           icon_color: input.icon?.color,
           icon_generated_url: input.icon?.generated,
+          // Rewriting the icon layers drops a generated icon or stores one of unknown style.
+         icon_generation_style: input.icon ? null : undefined,
           icon_generation_mode: input.iconGeneration?.mode,
           icon_generation_attempt: iconChanged
             ? sql`${ProjectTable.icon_generation_attempt} + 1`
@@ -525,6 +608,80 @@ export const layer = Layer.effect(
       const data = fromRow(result)
       yield* emitUpdated(data)
       return data
+    })
+
+    type DirectoryIconRow = typeof ProjectDirectoryIconTable.$inferSelect
+
+    const directoryIconFromRow = (row: DirectoryIconRow): DirectoryIcon => ({
+      directory: row.directory,
+      icon: { override: row.url },
+    })
+
+    const emitDirectoryIconUpdated = (data: DirectoryIconUpdate) =>
+      Effect.sync(() =>
+        GlobalBus.emit("event", {
+          directory: "global",
+          payload: { type: Event.DirectoryIconUpdated.type, properties: data },
+        }),
+      )
+
+    const directoryIcons = Effect.fn("Project.directoryIcons")(function* () {
+      const rows = yield* db
+        .select()
+        .from(ProjectDirectoryIconTable)
+        .orderBy(ProjectDirectoryIconTable.directory)
+        .all()
+        .pipe(Effect.orDie)
+      return rows.map(directoryIconFromRow)
+    })
+
+    const setDirectoryIcon = Effect.fn("Project.setDirectoryIcon")(function* (input: {
+      directory: string
+      url?: string
+    }) {
+      const url = input.url?.trim() ? yield* ProjectIcon.normalize(input.url) : undefined
+      const target = ProjectIcon.directoryKey(input.directory)
+      if (!url) {
+        yield* db
+            .delete(ProjectDirectoryIconTable)
+            .where(eq(ProjectDirectoryIconTable.directory, target))
+            .run()
+            .pipe(Effect.orDie)
+        const cleared = { directory: target }
+        yield* emitDirectoryIconUpdated(cleared)
+        return cleared
+      }
+      const row = yield* db
+        .insert(ProjectDirectoryIconTable)
+        .values({ directory: target, url, time_updated: Date.now() })
+        .onConflictDoUpdate({
+          target: ProjectDirectoryIconTable.directory,
+          set: { url, time_updated: Date.now() },
+        })
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      const result = directoryIconFromRow(row)
+      yield* emitDirectoryIconUpdated(result)
+      return result
+    })
+
+    const resolveDirectory = Effect.fnUntraced(function* (directory: string) {
+      // `global` is the app's control-plane sentinel, not a path.
+      if (directory === ProjectV2.ID.global) return { directory, real: directory, exists: true }
+      const real = yield* Effect.tryPromise(() => FSUtil.resolveAsync(directory)).pipe(
+        Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
+        Effect.catch(() => Effect.succeed(undefined)),
+      )
+      // A slow or unreadable path must not hide a project: only a directory the
+      // host confirmed missing is reported as absent.
+      if (real === undefined) return { directory, real: directory, exists: true }
+      const exists = yield* fs.exists(real).pipe(Effect.orElseSucceed(() => true))
+      return { directory, real, exists }
+    })
+
+    const resolveDirectories = Effect.fn("Project.resolveDirectories")(function* (directories: readonly string[]) {
+      return yield* Effect.forEach(directories, resolveDirectory, { concurrency: "unbounded" })
     })
 
     const initGit = Effect.fn("Project.initGit")(function* (input: { directory: string; project: Info }) {
@@ -618,6 +775,9 @@ export const layer = Layer.effect(
       list,
       get,
       update,
+      directoryIcons,
+      setDirectoryIcon,
+      resolveDirectories,
       initGit,
       setInitialized,
       sandboxes,

@@ -12,10 +12,11 @@ import { Prompt } from "./session/prompt"
 import { EventV2 } from "./event"
 import { Database } from "./database/database"
 import { SessionProjector } from "./session/projector"
-import { SessionActivityTable, SessionMessageTable, SessionTable } from "./session/sql"
+import { SessionActivityTable, SessionInputTable, SessionMessageTable, SessionTable } from "./session/sql"
 import { SessionSchema } from "./session/schema"
 import { AbsolutePath, PositiveInt, RelativePath } from "./schema"
 import { AgentV2 } from "./agent"
+import { SkillV2 } from "./skill"
 import { SessionV1 } from "./v1/session"
 import { InstallationVersion } from "./installation/version"
 import { Slug } from "./util/slug"
@@ -24,17 +25,19 @@ import path from "path"
 import { fromRow } from "./session/info"
 import { SessionRunner } from "./session/runner/index"
 import { SessionRunnerModel } from "./session/runner/model"
-import { overrideModel, sameChainSelection } from "./session/runner/model-chain"
+import { keepsFirmSelection, overrideModel, sameChainSelection } from "./session/runner/model-chain"
 import { SessionStore } from "./session/store"
 import * as SessionProtection from "./session/protection"
 import { SessionExecution } from "./session/execution"
+import { CrashActivity } from "./observability/crash-activity"
 import { SessionFileMutation } from "./session/file-mutation"
 import { logFailure } from "./session/logging"
 import { MessageDecodeError } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
 import { SessionAgentPolicy } from "./session/agent-policy"
-import { KeyedMutex } from "./effect/keyed-mutex"
+import { SessionOperations } from "./session/operations"
+import { SessionMetadata } from "./session/metadata"
 import { QuestionV2 } from "./question"
 import { Perf } from "./observability/perf"
 import { LocationServiceMap } from "./location-layer"
@@ -134,6 +137,12 @@ export type PromptInput = {
   model?: ModelV2.Ref
   system?: string
   delivery?: SessionInput.Delivery
+  origin?: SessionInput.Origin
+  /** Internal continuation fence; null requires an empty inbox. */
+  expectedLatestInputID?: SessionMessage.ID | null
+  /** Internal host-owned fences and exactly-once metadata side effects. */
+  expectedMetadata?: Record<string, unknown>
+  metadataPatchOnAdmission?: SessionSchema.MetadataPatch
   resume?: boolean
 }
 
@@ -253,7 +262,15 @@ export interface Interface {
   readonly patchMetadata: (input: {
     sessionID: SessionSchema.ID
     patch: SessionSchema.MetadataPatch
+    /** Internal compare-and-patch fence, checked under the Session operation lock. */
+    expectedMetadata?: Record<string, string>
   }) => Effect.Effect<void, NotFoundError>
+  /** Explicit CAS for owning settings writers; stale saves are observable. */
+  readonly compareAndPatchMetadata?: (input: {
+    sessionID: SessionSchema.ID
+    patch: SessionSchema.MetadataPatch
+    expectedMetadata: Record<string, unknown>
+  }) => Effect.Effect<boolean, NotFoundError>
   readonly setShare: (input: ShareInput) => Effect.Effect<void, NotFoundError>
   readonly setSummary: (input: SummaryInput) => Effect.Effect<void, NotFoundError>
   readonly prompt: (
@@ -380,7 +397,9 @@ export const admitPrompt = Effect.fn("V2Session.prompt")(
         const requested = new Prompt({
           ...input.prompt,
           ...(input.agent === undefined ? {} : { agent: input.agent }),
-          ...(input.model === undefined ? {} : { model: input.model }),
+          // A firmly picked model must not change while the Session runs; only an
+          // explicit selection carried by the prompt may replace it.
+          ...(input.model === undefined || keepsFirmSelection(session.model, input.model) ? {} : { model: input.model }),
           ...(input.system === undefined ? {} : { system: input.system }),
         })
         const existing = input.id === undefined ? undefined : yield* SessionInput.find(dependencies.db, messageID)
@@ -393,20 +412,28 @@ export const admitPrompt = Effect.fn("V2Session.prompt")(
                 prompt: requested,
               })
         const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
-        const admitted = yield* SessionInput.admit(dependencies.db, dependencies.events, {
-          id: messageID,
-          sessionID: input.sessionID,
-          prompt,
-          delivery,
-        }).pipe(
-          Effect.catchDefect((defect) =>
-            defect instanceof SessionInput.LifecycleConflict
-              ? new PromptConflictError({ sessionID: input.sessionID, messageID })
-              : Effect.die(defect),
-          ),
-        )
-        if (!SessionInput.equivalent(admitted, expected))
-          return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+        const admitted = yield* EventV2.atomic(dependencies.db, Effect.gen(function* () {
+          const previous = yield* SessionInput.find(dependencies.db, messageID)
+          const admitted = yield* SessionInput.admit(dependencies.db, dependencies.events, {
+            id: messageID,
+            sessionID: input.sessionID,
+            prompt,
+            delivery,
+            ...(input.origin === undefined ? {} : { origin: input.origin }),
+          }).pipe(
+            Effect.catchDefect((defect) =>
+              defect instanceof SessionInput.LifecycleConflict
+                ? new PromptConflictError({ sessionID: input.sessionID, messageID })
+                : Effect.die(defect),
+            ),
+          )
+          if (!SessionInput.equivalent(admitted, expected))
+            return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+          if (!previous && input.metadataPatchOnAdmission) yield* dependencies.events.publish(SessionEvent.MetadataPatched, {
+            sessionID: input.sessionID, timestamp: yield* DateTime.now, ...input.metadataPatchOnAdmission,
+          })
+          return admitted
+        }))
         if (input.resume !== false && dependencies.wake) yield* dependencies.wake(admitted)
         return admitted
       }),
@@ -426,7 +453,7 @@ const make = (execution: SessionExecution.Interface) =>
     const archive = Option.getOrUndefined(yield* Effect.serviceOption(SessionArchive.Service))
     const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
-    const operations = KeyedMutex.makeUnsafe<SessionSchema.ID>()
+    const operations = SessionOperations
 
     const enqueueWake = (admitted: SessionInput.Admitted) =>
       execution.wake(admitted.sessionID, admitted.admittedSeq).pipe(
@@ -768,9 +795,10 @@ const make = (execution: SessionExecution.Interface) =>
         return direction === "previous" ? merged.toReversed() : merged
       }),
       messages: Effect.fn("V2Session.messages")(function* (input) {
-        const active = yield* store.get(input.sessionID)
+        const trace = { kind: "session-stage", sessionID: input.sessionID } as const
+        const active = yield* CrashActivity.track({ ...trace, name: "messages.lookup" }, store.get(input.sessionID))
         if (!active && archive) {
-          const rows = yield* archive
+          const rows = yield* CrashActivity.track({ ...trace, name: "messages.archive-read" }, archive
             .readMessages(input.sessionID, {
               ...(input.limit === undefined ? {} : { limit: input.limit }),
               ...(input.order === undefined ? {} : { order: input.order }),
@@ -789,22 +817,24 @@ const make = (execution: SessionExecution.Interface) =>
                 error.itemID ? Effect.succeed([]) : Effect.fail(new NotFoundError({ sessionID: input.sessionID })),
               ),
               Effect.catchTag("SessionArchive.IntegrityError", (error) => Effect.die(error)),
-            )
-          return yield* Effect.forEach(rows, (row) => decodeArchived(input.sessionID, row))
+            ))
+          return yield* CrashActivity.track({ ...trace, name: "messages.archive-decode" },
+            Effect.forEach(rows, (row) => decodeArchived(input.sessionID, row)),
+          )
         }
         if (!active) return yield* new NotFoundError({ sessionID: input.sessionID })
         const direction = input.cursor?.direction ?? "next"
         const requestedOrder = input.order ?? "desc"
         const order = direction === "previous" ? (requestedOrder === "asc" ? "desc" : "asc") : requestedOrder
         const anchor = input.cursor
-          ? yield* db
+          ? yield* CrashActivity.track({ ...trace, name: "messages.cursor-lookup" }, db
               .select({ seq: SessionMessageTable.seq })
               .from(SessionMessageTable)
               .where(
                 and(eq(SessionMessageTable.session_id, input.sessionID), eq(SessionMessageTable.id, input.cursor.id)),
               )
               .get()
-              .pipe(Effect.orDie)
+              .pipe(Effect.orDie))
           : undefined
         if (input.cursor && !anchor) return []
         const boundary = anchor
@@ -820,10 +850,12 @@ const make = (execution: SessionExecution.Interface) =>
           .from(SessionMessageTable)
           .where(where)
           .orderBy(order === "asc" ? asc(SessionMessageTable.seq) : desc(SessionMessageTable.seq))
-        const rows = yield* (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(
-          Effect.orDie,
+        const rows = yield* CrashActivity.track({ ...trace, name: "messages.query" },
+          (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(Effect.orDie),
         )
-        return yield* Effect.forEach(direction === "previous" ? rows.toReversed() : rows, decode)
+        return yield* CrashActivity.track({ ...trace, name: "messages.decode" },
+          Effect.forEach(direction === "previous" ? rows.toReversed() : rows, decode),
+        )
       }),
       messageContext: Effect.fn("V2Session.messageContext")(function* (input) {
         if (!(yield* store.get(input.sessionID))) return []
@@ -878,11 +910,14 @@ const make = (execution: SessionExecution.Interface) =>
             .get()
             .pipe(Effect.orDie),
         ])
-        return yield* Effect.forEach(
-          [parent, ...state]
-            .filter((row): row is NonNullable<typeof row> => row !== undefined)
-            .toSorted((a, b) => a.seq - b.seq),
-          decode,
+        return yield* CrashActivity.track(
+          { kind: "session-stage", sessionID: input.sessionID, name: "messages.context-decode" },
+          Effect.forEach(
+            [parent, ...state]
+              .filter((row): row is NonNullable<typeof row> => row !== undefined)
+              .toSorted((a, b) => a.seq - b.seq),
+            decode,
+          ),
         )
       }),
       message: Effect.fn("V2Session.message")(function* (input) {
@@ -913,7 +948,29 @@ const make = (execution: SessionExecution.Interface) =>
       prompt: (input) =>
         operations.withLock(input.sessionID)(
           activate(input.sessionID).pipe(
-            Effect.andThen(admitPrompt({ db, events, store, content, cleanupRevert, wake: enqueueWake }, input)),
+            Effect.andThen(
+              Effect.gen(function* () {
+                if (input.expectedMetadata) {
+                  const session = yield* result.get(input.sessionID)
+                  if (Object.entries(input.expectedMetadata).some(([key, value]) => session.metadata?.[key] !== value))
+                    return yield* new BusyError({ sessionID: input.sessionID })
+                }
+                if (input.expectedLatestInputID !== undefined) {
+                  const latest = yield* db
+                    .select({ id: SessionInputTable.id })
+                    .from(SessionInputTable)
+                    .where(eq(SessionInputTable.session_id, input.sessionID))
+                    .orderBy(desc(SessionInputTable.admitted_seq))
+                    .limit(1)
+                    .get()
+                    .pipe(Effect.orDie)
+                  if ((latest?.id ?? null) !== input.expectedLatestInputID) {
+                    return yield* new BusyError({ sessionID: input.sessionID })
+                  }
+                }
+                return yield* admitPrompt({ db, events, store, content, cleanupRevert, wake: enqueueWake }, input)
+              }),
+            ),
           ),
         ),
       synthetic: (input) =>
@@ -1255,12 +1312,14 @@ const make = (execution: SessionExecution.Interface) =>
             Effect.asVoid,
           ),
         ),
+      compareAndPatchMetadata: (request) => SessionMetadata.compareAndPatch({ db, events, get: result.get, activate }, request),
       patchMetadata: (input) =>
         operations.withLock(input.sessionID)(
           activate(input.sessionID).pipe(
             Effect.andThen(
               Effect.gen(function* () {
-                yield* result.get(input.sessionID)
+                const session = yield* result.get(input.sessionID)
+                if (input.expectedMetadata && Object.entries(input.expectedMetadata).some(([key, value]) => session.metadata?.[key] !== value)) return
                 yield* events.publish(SessionEvent.MetadataPatched, {
                   sessionID: input.sessionID,
                   timestamp: yield* DateTime.now,
@@ -1327,10 +1386,12 @@ const make = (execution: SessionExecution.Interface) =>
                       reason: `summarizer model resolution failed: ${error.message}`,
                     })),
                   )
+                  const skills = Option.getOrUndefined(yield* Effect.serviceOption(SkillV2.Service))
                   const compaction = SessionCompaction.make({
                     events,
                     llm,
                     config: yield* config.entries(),
+                    commandNames: SkillV2.commandNamesFrom(skills),
                     loadCurrent: (sessionID) =>
                       Effect.all({
                         entries: SessionHistory.currentEntriesForRunner(db, sessionID),

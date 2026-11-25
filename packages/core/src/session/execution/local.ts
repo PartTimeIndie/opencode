@@ -24,6 +24,10 @@ import { SessionLinks } from "../links"
 import { SessionFailure } from "../failure"
 import { SessionSupervision } from "../supervision"
 import { SettlementWatchdog } from "../settlement-watchdog"
+import { SessionExecutionOwner } from "./owner"
+import { WorkspaceCheckout } from "../workspace/checkout"
+import { DesktopRecovery } from "../desktop-recovery"
+import { SessionActivityTable } from "../sql"
 
 export const DESKTOP_STARTUP_RECOVERY_DELAY_MS = 65_000
 
@@ -58,7 +62,9 @@ export const layer = Layer.effect(
     const activity = yield* SessionActivity.Service
     const events = yield* EventV2.Service
     const { db } = yield* Database.Service
-    const ownerID = "owner_" + Identifier.ascending()
+    const ownerID = DesktopRecovery.claimOwner("owner_" + Identifier.ascending())
+    const crashRequests = new Map<SessionSchema.ID, { activityID: string; previousOwner: string }>()
+    const crashCohort = new Set<string>()
     const activeActivityBySession = new Map<SessionSchema.ID, string>()
     const activityHeartbeatAt = new Map<string, number>()
     const explicitlyInterrupted = new Set<SessionSchema.ID>()
@@ -79,9 +85,15 @@ export const layer = Layer.effect(
     )
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, void, SessionRunner.RunError>({
       drain: Effect.fnUntraced(function* (sessionID: SessionSchema.ID, mode) {
+        const crash = mode === "recovery" ? crashRequests.get(sessionID) : undefined
+        if (mode === "recovery") {
+          crashRequests.delete(sessionID)
+          if (!crash) return
+        }
         const session = yield* store.get(sessionID)
         if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
-        if (yield* hasPendingBlockingQuestion(db, sessionID)) return
+        yield* WorkspaceCheckout.assertSession(db, sessionID)
+        if (!crash && (yield* hasPendingBlockingQuestion(db, sessionID))) return
         // Advisory wakes may outlive the input already consumed by an active drain.
         // Do not let their no-op successors overwrite a failed run with a completed activity.
         if (
@@ -98,7 +110,8 @@ export const layer = Layer.effect(
             activityHeartbeatAt,
             {
               sessionID,
-              kind: mode === "run" ? "resume" : "prompt",
+              kind: mode === "recovery" ? "recovery" : mode === "run" ? "resume" : "prompt",
+              crash,
               ownerID,
               leaseDurationMs: SessionActivity.LEASE_DURATION_MS,
               openedSeq,
@@ -119,8 +132,11 @@ export const layer = Layer.effect(
                   ),
                 ).pipe(Effect.forkScoped)
                 return yield* Effect.raceFirst(
-                  SessionRunner.Service.use((runner) => runner.run({ sessionID, force: mode === "run" })).pipe(
-                    Effect.provide(locations.get(session.location)),
+                  SessionExecutionOwner.withOwner(
+                    { sessionID, activityID: act.id, ownerID },
+                    SessionRunner.Service.use((runner) => runner.run({ sessionID, force: mode !== "wake" })).pipe(
+                      Effect.provide(locations.get(session.location)),
+                    ),
                   ),
                   Deferred.await(ownershipLostSignal).pipe(Effect.andThen(Effect.interrupt)),
                 ).pipe(
@@ -221,6 +237,7 @@ export const layer = Layer.effect(
           return yield* reconcilePendingTool(store, coordinator, sessionID, callID)
         }),
       resume: coordinator.run,
+      withIdle: coordinator.withIdle,
       resumeOrJoin: coordinator.runOrJoin,
       wake: coordinator.wake,
       queueContinuation: coordinator.queueContinuation,
@@ -229,7 +246,7 @@ export const layer = Layer.effect(
           Effect.catchCause((cause) => {
             // switchAgent/interrupt settle the awaited run with a pure Interrupt
             // cause. That expected runner exit must not interrupt the awaiting
-            // caller — an interrupted HTTP request fiber answers an empty 503.
+            // caller â€” an interrupted HTTP request fiber answers an empty 503.
             // Real typed failures and defects still propagate.
             const onlyInterrupts = cause.reasons.length > 0 && cause.reasons.every((reason) => Cause.isInterruptReason(reason))
             return onlyInterrupts ? Effect.void : Effect.failCause(cause)
@@ -238,6 +255,7 @@ export const layer = Layer.effect(
         ),
     })
 
+    yield* locations.bindExecution(executionService)
     yield* SessionWakeup.listen((sessionID, admittedSeq) =>
       executionService.wake(sessionID, admittedSeq).pipe(Effect.ignore),
     )
@@ -248,7 +266,7 @@ export const layer = Layer.effect(
       // The process-global loop resolves settings on each cycle: project config
       // can be published after this layer starts, and reloads can change it.
       yield* Effect.sleep(startupRecoveryDelayMs()).pipe(
-        Effect.andThen(SettlementWatchdog.run({ activity, db })),
+        Effect.andThen(SettlementWatchdog.run({ activity, db, excludeIDs: () => crashCohort })),
         Effect.catchCause((cause) =>
           Effect.logError("SettlementWatchdog: loop failed", { cause: Cause.pretty(cause) }).pipe(Effect.asVoid),
         ),
@@ -256,7 +274,31 @@ export const layer = Layer.effect(
       )
       yield* Effect.sleep(startupRecoveryDelayMs()).pipe(
         Effect.andThen(
-          runStartupRecovery(activity, db, () => new Set(activeActivityBySession.values()), executionService.resume),
+          Effect.gen(function* () {
+            const predecessors = DesktopRecovery.predecessors()
+            if (predecessors.length) {
+              const candidates = yield* db.select().from(SessionActivityTable).where(and(
+                inArray(SessionActivityTable.owner_id, [...predecessors]),
+                inArray(SessionActivityTable.status, ["running", "recovering"]),
+              )).all().pipe(Effect.orDie)
+              for (const candidate of candidates) {
+                if (!candidate.owner_id) continue
+                crashCohort.add(candidate.id)
+                crashRequests.set(candidate.session_id, { activityID: candidate.id, previousOwner: candidate.owner_id })
+                yield* coordinator.recover(candidate.session_id).pipe(
+                  Effect.catchCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.void :
+                    Effect.logError("Desktop crash recovery paused", { sessionID: candidate.session_id, cause: Cause.pretty(cause) })),
+                  Effect.ensuring(Effect.sync(() => {
+                    crashCohort.delete(candidate.id)
+                    crashRequests.delete(candidate.session_id)
+                  })),
+                  Effect.forkScoped,
+                )
+              }
+            }
+            yield* runStartupRecovery(activity, db,
+              () => new Set([...activeActivityBySession.values(), ...crashCohort]), executionService.resume)
+          }),
         ),
         Effect.catchCause((cause) =>
           Effect.logError("SessionRecovery: startup failed", { cause: Cause.pretty(cause) }).pipe(Effect.asVoid),
@@ -388,21 +430,43 @@ export const activityHeartbeat = (
   heartbeatAt: Map<string, number>,
   onOwnershipLost: () => Effect.Effect<void>,
 ) =>
-  Effect.forever(
-    Effect.sleep(SessionActivity.HEARTBEAT_INTERVAL_MS).pipe(
-      Effect.andThen(
-        Effect.gen(function* () {
-          const renewed = yield* activity.heartbeat(activityID, ownerID, SessionActivity.LEASE_DURATION_MS)
-          if (!renewed) return yield* onOwnershipLost()
-          heartbeatAt.set(activityID, yield* Clock.currentTimeMillis)
-        }),
-      ),
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-        return Effect.logWarning("SessionActivity: heartbeat failed", { activityID, cause }).pipe(Effect.asVoid)
-      }),
-    ),
-  )
+  Effect.gen(function* () {
+    let missed = 0
+    const renew = Effect.gen(function* () {
+      const renewed = yield* activity.heartbeat(activityID, ownerID, SessionActivity.LEASE_DURATION_MS).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.failCause(cause)
+            : Effect.as(
+              Effect.logWarning("SessionActivity: heartbeat renewal failed", { activityID, missed }),
+              "error" as const,
+            )),
+      )
+      // Wall-clock backstop after the outcome: a slow or stalled renewal must
+      // not postpone ownership loss past the durable lease window. Successful
+      // renewals restamp the map, so staleness here means real silence.
+      const now = yield* Clock.currentTimeMillis
+      const lastStamp = heartbeatAt.get(activityID)
+      if (lastStamp !== undefined &&
+        now - lastStamp >= SessionActivity.LEASE_DURATION_MS - SessionActivity.HEARTBEAT_INTERVAL_MS) {
+        yield* onOwnershipLost()
+        return
+      }
+      // A thrown renewal defect may recover on the next tick, but two
+      // consecutive misses must report ownership loss visibly instead of
+      // running on a silently expired lease. A false renewal already proves
+      // the row is lost and reports ownership loss immediately.
+      if (renewed === "error") {
+        missed++
+        if (missed >= 2) { yield* onOwnershipLost(); return }
+        return
+      }
+      if (!renewed) { yield* onOwnershipLost(); return }
+      missed = 0
+      heartbeatAt.set(activityID, now)
+    })
+    yield* Effect.forever(Effect.sleep(SessionActivity.HEARTBEAT_INTERVAL_MS).pipe(Effect.andThen(renew)))
+  })
 
 export const heartbeatActivityProgress = (
   activity: SessionActivity.Interface,

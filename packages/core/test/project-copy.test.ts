@@ -108,6 +108,38 @@ function stored(projectID: Project.ID) {
 }
 
 describe("ProjectCopy", () => {
+  testEffect(Layer.empty).live("unchanged discovery stays read-only while another connection owns the writer", () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      const filename = path.join(directory.path, "refresh.db")
+      const database = Database.layerFromPath(filename)
+      const events = EventV2.layer.pipe(Layer.provide(database))
+      const directories = ProjectDirectories.layer.pipe(Layer.provide(database))
+      const copies = ProjectCopy.layer.pipe(
+        Layer.provide(database), Layer.provide(events), Layer.provide(directories),
+        Layer.provide(FSUtil.defaultLayer), Layer.provide(Git.defaultLayer),
+      )
+      yield* Effect.gen(function* () {
+        const input = yield* setup()
+        yield* input.db.run("PRAGMA busy_timeout = 10").pipe(Effect.orDie)
+        const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+        const writer = yield* Effect.acquireRelease(
+          Effect.sync(() => new sqlite.Database(filename)),
+          (connection) => Effect.sync(() => connection.close()),
+        )
+        writer.run("BEGIN IMMEDIATE")
+        const result = yield* (yield* ProjectCopy.Service).refresh({ projectID: input.projectID }).pipe(Effect.exit)
+        expect(Exit.isSuccess(result)).toBe(true)
+        if (Exit.isSuccess(result)) expect(result.value).toEqual({ updated: [], removed: [] })
+        expect(writer.inTransaction).toBe(true)
+        writer.run("ROLLBACK")
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(database, events, directories, copies)))
+    }),
+  )
+
   isolatedIt.live("registers isolated workspace creation only when the capability is enabled", () =>
     Effect.gen(function* () {
       const input = yield* setup()

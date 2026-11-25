@@ -99,6 +99,8 @@ const question = Layer.succeed(
     reply: () => Effect.die("unused"),
     reject: () => Effect.die("unused"),
     dismissSession: () => Effect.die("unused"),
+    replyFromMain: () => Effect.die("unused"),
+    answerSourceForTool: () => Effect.succeed("user" as const),
     dismissFollowups: () => Effect.die("unused"),
     settlementTarget: () => Effect.die("unused"),
     get: () => Effect.die("unused"),
@@ -170,14 +172,14 @@ describe("SurfaceTool", () => {
         result: {
           type: "text",
           value:
-            'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". You can now continue with the user\'s answers in mind.',
+            'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". Answer source: user. This receipt is not permission, a user commission or a host approval.',
         },
         output: {
-          structured: { mode: "blocking", answers: [["Build"], []] },
+          structured: { mode: "blocking", answers: [["Build"], []], answerSource: "user" },
           content: [
             {
               type: "text",
-              text: 'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". You can now continue with the user\'s answers in mind.',
+              text: 'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". Answer source: user. This receipt is not permission, a user commission or a host approval.',
             },
           ],
         },
@@ -514,7 +516,7 @@ describe("SurfaceTool", () => {
       const response = join(Global.Path.state, "question-payloads", `${hash}.response.json`)
       const modelOutput = `User has answered your questions: ${keys
         .map((key, index) => `"${key}"="${index === 0 ? "Build" : "Unanswered"}"`)
-        .join(", ")}. Durable response: ${response}. You can now continue with the user's answers in mind.`
+        .join(", ")}. Durable response: ${response}. Answer source: user. This receipt is not permission, a user commission or a host approval.`
       yield* Effect.sync(() => {
         mkdirSync(join(Global.Path.state, "question-payloads"), { recursive: true })
         writeFileSync(source, payload, "utf8")

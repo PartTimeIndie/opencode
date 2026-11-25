@@ -112,35 +112,12 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
           workspaceID: yield* InstanceState.workspaceID,
         }),
       )
-      const [list, catalog] = yield* Effect.gen(function* () {
+      return yield* Effect.gen(function* () {
         yield* McpTool.Service.use((mcpTools) => mcpTools.refresh()).pipe(
           Effect.mapError(() => new HttpApiError.BadRequest({})),
         )
-        return yield* Effect.all(
-          [
-            ToolRegistry.Service.use((registry) => registry.materialize()).pipe(
-              Effect.map((materialized) => materialized.definitions),
-            ),
-            ToolRegistry.Service.use((registry) => registry.catalog()),
-          ],
-          { concurrency: "unbounded" },
-        )
+        return yield* ToolRegistry.Service.use((registry) => registry.catalog())
       }).pipe(Effect.provide(location))
-      return [
-        ...list.map((item) => {
-          const metadata = catalog.find((entry) => entry.id === item.name)
-          return {
-            id: item.name,
-            description: item.description,
-            parameters: item.inputSchema,
-            scope: metadata?.scope ?? ("location" as const),
-            ...(metadata?.project ? { project: metadata.project } : {}),
-            ...(metadata?.source ? { source: metadata.source } : {}),
-            ...(metadata?.version ? { version: metadata.version } : {}),
-            visible: metadata?.visible ?? true,
-          }
-        }),
-      ]
     })
 
     const toolIDs = Effect.fn("ExperimentalHttpApi.toolIDs")(function* () {
@@ -149,8 +126,8 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
         yield* McpTool.Service.use((mcpTools) => mcpTools.refresh()).pipe(
           Effect.mapError(() => new HttpApiError.BadRequest({})),
         )
-        return yield* ToolRegistry.Service.use((registry) => registry.materialize()).pipe(
-          Effect.map((materialized) => materialized.definitions.map((item) => item.name)),
+        return yield* ToolRegistry.Service.use((registry) => registry.catalog()).pipe(
+          Effect.map((catalog) => catalog.map((item) => item.id)),
         )
       }).pipe(
         Effect.provide(

@@ -96,6 +96,7 @@ export type QuestionV2Info = SurfaceBlockingRequest["questions"][number] & {
   filePath?: string
   emojis?: string[]
   form?: QuestionFormSpec
+  chatSend?: { text: string; label?: string; description?: string }
   body?: QuestionBodyBlock[]
 }
 

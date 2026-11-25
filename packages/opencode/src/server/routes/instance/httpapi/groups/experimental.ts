@@ -270,7 +270,8 @@ export const ExperimentalApi = HttpApi.make("experimental")
           OpenApi.annotations({
             identifier: "tool.list",
             summary: "List tools",
-            description: "Get a list of available tools with their JSON schema parameters for the current workspace.",
+            description:
+              "Get the current workspace's configurable tool catalog with JSON schema parameters, including inactive tools. Listing does not grant execution access. Provider and model query parameters are accepted for compatibility but do not filter this catalog.",
           }),
         ),
         HttpApiEndpoint.get("toolIDs", ExperimentalPaths.toolIDs, {
@@ -282,7 +283,7 @@ export const ExperimentalApi = HttpApi.make("experimental")
             identifier: "tool.ids",
             summary: "List tool IDs",
             description:
-              "Get a list of all available tool IDs, including both built-in tools and dynamically registered tools.",
+              "Get configurable tool IDs for the current workspace, including inactive built-in and dynamically registered tools. Listing does not grant execution access.",
           }),
         ),
         HttpApiEndpoint.get("worktree", ExperimentalPaths.worktree, {

@@ -78,4 +78,79 @@ describe("file tree requests", () => {
     expect(errors).toEqual([])
     dispose.cleanup()
   })
+
+  test("reports the first failure and skips repeated identical error toasts", async () => {
+    const errors: string[] = []
+    const failure = new Error("Unexpected server error. Check server logs for details.")
+    const nodes = [
+      {
+        name: "README.md",
+        path: "README.md",
+        type: "file" as const,
+        absolute: "C:/GitRepros/opencode/README.md",
+        ignored: false,
+      },
+    ]
+    let calls = 0
+    const dispose = createRoot((cleanup) => {
+      const tree = createFileTreeStore({
+        scope: () => "C:/GitRepros/opencode",
+        normalizeDir: (input) => input,
+        list: async () => {
+          calls += 1
+          if (calls !== 3) throw failure
+          return nodes
+        },
+        onError: (message) => errors.push(message),
+      })
+      return { cleanup, tree }
+    })
+
+    await dispose.tree.listDir("")
+    await dispose.tree.listDir("", { force: true })
+
+    expect(calls).toBe(2)
+    expect(errors).toEqual([failure.message])
+    expect(dispose.tree.dirState("")?.error).toBe(failure.message)
+
+    // A success clears the marker so the next failure is reported again.
+    await dispose.tree.listDir("", { force: true })
+    await dispose.tree.listDir("", { force: true })
+
+    expect(calls).toBe(4)
+    expect(errors).toEqual([failure.message, failure.message])
+    expect(dispose.tree.dirState("")?.error).toBe(failure.message)
+    dispose.cleanup()
+  })
+
+  test("keeps silent watcher refreshes out of error toasts", async () => {
+    const errors: string[] = []
+    const failure = new Error("Unexpected server error. Check server logs for details.")
+    const dispose = createRoot((cleanup) => {
+      const tree = createFileTreeStore({
+        scope: () => "C:/GitRepros/opencode",
+        normalizeDir: (input) => input,
+        list: async () => {
+          throw failure
+        },
+        onError: (message) => errors.push(message),
+      })
+      return { cleanup, tree }
+    })
+
+    await dispose.tree.listDir("", { force: true, silent: true })
+
+    expect(dispose.tree.dirState("")?.error).toBe(failure.message)
+    expect(errors).toEqual([])
+
+    await dispose.tree.listDir("", { force: true })
+
+    // A user-triggered refresh still toasts once for the unchanged failure.
+    expect(errors).toEqual([failure.message])
+
+    await dispose.tree.listDir("", { force: true })
+
+    expect(errors).toEqual([failure.message])
+    dispose.cleanup()
+  })
 })

@@ -6,12 +6,19 @@ export function forkTransferExclusion(file: string, ignored = false): string | u
     return "unsafe-path"
   if (ignored) return "git-ignored"
   if (/^docs\/plans\/prototype-fund(?:[./-]|$)/i.test(file)) return "personal-document"
+  if (file === "packages/app/e2e/regression/question-daily-review-import.spec.ts") return "local-agent-workflow"
+  if (file === "packages/core/script/fixtures/pu-skill-groups.json") return "local-config"
+  if (/^docs\/visual-qa-smoke-[^/]+\.md$/.test(file)) return "local-evidence"
+  if (/^packages\/app\/src\/context\/global-sync\/_patch_[^/]+\.py$/.test(file)) return "local-scratch"
+  if (/^packages\/core\/test\/(?:clean_fixture|dedupe_tests|final_close|find_dup|fix_fixture)\.py$/.test(file))
+    return "local-scratch"
+  if (file === "packages/app/e2e/run-with-vite-server.local.ts") return "local-scratch"
   if (/^skills\//.test(file)) return "personal-skill"
   // Only the two repository-development skills are portable project sources.
   // Installed user workflows remain on disk, but are not publication inputs.
   if (/^\.opencode\/skills\//.test(file) && !/^\.opencode\/skills\/(?:composer-toolbar-plugin|effect)\//.test(file))
     return "local-skill"
-  if (/^\.opencode\/(?:scripts|tools|agent|agents)\//.test(file)) return "local-agent-workflow"
+  if (/^\.opencode\/(?:scripts|tools?|agents?)\//.test(file)) return "local-agent-workflow"
   if (/^\.opencode\/(?:opencode\.jsonc?|app\.jsonc|tui\.json|prompts\/|themes\/)/.test(file)) return "local-config"
   if (/^(?:\.agents\/checkpoints|\.cursor\/hooks\/state)\//.test(file)) return "local-agent-state"
   if (/^\.opencode\/(?:plugin-sources|plugins)\/pu-agent-mirror-app\//.test(file) || file === "packages/app/e2e/regression/pu-agent-mirror.spec.ts")

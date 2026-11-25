@@ -573,6 +573,77 @@ test("Daily Review exposes all 48 accepted items and confirms while build is alr
   expect(failures.filter((failure) => !isExpectedAbortedBackgroundRequest(failure))).toEqual([])
 })
 
+test("a confirmed same-route handoff switches the composer agent and chain exactly once", async ({ page }) => {
+  const errors = trackPageErrors(page)
+  const networkFailures = trackNetworkFailures(page)
+  const requests: unknown[] = []
+  const extraSwitchRequests: string[] = []
+  let handoffDismissed = false
+  let releaseSwitch = () => {}
+  const switchGate = new Promise<void>((resolve) => {
+    releaseSwitch = resolve
+  })
+  await setupHandoffPage(page, {
+    questions: () => handoffDismissed ? [] : [handoffRequest()],
+    onQuestionReject: () => {
+      handoffDismissed = true
+    },
+  })
+  await page.route(`**/api/session/${sessionID}/switch-agent-and-prompt`, async (route) => {
+    requests.push(route.request().postDataJSON())
+    await switchGate
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ id: "msg_started" }) })
+  })
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return
+    const url = new URL(request.url())
+    if (url.pathname.endsWith("/switch-agent-and-prompt")) return
+    if (url.pathname.includes("switch-agent") || url.pathname.includes("switch-model"))
+      extraSwitchRequests.push(`${request.method()} ${url.pathname}`)
+  })
+
+  await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+  const agentTrigger = page.locator('[data-action="prompt-agent"]')
+  const modelControl = page.locator('[data-component="composer-model-control"]')
+  const modelTrigger = modelControl.locator('[data-action="prompt-model"]')
+  await expect(agentTrigger).toBeVisible()
+  await expect(modelControl).toContainText("GPT Test")
+
+  const popup = page.locator('[data-component="control-panel-popup"]')
+  await expect(popup.locator('[data-component="agent-handoff"]')).toBeVisible()
+  await popup.getByRole("button", { name: "Switch to build and implement" }).click()
+
+  // While the atomic switch request is in flight, this session's pickers are locked.
+  await expect(agentTrigger).toBeDisabled()
+  await expect(modelTrigger).toHaveAttribute("aria-disabled", "true")
+
+  releaseSwitch()
+  await expect.poll(() => requests.length).toBe(1)
+  await expect(popup).toHaveCount(0)
+
+  // The composer now shows exactly the confirmed selection, not the agent default re-resolved.
+  await expect(modelControl).toContainText("GLM Chain")
+  await expect(agentTrigger).toContainText("build")
+  await expect(agentTrigger).toBeEnabled()
+  await expect(modelTrigger).not.toHaveAttribute("aria-disabled", "true")
+  expect(extraSwitchRequests).toEqual([])
+
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await test.info().attach("agent-handoff-composer-selection-desktop", {
+    body: await page.screenshot({ path: screenshotPath("agent-handoff-composer-selection-desktop.png"), fullPage: true }),
+    contentType: "image/png",
+  })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await test.info().attach("agent-handoff-composer-selection-mobile", {
+    body: await page.screenshot({ path: screenshotPath("agent-handoff-composer-selection-mobile.png"), fullPage: true }),
+    contentType: "image/png",
+  })
+  expectNoSmokeErrors(errors, [], [])
+  expect(
+    networkFailures.every((failure) => isExpectedAbortedBackgroundRequest(failure)),
+  ).toBe(true)
+})
+
 async function setupHandoffPage(page: Page, options: HandoffMockOptions) {
   await mockOpenCodeServer(page, {
     port: serverPort,

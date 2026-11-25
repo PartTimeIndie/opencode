@@ -42,6 +42,7 @@ export interface BasicToolProps {
   clickable?: boolean
   action?: JSX.Element
   hoverTitle?: string
+  inspectWhileRunning?: boolean
 }
 
 const SPRING = { type: "spring" as const, visualDuration: 0.35, bounce: 0 }
@@ -176,7 +177,7 @@ export function BasicTool(props: BasicToolProps) {
   })
 
   const handleOpenChange = (value: boolean) => {
-    if (pending()) return
+    if (props.hideDetails || (pending() && !props.inspectWhileRunning)) return
     if (props.locked && !value) return
     setOpen(value)
   }
@@ -250,7 +251,7 @@ export function BasicTool(props: BasicToolProps) {
       <Show when={props.action}>
         <span data-slot="basic-tool-tool-action">{props.action}</span>
       </Show>
-      <Show when={hasChildren() && !props.hideDetails && !props.locked && !pending()}>
+      <Show when={hasChildren() && !props.hideDetails && !props.locked && (!pending() || props.inspectWhileRunning)}>
         <Collapsible.Arrow />
       </Show>
     </div>

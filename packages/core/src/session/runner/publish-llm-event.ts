@@ -7,6 +7,7 @@ import { SessionFailure } from "../failure"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { ProviderError } from "../provider-error"
+import type { Tool } from "../../tool/tool"
 
 type Input = {
   readonly sessionID: SessionSchema.ID
@@ -14,6 +15,8 @@ type Input = {
   readonly model: ModelV2.Ref
   readonly cost: ReadonlyArray<ModelV2.Cost>
   readonly snapshot?: string
+  readonly publishLiveProgress?: boolean
+  readonly structuredOutputAttempt?: SessionEvent.Step.Started["data"]["structuredOutputAttempt"]
 }
 
 const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
@@ -122,6 +125,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       settled: boolean
       providerExecuted: boolean
       providerMetadata?: ProviderMetadata
+      receipt?: Tool.Progress
     }
   >()
   const timestamp = DateTime.now
@@ -152,6 +156,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       assistantMessageID,
       timestamp: yield* timestamp,
       ...(input.snapshot === undefined ? {} : { snapshot: input.snapshot }),
+      ...(input.structuredOutputAttempt === undefined ? {} : { structuredOutputAttempt: input.structuredOutputAttempt }),
     })
     return assistantMessageID
   })
@@ -336,6 +341,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     let uncalled = 0
     for (const [callID, tool] of tools) {
       if (tool.settled || (hostedOnly && !tool.providerExecuted)) continue
+      if (tool.receipt) yield* persistReceipt(callID, tool)
       tool.settled = true
       if (!tool.called) uncalled++
       yield* events.publish(SessionEvent.Tool.Failed, {
@@ -359,6 +365,22 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     const tool = tools.get(callID)
     return tool ? Effect.succeed(tool.assistantMessageID) : Effect.die(`Unknown tool call: ${callID}`)
   }
+
+  const persistReceipt = (callID: string, tool: { assistantMessageID: SessionMessage.ID; receipt?: Tool.Progress }) =>
+    Effect.gen(function* () {
+      const receipt = tool.receipt
+      if (!receipt) return
+      yield* events.publish(SessionEvent.Tool.Progress, {
+          sessionID: input.sessionID,
+          assistantMessageID: tool.assistantMessageID,
+          callID,
+          timestamp: yield* timestamp,
+          structured: receipt.structured,
+          content: receipt.content.filter(
+            (part): part is Extract<Tool.Content, { type: "text" }> => part.type === "text",
+          ),
+        })
+    })
 
   const publish = Effect.fn("SessionRunner.publishLLMEvent")(function* (
     event: LLMEvent,
@@ -481,6 +503,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
           if (event.result.type === "error") return
           return yield* Effect.die(`Duplicate tool result: ${event.id}`)
         }
+        if (event.result.type === "error" && tool.receipt) yield* persistReceipt(event.id, tool)
         tool.settled = true
         const result = settledOutput(event.output, event.result)
         const provider = {
@@ -577,6 +600,32 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   return {
     publish,
     flush,
+    // Called only inside the cache attempt's atomic parking transaction. Persist
+    // our billed usage with an error finish, never buffered content or tool calls.
+    accountRejected: Effect.fn("SessionRunner.accountRejected")(function* (
+      usage: Usage,
+      metadata?: ProviderMetadata,
+      generationMs?: number,
+    ) {
+      if (stepSettled) return
+      const measured = usageCost(input.cost, usage, metadata)
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID: input.sessionID,
+        timestamp: yield* timestamp,
+        assistantMessageID: yield* startAssistant(),
+        finish: "error",
+        cost: measured.cost,
+        tokens: measured.tokens,
+        tokenMeasurement: {
+          version: 1,
+          ...measured.tokenMeasurement,
+          ...(generationMs === undefined || !Number.isFinite(generationMs) ? {} : {
+            generationMilliseconds: Math.max(0, Math.round(generationMs)),
+          }),
+        },
+      })
+      stepSettled = true
+    }),
     finishStep: Effect.fn("SessionRunner.finishStep")(function* (
       snapshot?: string,
       structured?: unknown,
@@ -645,11 +694,40 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     hasUsableText: () => usableText,
     hasCompletedToolResult: () => completedToolResult,
     hasStepFinish: () => stepFinish !== undefined,
+    // An empty successful attempt can be retried before any assistant output.
+    // Its finish/usage must not mask the next attempt's terminal verdict.
+    clearEmptyFinish: () => {
+      if (stepSettled || retryBarrier || usableText || completedToolResult || tools.size > 0) return false
+      if (stepFinish && stepFinish.finish !== "stop") return false
+      stepFinish = undefined
+      return true
+    },
     stepFinishReason: () => stepFinish?.finish,
     hasProviderError: () => providerFailed,
     startAssistant,
     currentAssistantMessageID: () => assistantMessageID,
     assistantMessageID: assistantMessageIDForTool,
+    progress: Effect.fn("SessionRunner.toolProgress")(function* (callID: string, snapshot: Tool.Progress) {
+      const tool = tools.get(callID)
+      if (!tool || !tool.called || tool.settled || stepSettled || tool.providerExecuted) return
+      if (tool.name === "multi_agent_fanout") tool.receipt = snapshot
+       // A repair claim is an idempotency record, not optional live UI progress.
+       // Persist it before the provider request even when live display is disabled.
+       const repairClaimed = tool.name === "multi_agent_fanout" && Array.isArray(snapshot.structured.reviewers) &&
+         snapshot.structured.reviewers.some((row: unknown) =>
+           row !== null && typeof row === "object" && "repairClaim" in row && typeof row.repairClaim === "string")
+       if (input.publishLiveProgress === false && !repairClaimed) return
+      yield* events.publish(SessionEvent.Tool.Progress, {
+        sessionID: input.sessionID,
+        assistantMessageID: tool.assistantMessageID,
+        callID,
+        timestamp: yield* timestamp,
+        structured: snapshot.structured,
+        content: snapshot.content.filter(
+          (part): part is Extract<Tool.Content, { type: "text" }> => part.type === "text",
+        ),
+      })
+    }),
     publishedDeltaCount: () => publishedDeltas,
   }
 }

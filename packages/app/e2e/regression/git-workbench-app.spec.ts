@@ -1,4 +1,4 @@
-import { expect, test, type CDPSession, type Locator, type Page, type Route } from "@playwright/test"
+﻿import { expect, test, type CDPSession, type Locator, type Page, type Route } from "@playwright/test"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { mockOpenCodeServer } from "../utils/mock-server"
@@ -535,6 +535,231 @@ test.describe("git workbench app plugin", () => {
         .getByRole("button", { name: "Commit All Open Changes", exact: true }),
     )
     await page.screenshot({ path: "e2e/test-results/git-workbench-mobile-shell.png", fullPage: true })
+    expectNoSmokeErrors(errors, [], networkFailures)
+  })
+
+  test("filters branch history with a graph, retry, full message loading and persistence", async ({ page }) => {
+    const errors = trackPageErrors(page)
+    const networkFailures: string[] = []
+    const actions: string[] = []
+    const actionPayloads: Record<string, unknown>[] = []
+    page.on("requestfailed", (request) =>
+      networkFailures.push(`${request.failure()?.errorText ?? "failed"} ${request.url()}`),
+    )
+    page.on("response", (response) => {
+      if (response.status() >= 400 && !response.url().includes("/vcs/git/history"))
+        networkFailures.push(`${response.status()} ${response.request().method()} ${response.url()}`)
+    })
+
+    const snapshot = gitSnapshot()
+    const existingBranches = snapshot.branches as Array<{
+      name: string
+      current: boolean
+      remote: boolean
+      hash?: string
+      upstream?: string
+      tracking?: string
+    }>
+    const refSnapshot = {
+      ...snapshot,
+      branches: [
+        { ...existingBranches[0], ref: "refs/heads/git-workbench-test" },
+        { ...existingBranches[1], ref: "refs/heads/main" },
+        { ...existingBranches[2], ref: "refs/remotes/origin/main" },
+        { name: "side", current: false, remote: false, hash: "3000000", ref: "refs/heads/side" },
+      ],
+    }
+    const hash = (seed: string) => seed.padEnd(40, "0")
+    const base = {
+      author: "Codex",
+      email: "codex@example.test",
+      date: new Date().toISOString(),
+    }
+    const history = {
+      commits: [
+        { hash: hash("4"), short: "4444444", parents: [hash("2"), hash("3")], ...base, subject: "feat: merge side", body: "" },
+        { hash: hash("3"), short: "3333333", parents: [hash("2")], ...base, subject: "fix: side work", body: "" },
+        {
+          hash: hash("2"),
+          short: "2222222",
+          parents: [hash("1")],
+          ...base,
+          subject: "chore: middle",
+          body: "detail ".repeat(400),
+          bodyTruncated: true,
+        },
+        { hash: hash("1"), short: "1111111", parents: [], ...base, subject: "chore: baseline", body: "" },
+      ],
+      headOid: hash("4"),
+      refLabels: [
+        { hash: hash("4"), label: "git-workbench-test" },
+        { hash: hash("1"), label: "main" },
+        { hash: hash("3"), label: "side" },
+      ],
+      firstParentChain: [hash("4"), hash("2"), hash("1")],
+    }
+
+    await mockOpenCodeServer(page, {
+      directory,
+      project: [project()],
+      provider: provider(),
+      sessions: [session()],
+      pageMessages: () => ({ items: [] }),
+    })
+    await mockGitWorkbenchPlugin(page)
+    await mockGitApi(page, { [directory]: refSnapshot }, actions, actionPayloads, {
+      history,
+      historyErrorOnce: { status: 409, code: "shallow_changed", recovery: "refresh", message: "History anchor moved" },
+      commitMessages: { [hash("2")]: `chore: middle\n\n${"detail ".repeat(400)}` },
+    })
+    await configurePage(page)
+
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+    await hideDebugBar(page)
+    await prepareDockPaneSelection(page, "left", "gitWorkbench")
+    await page.keyboard.press("Enter")
+    const workbench = page.locator(".oc-git-workbench")
+    await expectAppVisible(workbench)
+
+    await workbench.locator(".oc-git-workbench__tabs").getByRole("button", { name: "History" }).click()
+
+    const select = workbench.locator(".oc-git-workbench__history-select")
+    await expectAppVisible(select)
+    await expect(workbench.locator(".oc-git-workbench__history-error-text")).toContainText("History anchor moved")
+    await expect(workbench.getByRole("button", { name: "Aktualisieren" }).first()).toBeVisible()
+    await workbench.getByRole("button", { name: "Aktualisieren" }).first().click()
+
+    await expect(workbench.locator(".oc-git-workbench__history-row")).toHaveCount(4)
+    await expect(workbench.locator(".oc-git-workbench__node--merge")).toHaveCount(1)
+    await expect(workbench.locator(".oc-git-workbench__graph-svg").first()).toBeVisible()
+    await expect(workbench.locator(".oc-git-workbench__history-footnote")).toContainText("Anfang der Historie erreicht (4 Commits)")
+    await expect(workbench.locator(".oc-git-workbench__refs").first()).toContainText("git-workbench-test")
+
+    await select.selectOption("ref:refs/heads/side")
+    await expect(workbench.locator(".oc-git-workbench__history-row")).toHaveCount(3)
+    await expect(workbench.locator(".oc-git-workbench__history-row").first()).toContainText("fix: side work")
+    await expect(workbench.locator(".oc-git-workbench__details h3")).toHaveText("fix: side work")
+    const narrowLayout = await workbench.locator(".oc-git-workbench__history").evaluate((element) => {
+      const details = element.querySelector(".oc-git-workbench__details")!.getBoundingClientRect()
+      const list = element.querySelector(".oc-git-workbench__history-window")!.getBoundingClientRect()
+      return { detailsLeft: details.left, listLeft: list.left, detailsRight: details.right, right: element.getBoundingClientRect().right }
+    })
+    expect(narrowLayout.detailsLeft).toBe(narrowLayout.listLeft)
+    expect(narrowLayout.detailsRight).toBeLessThanOrEqual(narrowLayout.right)
+
+    const toggle = workbench.locator(".oc-git-workbench__history-toggle input")
+    await expect(toggle).toBeEnabled()
+    await toggle.check()
+    await expect(workbench.locator(".oc-git-workbench__history-row")).toHaveCount(3)
+
+    await select.selectOption("__all__")
+    await expect(toggle).toBeDisabled()
+    await expect(workbench.locator(".oc-git-workbench__history-row")).toHaveCount(4)
+
+    await select.selectOption("ref:refs/heads/side")
+    await workbench.locator(".oc-git-workbench__history-row").nth(1).click()
+    await expect(workbench.getByRole("button", { name: "Mehr Committext laden" })).toBeVisible()
+    await workbench.getByRole("button", { name: "Mehr Committext laden" }).click()
+    await expect(workbench.locator(".oc-git-workbench__commit-message")).toContainText("detail")
+    await expect(workbench.getByRole("button", { name: "Mehr Committext laden" })).toHaveCount(0)
+
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.getByRole("button", { name: "More tools", exact: true }).click()
+    // At mobile width the app docks the plugin body away; the shell plus the
+    // plugin toolbar remain available (same contract as the shell test).
+    await expectAppVisible(page.getByRole("heading", { name: "Git Workbench QA" }))
+    await page.screenshot({ path: "e2e/test-results/git-workbench-history-mobile.png", fullPage: true })
+    await page.setViewportSize({ width: 1280, height: 720 })
+
+    await select.selectOption("ref:refs/heads/side")
+    await expect(select).toHaveValue("ref:refs/heads/side")
+    await page.reload()
+    await hideDebugBar(page)
+    const reopened = page.locator(".oc-git-workbench")
+    await expectAppVisible(reopened)
+    await reopened.locator(".oc-git-workbench__tabs").getByRole("button", { name: "History" }).click()
+    await expect(reopened.locator(".oc-git-workbench__history-select")).toHaveValue("ref:refs/heads/side", { timeout: 15_000 })
+
+    await page.screenshot({ path: "e2e/test-results/git-workbench-history-graph.png", fullPage: true })
+    // The deliberate 409 fixture logs one expected resource error. Reload may
+    // abort the live event stream, but must not hide other network failures.
+    expect(errors).toEqual(["Failed to load resource: the server responded with a status of 409 (Conflict)"])
+    expect(networkFailures.filter((failure) => !/^net::ERR_ABORTED .*\/global\/event$/.test(failure))).toEqual([])
+  })
+
+  test("windows large histories and loads pages until the real end", async ({ page }) => {
+    const errors = trackPageErrors(page)
+    const networkFailures: string[] = []
+    page.on("requestfailed", (request) =>
+      networkFailures.push(`${request.failure()?.errorText ?? "failed"} ${request.url()}`),
+    )
+    page.on("response", (response) => {
+      if (response.status() >= 400 && !response.url().includes("/vcs/git/history"))
+        networkFailures.push(`${response.status()} ${response.request().method()} ${response.url()}`)
+    })
+
+    const total = 260
+    const hash = (index: number) => String(index).padStart(40, "0")
+    const base = { author: "Codex", email: "codex@example.test", date: new Date().toISOString() }
+    const commits = []
+    for (let index = total; index >= 1; index--) {
+      commits.push({
+        hash: hash(index),
+        short: String(index).padStart(7, "0"),
+        parents: index === total ? [] : [hash(index + 1)],
+        ...base,
+        subject: `chain ${index}`,
+        body: "",
+      })
+    }
+    const history = {
+      commits,
+      headOid: hash(total),
+      refLabels: [{ hash: hash(total), label: "git-workbench-test" }],
+    }
+
+    await mockOpenCodeServer(page, {
+      directory,
+      project: [project()],
+      provider: provider(),
+      sessions: [session()],
+      pageMessages: () => ({ items: [] }),
+    })
+    await mockGitWorkbenchPlugin(page)
+    await mockGitApi(page, { [directory]: gitSnapshot() }, [], [], { history })
+    await configurePage(page)
+
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+    await hideDebugBar(page)
+    await prepareDockPaneSelection(page, "left", "gitWorkbench")
+    await page.keyboard.press("Enter")
+    const workbench = page.locator(".oc-git-workbench")
+    await expectAppVisible(workbench)
+    await workbench.locator(".oc-git-workbench__tabs").getByRole("button", { name: "History" }).click()
+
+    const rows = workbench.locator(".oc-git-workbench__history-row")
+    await expect(rows.first()).toContainText(`chain ${total}`)
+    await expect.poll(async () => rows.count(), { timeout: 10_000 }).toBeLessThan(200)
+
+    await workbench.getByRole("button", { name: /^Mehr laden \(/ }).click()
+    await expect
+      .poll(async () => workbench.locator(".oc-git-workbench__history-footnote").textContent(), { timeout: 15_000 })
+      .toContain(`Anfang der Historie erreicht (${total} Commits)`)
+    await expect.poll(async () => rows.count(), { timeout: 10_000 }).toBeLessThan(200)
+    await expect(rows.first()).toContainText(`chain ${total}`)
+
+    const list = workbench.locator(".oc-git-workbench__history-window")
+    await list.evaluate((element) => { element.scrollTop = 38 * 180 })
+    await expect(rows.first()).toContainText("chain 104")
+    const pitch = await rows.nth(1).evaluate((row) => row.getBoundingClientRect().top - row.previousElementSibling!.getBoundingClientRect().top)
+    expect(pitch).toBe(38)
+    await rows.nth(24).click()
+    await expect.poll(async () => list.evaluate((element) => element.scrollTop)).toBeGreaterThan(38 * 170)
+    await expect(rows.first()).toContainText("chain 104")
+
+    await page.screenshot({ path: "e2e/test-results/git-workbench-history-large.png", fullPage: true })
     expectNoSmokeErrors(errors, [], networkFailures)
   })
 
@@ -1151,6 +1376,8 @@ async function mockGitWorkbenchPlugin(page: Page) {
   const root = path.resolve("../../.opencode/plugins/git-workbench-app")
   const body = await fs.readFile(path.join(root, "index.js"), "utf8")
   const targetBody = await fs.readFile(path.join(root, "commit-target.js"), "utf8")
+  const graphBody = await fs.readFile(path.join(root, "history-graph.js"), "utf8")
+  const stateBody = await fs.readFile(path.join(root, "history-state.js"), "utf8")
   await page.route("**/app/plugins**", (route) =>
     json(route, {
       plugins: [
@@ -1180,6 +1407,22 @@ async function mockGitWorkbenchPlugin(page: Page) {
       body: targetBody,
     }),
   )
+  await page.route("**/app/plugin/git-workbench-app/1/history-graph.js**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "text/javascript",
+      headers: { "access-control-allow-origin": "*" },
+      body: graphBody,
+    }),
+  )
+  await page.route("**/app/plugin/git-workbench-app/1/history-state.js**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "text/javascript",
+      headers: { "access-control-allow-origin": "*" },
+      body: stateBody,
+    }),
+  )
   await page.route("**/app/plugin/git-workbench-app/1/assets/*", async (route) => {
     const file = path.basename(new URL(route.request().url()).pathname)
     return route.fulfill({
@@ -1191,6 +1434,27 @@ async function mockGitWorkbenchPlugin(page: Page) {
   })
 }
 
+type MockHistoryCommit = {
+  hash: string
+  short: string
+  parents: string[]
+  author: string
+  email: string
+  date: string
+  subject: string
+  body: string
+  bodyTruncated?: boolean
+  boundary?: "none" | "shallow" | "missing"
+}
+
+type MockHistory = {
+  commits: MockHistoryCommit[]
+  headOid?: string
+  refLabels?: { hash: string; label: string }[]
+  firstParentChain?: string[]
+  errorOnce?: { status: number; code: string; recovery: string; message: string }
+}
+
 async function mockGitApi(
   page: Page,
   snapshots: Record<string, ReturnType<typeof gitSnapshot>>,
@@ -1200,6 +1464,9 @@ async function mockGitApi(
     snapshotDelays?: Record<string, number>
     discoveredRepositories?: { worktree: string; name: string }[]
     firstDiscoveryUnavailable?: boolean
+    history?: MockHistory
+    historyErrorOnce?: { status: number; code: string; recovery: string; message: string }
+    commitMessages?: Record<string, string>
   } = {},
 ) {
   const snapshotDirectory = (route: Route) => new URL(route.request().url()).searchParams.get("directory") ?? directory
@@ -1238,6 +1505,93 @@ async function mockGitApi(
     }
     return json(route, { ok: true, message: `${body.action} completed` })
   })
+  let historyFailures = 0
+  await page.route("**/vcs/git/history**", async (route) => {
+    const requestDirectory = new URL(route.request().url()).searchParams.get("directory") ?? directory
+    void requestDirectory
+    const history = options.history
+    if (!history) return json(route, { commits: [], hasMore: false, selector: "head", firstParent: false, refLabels: [] })
+    const error = options.historyErrorOnce
+    if (error && historyFailures++ === 0) {
+      return route.fulfill({
+        status: error.status,
+        contentType: "application/json",
+        body: JSON.stringify({ name: "VcsGitHistoryError", data: { code: error.code, recovery: error.recovery, message: error.message } }),
+      })
+    }
+    const request = (await route.request().postDataJSON()) as {
+      selector?: "all" | "head" | "branch"
+      ref?: string
+      firstParent?: boolean
+      limit?: number
+      cursor?: string
+    }
+    let list = history.commits
+    if (request.cursor) {
+      const parts = request.cursor.split(":")
+      const offset = Number(parts[1])
+      const pageSize = Number(parts[2])
+      const page = list.slice(offset, offset + pageSize)
+      const nextOffset = offset + page.length
+      return json(route, {
+        commits: page,
+        hasMore: nextOffset < list.length,
+        selector: parts[3] === "all" || parts[3] === "head" || parts[3] === "branch" ? parts[3] : "head",
+        firstParent: parts[4] === "1",
+        refLabels: history.refLabels ?? [],
+        nextCursor: nextOffset < list.length ? `p:${nextOffset}:${pageSize}:${parts[3]}:${parts[4]}` : undefined,
+      })
+    }
+    const selector = request.selector ?? "head"
+    const firstParent = selector === "all" ? false : (request.firstParent ?? false)
+    if (selector === "branch" && request.ref) {
+      const shortRef = request.ref.replace(/^refs\/(heads|remotes)\//, "")
+      const refHashes = (history.refLabels ?? []).filter((label) => label.label === shortRef).map((label) => label.hash)
+      const ancestors = new Set(refHashes.flatMap((hash) => reachableHashes(history.commits, hash)))
+      list = list.filter((commit) => ancestors.has(commit.hash))
+    }
+    if (firstParent) {
+      const tips =
+        selector === "branch" && request.ref
+          ? (history.refLabels ?? [])
+              .filter((label) => label.label === request.ref?.replace(/^refs\/(heads|remotes)\//, ""))
+              .map((label) => label.hash)
+          : [history.headOid ?? history.commits[0]?.hash]
+      const chain = new Set([...(history.firstParentChain ?? []), ...tips.filter((tip): tip is string => Boolean(tip))])
+      list = list.filter((commit) => chain.has(commit.hash))
+    }
+    const limit = Math.max(1, Math.min(1000, request.limit ?? 200))
+    const page = list.slice(0, limit)
+    const hasMore = list.length > limit
+    return json(route, {
+      commits: page,
+      hasMore,
+      selector,
+      firstParent,
+      headOid: history.headOid,
+      refLabels: history.refLabels ?? [],
+      nextCursor: hasMore ? `p:${limit}:${limit}:${selector}:${firstParent ? 1 : 0}` : undefined,
+    })
+  })
+  await page.route("**/vcs/git/commit-message**", async (route) => {
+    const body = (await route.request().postDataJSON()) as { hash?: string }
+    const text = (options.commitMessages ?? {})[body.hash ?? ""] ?? `${body.hash ?? ""}\n\nBody\n`
+    return json(route, { text, truncated: false })
+  })
+}
+
+function reachableHashes(commits: MockHistoryCommit[], start: string): string[] {
+  const byHash = new Map(commits.map((commit) => [commit.hash, commit]))
+  const seen: string[] = []
+  const queue = [start]
+  while (queue.length) {
+    const hash = queue.pop()
+    if (!hash || seen.includes(hash)) continue
+    seen.push(hash)
+    const commit = byHash.get(hash)
+    if (commit) queue.push(...commit.parents)
+  }
+  return seen
 }
 
 async function expectComposerCommitBesideSend(page: Page) {

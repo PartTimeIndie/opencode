@@ -82,10 +82,6 @@ function runAll(list: Array<() => Promise<unknown>>) {
   return Promise.allSettled(list.map((item) => item()))
 }
 
-export function bootstrapFeedbackErrors(errors: unknown[], handledErrors: Set<unknown>) {
-  return errors.filter((error) => !handledErrors.has(error))
-}
-
 function showErrors(input: {
   errors: unknown[]
   title: string
@@ -132,9 +128,11 @@ export async function bootstrapGlobal(input: {
   setGlobalStore: SetStoreFunction<GlobalStore>
   queryClient: QueryClient
 }) {
+  // The provider observer owns catalog readiness. Refresh discovery here, but
+  // never hold the app shell behind a slow plugin or provider response.
+  void input.queryClient.fetchQuery(loadProvidersQuery(input.scope, null, input.serverSDK)).catch(() => {})
   const slow = [
     () => input.queryClient.fetchQuery(loadGlobalConfigQuery(input.scope, input.serverSDK)),
-    () => input.queryClient.fetchQuery(loadProvidersQuery(input.scope, null, input.serverSDK)),
     () => input.queryClient.fetchQuery(loadPathQuery(input.scope, null, input.serverSDK)),
     () =>
       input.queryClient
@@ -289,7 +287,8 @@ export async function bootstrapDirectory(input: {
   const revKey = ScopedKey.from(input.scope, input.directory)
   const rev = (providerRev.get(revKey) ?? 0) + 1
   providerRev.set(revKey, rev)
-  const handledErrors = new Set<unknown>()
+  // Keep refresh behavior without holding session loading behind discovery.
+  void input.queryClient.fetchQuery(loadProvidersQuery(input.scope, input.directory, input.sdk)).catch(() => {})
   const slow = [
     () => Promise.resolve(input.loadSessions(input.directory)),
     () =>
@@ -409,20 +408,10 @@ export async function bootstrapDirectory(input: {
         })
       }),
     input.mcp && (() => input.queryClient.fetchQuery(loadMcpQuery(input.scope, input.directory, input.sdk))),
-    () =>
-      input.queryClient
-        .fetchQuery(loadProvidersQuery(input.scope, input.directory, input.sdk))
-        .catch((error) => {
-          if (!isCancellationError(error)) {
-            handledErrors.add(error)
-          }
-          throw error
-        }),
   ].filter(Boolean) as (() => Promise<unknown>)[]
 
   await waitForPaint()
-  const slowErrs = errors(await runAll(slow))
-  const feedbackErrors = bootstrapFeedbackErrors(slowErrs, handledErrors)
+  const feedbackErrors = errors(await runAll(slow))
   if (feedbackErrors.length > 0) {
     console.error("Failed to finish bootstrap instance", feedbackErrors[0])
     const project = getFilename(input.directory)

@@ -11,12 +11,12 @@ import {
 } from "solid-js"
 
 export type DockContentParts = {
-  header: JSX.Element
-  review: JSX.Element
-  changes: JSX.Element
-  files: JSX.Element
+  header: () => JSX.Element
+  review: () => JSX.Element
+  changes: () => JSX.Element
+  files: () => JSX.Element
   bottom: () => JSX.Element
-  mobileChanges: JSX.Element
+  mobileChanges: () => JSX.Element
   mobileChangesOpen: () => boolean
   onResponseSubmit?: () => void
 }
@@ -37,7 +37,15 @@ export function createDockContentRegistry(): DockContentRegistry {
     register(next) {
       const owner = getOwner()
       const registered = owner
-        ? { ...next, bottom: () => runWithOwner(owner, next.bottom) }
+        ? {
+            ...next,
+            header: () => runWithOwner(owner, next.header),
+            review: () => runWithOwner(owner, next.review),
+            changes: () => runWithOwner(owner, next.changes),
+            files: () => runWithOwner(owner, next.files),
+            bottom: () => runWithOwner(owner, next.bottom),
+            mobileChanges: () => runWithOwner(owner, next.mobileChanges),
+          }
         : next
       setParts(registered)
       onCleanup(() => {

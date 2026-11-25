@@ -6,6 +6,10 @@ type SidecarCredentials = {
   password?: string
 }
 
+export function ownsSidecarLogin(source: { session: object } | null, session: object, isProxy: boolean) {
+  return source !== null && source.session === session && !isProxy
+}
+
 export function sidecarBrowserAuthorization(requestURL: string, sidecar: SidecarCredentials | undefined) {
   if (!sidecar?.password) return
   if (!isDesktopSidecarURL(sidecar.url)) return

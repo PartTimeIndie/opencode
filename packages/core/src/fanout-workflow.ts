@@ -94,10 +94,15 @@ export const locationLayer = Layer.unwrap(Effect.map(Location.Service, (location
 ))
 
 export function resultDecoder(schema: Record<string, unknown>) {
+  const { $defs, definitions, ...rest } = schema
   const compiled = SchemaRepresentation.toSchema(SchemaRepresentation.fromJsonSchemaDocument({
-    dialect: "draft-2020-12", schema, definitions: {},
+    dialect: "draft-2020-12", schema: rest,
+    definitions: {
+      ...(definitions && typeof definitions === "object" && !Array.isArray(definitions) ? definitions : {}),
+      ...($defs && typeof $defs === "object" && !Array.isArray($defs) ? $defs : {}),
+    } as Parameters<typeof SchemaRepresentation.fromJsonSchemaDocument>[0]["definitions"],
   }))
   // JSON Schema cannot declare Effect services; the representation API uses Top for custom revivers.
-  const decode = Schema.decodeUnknownOption(Schema.fromJsonString(compiled as Schema.Codec<unknown>))
+  const decode = Schema.decodeUnknownOption(Schema.fromJsonString(compiled as Schema.Codec<unknown>), { onExcessProperty: "error" })
   return (text: string) => Option.getOrUndefined(decode(text))
 }

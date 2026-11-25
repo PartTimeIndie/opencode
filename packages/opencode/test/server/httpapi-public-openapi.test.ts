@@ -70,6 +70,12 @@ function isBuiltInEndpointError(name: string) {
 }
 
 describe("PublicApi OpenAPI v2 errors", () => {
+  test("does not advertise retired orchestration routes or operational schemas", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    expect(Object.keys(spec.paths).filter((path) => path.includes("orchestrator"))).toEqual([])
+    for (const name of ["OrchestratorSnapshot", "OrchestratorTask", "OrchestratorOperation"])
+      expect(spec.components.schemas[name], name).toBeUndefined()
+  })
   test("exposes generic plugin services without voice-specific routes", () => {
     const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
     expect(spec.paths["/api/session/{sessionID}/voice"]).toBeUndefined()
@@ -343,6 +349,17 @@ describe("PublicApi OpenAPI v2 errors", () => {
       expect(componentName(responseRef(spec.paths[route[1]]?.[route[0]]?.responses?.["404"]) ?? "")).toBe(
         "ProjectNotFoundError",
       )
+    }
+  })
+
+  test("documents rejected project icons as a 400 response", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+
+    for (const route of [
+      ["put", "/project/directory-icon"],
+      ["patch", "/project/{projectID}"],
+    ] as const) {
+      expect(spec.paths[route[1]]?.[route[0]]?.responses?.["400"]).toBeDefined()
     }
   })
 })

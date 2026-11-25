@@ -6,7 +6,7 @@ import { expect, test } from "bun:test"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { eq, sql } from "drizzle-orm"
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
-import { Cause, Effect, Exit } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { EffectDrizzleSqlite } from "../src"
@@ -162,6 +162,46 @@ test("interrupts timed out transactions and releases the writer lock", async () 
     observer.close()
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test("external interruption cancels a timeout-guarded transaction without waiting for its deadline", async () => {
+  await run(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults({ transactionTimeoutMs: 4_000 })
+    yield* db.run(sql`create table users (id integer primary key autoincrement, name text not null)`)
+    const reached = yield* Deferred.make<void>()
+    const writer = yield* db.transaction((tx) => Effect.gen(function* () {
+      yield* tx.insert(users).values({ name: "Cancelled" })
+      yield* Deferred.succeed(reached, undefined)
+      yield* Effect.never
+    })).pipe(Effect.forkScoped)
+    yield* Deferred.await(reached)
+    const started = performance.now()
+    yield* Fiber.interrupt(writer)
+    const exit = yield* Fiber.await(writer)
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+    expect(performance.now() - started).toBeLessThan(1_000)
+    expect(yield* db.select().from(users)).toEqual([])
+    yield* db.transaction((tx) => tx.insert(users).values({ name: "After" }))
+    expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "After" }])
+  }).pipe(Effect.scoped))
+})
+
+test("interrupted callers can finish a masked cleanup transaction", async () => {
+  await run(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults({ transactionTimeoutMs: 4_000 })
+    yield* db.run(sql`create table users (id integer primary key autoincrement, name text not null)`)
+    const reached = yield* Deferred.make<void>()
+    const writer = yield* Deferred.succeed(reached, undefined).pipe(
+      Effect.andThen(Effect.never),
+      Effect.ensuring(db.transaction((tx) => tx.insert(users).values({ name: "Cleanup" })).pipe(Effect.orDie)),
+      Effect.forkScoped,
+    )
+    yield* Deferred.await(reached)
+    yield* Fiber.interrupt(writer)
+    const exit = yield* Fiber.await(writer)
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+    expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "Cleanup" }])
+  }).pipe(Effect.scoped))
 })
 
 test("supports returning and rejects empty update sets", async () => {

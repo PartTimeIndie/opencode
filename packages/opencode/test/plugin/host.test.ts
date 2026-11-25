@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import { eq } from "drizzle-orm"
+import { mkdir, rm, symlink } from "node:fs/promises"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { z } from "zod"
 import { AgentV2 } from "@opencode-ai/core/agent"
@@ -14,7 +16,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionActivityTable, SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { EffectBridge } from "../../src/effect/bridge"
 import { createPluginHost } from "../../src/plugin/host"
@@ -41,6 +43,76 @@ const fixture = (directory: string) => Effect.gen(function* () {
 })
 
 describe("server plugin host", () => {
+  test("Goal status CAS and admission fence metadata replacement and persist the exact receipt", async () => {
+    await using directory = await tmpdir()
+    await Effect.runPromise(Effect.gen(function* () {
+      const f = yield* fixture(directory.path)
+      const sessions = yield* SessionV2.Service
+      const session = yield* sessions.create({ title: "Goal atomic state", location: f.ref })
+      const status = JSON.stringify({ runID: "run-1", stopped: false })
+      yield* sessions.patchMetadata({ sessionID: session.id, patch: { set: { "opencode.session.goal": "ship it", "opencode.session.goal_run": "run-1" } } })
+      const project = { sessionID: session.id, condition: "ship it", runID: "run-1", status }
+      expect(yield* Effect.promise(() => f.first.host.sessions.goalOwnership.project!(project))).toBe(true)
+      expect(yield* Effect.promise(() => f.first.host.sessions.goalOwnership.project!({ ...project, status: "stale" }))).toBe(false)
+      yield* sessions.patchMetadata({ sessionID: session.id, patch: { set: { "opencode.session.goal_run": "run-2" }, unset: ["opencode.session.goal_status"] } })
+      yield* Effect.promise(async () => expect(f.first.host.sessions.prompt({ sessionID: session.id, text: "stale", expectedLatestInputID: null,
+        goal: { condition: "ship it", runID: "run-1", expectedStatus: status, status },
+      })).rejects.toMatchObject({ _tag: "SessionBusyError" }))
+      const admitted = yield* Effect.promise(() => f.first.host.sessions.prompt({ sessionID: session.id, text: "fresh", expectedLatestInputID: null,
+        goal: { condition: "ship it", runID: "run-2", status: JSON.stringify({ runID: "run-2", stopped: false }) },
+      }))
+      expect(JSON.parse(admitted.goalStatus!).active).toEqual({ promptID: admitted.id })
+      expect((yield* sessions.get(session.id)).metadata?.["opencode.session.goal_status"]).toBe(admitted.goalStatus)
+      expect(yield* Effect.promise(() => f.first.host.sessions.inputOrigin({ sessionID: session.id, inputID: admitted.id }))).toBe("plugin")
+      yield* Effect.promise(() => f.first.dispose())
+      expect(f.first.host.signal?.aborted).toBe(true)
+      yield* Effect.promise(async () => expect(f.first.host.sessions.goalOwnership.project!({ ...project, runID: "run-2", expectedStatus: admitted.goalStatus })).rejects.toThrow("unloaded"))
+    }).pipe(Effect.provide(layer), Effect.scoped))
+  }, 30_000)
+  test("Goal cleanup and automatic admission reject stale run and inbox identities", async () => {
+    await using directory = await tmpdir()
+    await Effect.runPromise(Effect.gen(function* () {
+      const f = yield* fixture(directory.path)
+      const sessions = yield* SessionV2.Service
+      const session = yield* sessions.create({ title: "Goal fences", location: f.ref })
+      yield* sessions.patchMetadata({ sessionID: session.id, patch: { set: { "opencode.session.goal": "ship it", "opencode.session.goal_run": "new-run", "opencode.session.goal_status": "new-status" } } })
+      yield* Effect.promise(() => f.first.host.sessions.goalOwnership.clear!({ sessionID: session.id, condition: "ship it", runID: "old-run" }))
+      expect((yield* sessions.get(session.id)).metadata?.["opencode.session.goal"]).toBe("ship it")
+      expect((yield* sessions.get(session.id)).metadata?.["opencode.session.goal_status"]).toBe("new-status")
+      yield* Effect.promise(() => f.first.host.sessions.goalOwnership.clear!({ sessionID: session.id, condition: "different objective", runID: "new-run" }))
+      expect((yield* sessions.get(session.id)).metadata?.["opencode.session.goal_run"]).toBe("new-run")
+      yield* Effect.promise(() => f.first.host.sessions.goalOwnership.clear!({ sessionID: session.id, condition: "ship it", runID: "new-run" }))
+      const cleared = (yield* sessions.get(session.id)).metadata
+      expect(cleared?.["opencode.session.goal"]).toBeUndefined()
+      expect(cleared?.["opencode.session.goal_run"]).toBeUndefined()
+      expect(cleared?.["opencode.session.goal_status"]).toBeUndefined()
+      const head = yield* Effect.promise(() => f.first.host.sessions.admissionHead!({ sessionID: session.id }))
+      expect(head.id).toBeNull()
+      const human = yield* sessions.prompt({ sessionID: session.id, prompt: { text: "Wait, new instruction" }, origin: "interactive", resume: false })
+      yield* Effect.promise(async () => expect(f.first.host.sessions.prompt({ sessionID: session.id, text: "Stale continuation", expectedLatestInputID: head.id })).rejects.toThrow())
+      const { db } = yield* Database.Service
+      const rows = yield* db.select().from(SessionInputTable).all().pipe(Effect.orDie)
+      expect(rows.map((item) => item.id)).toEqual([human.id])
+      expect((yield* Effect.promise(() => f.first.host.sessions.admissionHead!({ sessionID: session.id }))).id).toBe(human.id)
+    }).pipe(Effect.provide(layer), Effect.scoped))
+  }, 30_000)
+  test("plugin prompt preserves validated output format and noninteractive provenance", async () => {
+    await using directory = await tmpdir()
+    await Effect.runPromise(Effect.gen(function* () {
+      const f = yield* fixture(directory.path)
+      const session = yield* (yield* SessionV2.Service).create({ title: "Goal format", location: f.ref })
+      const format = { type: "json_schema" as const, schema: { type: "object", properties: { done: { type: "boolean" } }, required: ["done"], additionalProperties: false } }
+      const admitted = yield* Effect.promise(() => f.first.host.sessions.prompt({ sessionID: session.id, text: "Verify", format }))
+      const { db } = yield* Database.Service
+      const rows = yield* db.select().from(SessionInputTable).all().pipe(Effect.orDie)
+      const row = rows.find((item) => item.id === admitted.id)
+      expect(row?.prompt.format).toEqual(format)
+      expect(row?.origin).toBe("plugin")
+      yield* Effect.promise(async () => expect(f.first.host.sessions.prompt({ sessionID: session.id, text: "Bad format", format: { type: "invalid" } })).rejects.toThrow())
+      const after = yield* db.select().from(SessionInputTable).all().pipe(Effect.orDie)
+      expect(after).toHaveLength(rows.length)
+    }).pipe(Effect.provide(layer), Effect.scoped))
+  }, 30_000)
   test("loads a separate media package and isolates credentials, project scope and cancellation", async () => {
     await using directory = await tmpdir()
     await Effect.runPromise(Effect.gen(function* () {
@@ -163,8 +235,31 @@ describe("server plugin host", () => {
       expect(yield* Effect.promise(() => f.first.host.sessions.exists("ses_missing"))).toBe(false)
       expect(yield* Effect.promise(() => f.first.host.sessions.execution.read({sessionID:session.id,messageID:"msg_missing"}))).toEqual({phase:"admission_missing"})
       yield* Effect.promise(async () => expect(f.first.host.sessions.execution.read({sessionID:foreign.id,messageID:"msg_missing"})).rejects.toThrow("another plugin location"))
+      const readMainTask = f.first.host.sessions.execution.readMainTask!
+      const attempt = { parentSessionID: session.id, sessionID: session.id, messageID: "msg_missing",
+        dispatchDigest: "a".repeat(64), placementIdentity: "fixture-checkout" }
+      expect(yield* Effect.promise(() => readMainTask(attempt))).toEqual({ phase: "task_binding_mismatch" })
+      for (const binding of [{ ...attempt, parentSessionID: foreign.id }, { ...attempt, sessionID: foreign.id }]) {
+        yield* Effect.promise(async () => expect(readMainTask(binding)).rejects.toThrow("another plugin location"))
+      }
       const archived = SessionV2.ID.create()
       const database = yield* Database.Service
+      const child = yield* sessions.create({ title: "Native task fixture", parentID: session.id, location: f.ref })
+      const admitted = yield* sessions.prompt({ sessionID: child.id, prompt: { text: "Bound input" }, resume: false })
+      const bound = { ...attempt, sessionID: child.id, messageID: admitted.id }
+      yield* database.db.update(SessionTable).set({ fork_dispatch_digest: bound.dispatchDigest, agent_policy: {
+        tools: { mode: "explicit", entries: {} }, permissionLayers: [],
+        source: { type: "task", sessionID: session.id, agent: AgentV2.ID.make("build") },
+        executionPlacement: { version: 1, directory: directory.path, checkout: directory.path, identity: bound.placementIdentity },
+        mainWriteConsent: { version: 1, permissionID: "per_fixture", inputID: bound.messageID,
+          dispatchDigest: bound.dispatchDigest, placementIdentity: bound.placementIdentity },
+      } }).where(eq(SessionTable.id, child.id)).run()
+      expect(yield* Effect.promise(() => readMainTask(bound))).toEqual({ phase: "admitted" })
+      expect(yield* Effect.promise(() => readMainTask({ ...bound, messageID: attempt.messageID })))
+        .toEqual({ phase: "task_binding_mismatch" })
+      expect(yield* database.db.select().from(SessionActivityTable).where(eq(SessionActivityTable.session_id, child.id)).all()).toEqual([])
+      const inputs = yield* database.db.select().from(SessionInputTable).where(eq(SessionInputTable.session_id, child.id)).all()
+      expect(inputs.map((row) => row.id)).toEqual([admitted.id])
       yield* database.db.insert(SessionArchiveCatalogTable).values({
         session_id: archived, project_id: "global", title: "Archived", directory: directory.path, location: "archived",
         time_created: 1, time_updated: 1, time_last_modified: 1,
@@ -174,7 +269,64 @@ describe("server plugin host", () => {
       expect(yield* Effect.promise(() => completionRegistry.check(directory.path,{sessionID:session.id,messages:[]}))).toBe("incomplete")
       yield* Effect.promise(() => f.first.dispose())
       expect(yield* Effect.promise(() => completionRegistry.check(directory.path,{sessionID:session.id,messages:[]}))).toBeUndefined()
+      yield* Effect.promise(async () => expect(readMainTask(attempt)).rejects.toThrow("unloaded"))
     }).pipe(Effect.provide(SessionArchive.layer({directory:`${directory.path}/archive`,isIdle:()=>Effect.succeed(true)}).pipe(Layer.provideMerge(layer))), Effect.scoped))
+  }, 30_000)
+  test.skipIf(process.platform !== "win32")("accepts case and separator drift of the same plugin location", async () => {
+    await using directory = await tmpdir()
+    await Effect.runPromise(Effect.gen(function* () {
+      const f = yield* fixture(directory.path)
+      const sessions = yield* SessionV2.Service
+      const drifted = directory.path.replaceAll("\\", "/").toUpperCase()
+      const session = yield* sessions.create({ title: "Drifted location", location: Location.Ref.make({ directory: AbsolutePath.make(drifted) }) })
+      expect(yield* Effect.promise(() => f.first.host.sessions.exists(session.id))).toBe(true)
+      expect((yield* Effect.promise(() => f.first.host.sessions.admissionHead!({ sessionID: session.id }))).id).toBeNull()
+      const foreign = yield* sessions.create({ title: "Foreign location", location: Location.Ref.make({ directory: AbsolutePath.make(`${directory.path}/foreign`) }) })
+      expect(yield* Effect.promise(() => f.first.host.sessions.exists(foreign.id))).toBe(false)
+      yield* Effect.promise(async () => expect(f.first.host.sessions.admissionHead!({ sessionID: foreign.id })).rejects.toThrow("another plugin location"))
+    }).pipe(Effect.provide(layer), Effect.scoped))
+  }, 30_000)
+  test.skipIf(process.platform !== "win32")("resolves junction aliases of the same plugin location", async () => {
+    await using directory = await tmpdir()
+    const alias = `${directory.path}-junction-alias`
+    try {
+      await symlink(directory.path, alias, "junction")
+      await Effect.runPromise(Effect.gen(function* () {
+        const f = yield* fixture(directory.path)
+        const sessions = yield* SessionV2.Service
+        const session = yield* sessions.create({ title: "Aliased location", location: Location.Ref.make({ directory: AbsolutePath.make(alias) }) })
+        expect(yield* Effect.promise(() => f.first.host.sessions.exists(session.id))).toBe(true)
+        expect((yield* Effect.promise(() => f.first.host.sessions.admissionHead!({ sessionID: session.id }))).id).toBeNull()
+      }).pipe(Effect.provide(layer), Effect.scoped))
+    } finally {
+      await rm(alias, { force: true, recursive: true })
+    }
+  }, 30_000)
+  test.skipIf(process.platform === "win32")("rejects case-different POSIX directories and accepts symlink aliases", async () => {
+    await using directory = await tmpdir()
+    const upper = `${directory.path}/PROJ`
+    const lower = `${directory.path}/proj`
+    const alias = `${directory.path}/alias`
+    try {
+      await mkdir(upper, { recursive: true })
+      await mkdir(lower, { recursive: true })
+      await symlink(directory.path, alias, "dir")
+      await Effect.runPromise(Effect.gen(function* () {
+        const f = yield* fixture(directory.path)
+        const sessions = yield* SessionV2.Service
+        // Two existing siblings differing only by case are distinct projects:
+        // the case fold must never run on POSIX roots (win32.isAbsolute
+        // claims those), and realpath must not equate them either.
+        const sibling = yield* sessions.create({ title: "Case sibling", location: Location.Ref.make({ directory: AbsolutePath.make(upper) }) })
+        expect(yield* Effect.promise(() => f.first.host.sessions.exists(sibling.id))).toBe(false)
+        yield* Effect.promise(async () => expect(f.first.host.sessions.admissionHead!({ sessionID: sibling.id })).rejects.toThrow("another plugin location"))
+        const aliased = yield* sessions.create({ title: "Symlink alias", location: Location.Ref.make({ directory: AbsolutePath.make(alias) }) })
+        expect(yield* Effect.promise(() => f.first.host.sessions.exists(aliased.id))).toBe(true)
+        expect((yield* Effect.promise(() => f.first.host.sessions.admissionHead!({ sessionID: aliased.id }))).id).toBeNull()
+      }).pipe(Effect.provide(layer), Effect.scoped))
+    } finally {
+      await rm(alias, { force: true })
+    }
   }, 30_000)
   test("keeps neutral agent/tool registrations alive and removes them on unload", async () => {
     await using directory = await tmpdir()

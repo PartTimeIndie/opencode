@@ -32,6 +32,105 @@ function withTmp<A, E, R>(f: (directory: string) => Effect.Effect<A, E, R>) {
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex")
 
 describe("FileMutation", () => {
+  it.live("rejects a stale mode before any transaction target changes", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      const first = { canonical: path.join(directory, "first.txt"), resource: "first.txt" }
+      const second = { canonical: path.join(directory, "second.txt"), resource: "second.txt" }
+      yield* Effect.promise(() => Promise.all([fs.writeFile(first.canonical, "first"), fs.writeFile(second.canonical, "second")]))
+      const actualMode = (yield* Effect.promise(() => fs.stat(second.canonical))).mode & 0o777
+      const result = yield* (yield* FileMutation.Service).transact([
+        { type: "update", target: first, content: "changed", expected: { exists: true, sha256: sha256("first") } },
+        { type: "delete", target: second, expected: { exists: true, sha256: sha256("second"), mode: actualMode ^ 0o200 } },
+      ]).pipe(Effect.flip)
+      expect(result).toMatchObject({ _tag: "FileMutation.StaleContentError", path: second.canonical })
+      expect(yield* Effect.promise(() => fs.readFile(first.canonical, "utf8"))).toBe("first")
+      expect(yield* Effect.promise(() => fs.readFile(second.canonical, "utf8"))).toBe("second")
+    }).pipe(provide(directory))),
+  )
+
+  it.live("retains observed modes in guarded replacements and checkpoints", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      const target = { canonical: path.join(directory, "mode.txt"), resource: "mode.txt" }
+      yield* Effect.promise(() => fs.writeFile(target.canonical, "before"))
+      yield* Effect.promise(() => fs.chmod(target.canonical, 0o666))
+      const mode = (yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777
+      const result = yield* (yield* FileMutation.Service).transact([
+        { type: "update", target, content: "after", expected: { exists: true, sha256: sha256("before"), mode } },
+      ])
+      expect((yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777).toBe(mode)
+      expect(result[0]?.checkpoint).toMatchObject({ before: { mode }, after: { mode } })
+      expect(result[0]?.mutation).toMatchObject({ before: { mode }, after: { mode } })
+    }).pipe(provide(directory))),
+  )
+
+  it.live("applies explicit transaction modes before reporting success", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      const target = { canonical: path.join(directory, "readonly.txt"), resource: "readonly.txt" }
+      const result = yield* (yield* FileMutation.Service).transact([{ type: "add", target, content: "created", mode: 0o444 }])
+      expect((yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777).toBe(0o444)
+      expect(result[0]?.checkpoint.after).toMatchObject({ exists: true, mode: 0o444 })
+    }).pipe(provide(directory))),
+  )
+
+  it.live("rolls journal-commit failure back with the original bytes and mode", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      const target = { canonical: path.join(directory, "rollback-mode.txt"), resource: "rollback-mode.txt" }
+      yield* Effect.promise(() => fs.writeFile(target.canonical, "before"))
+      yield* Effect.promise(() => fs.chmod(target.canonical, 0o666))
+      const mode = (yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777
+      const error = yield* (yield* FileMutation.Service).transact([
+        { type: "update", target, content: "after", expected: { exists: true, sha256: sha256("before"), mode } },
+      ], { journal: () => Effect.fail("journal unavailable") }).pipe(Effect.flip)
+      expect(error).toBe("journal unavailable")
+      expect(yield* Effect.promise(() => fs.readFile(target.canonical, "utf8"))).toBe("before")
+      expect((yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777).toBe(mode)
+    }).pipe(provide(directory))),
+  )
+
+  it.live("does not roll back over an external mode-only edit after commit", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      const target = { canonical: path.join(directory, "foreign-mode.txt"), resource: "foreign-mode.txt" }
+      yield* Effect.promise(() => fs.writeFile(target.canonical, "before"))
+      const error = yield* (yield* FileMutation.Service).transact([
+        { type: "update", target, content: "after", expected: { exists: true, sha256: sha256("before") } },
+      ], { journal: () => Effect.promise(() => fs.chmod(target.canonical, 0o444)).pipe(Effect.andThen(Effect.fail("journal unavailable"))) }).pipe(Effect.flip)
+      expect(error).toMatchObject({ _tag: "FileMutation.TransactionRollbackError", path: target.canonical })
+      expect(yield* Effect.promise(() => fs.readFile(target.canonical, "utf8"))).toBe("after")
+      expect((yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777).toBe(0o444)
+    }).pipe(provide(directory))),
+  )
+
+  it.live("rechecks all measured bytes and modes after awaited transaction preparation", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      for (const drift of ["bytes", "mode"] as const) {
+        const first = { canonical: path.join(directory, `${drift}-first.txt`), resource: `${drift}-first.txt` }
+        const second = { canonical: path.join(directory, `${drift}-second.txt`), resource: `${drift}-second.txt` }
+        yield* Effect.promise(() => Promise.all([fs.writeFile(first.canonical, "first"), fs.writeFile(second.canonical, "second")]))
+        const error = yield* (yield* FileMutation.Service).transact([
+          { type: "update", target: first, content: "ours", expected: { exists: true, sha256: sha256("first") } },
+          { type: "update", target: second, content: "ours", expected: { exists: true, sha256: sha256("second") } },
+        ], { before: Effect.promise(() => drift === "bytes" ? fs.writeFile(second.canonical, "foreign") : fs.chmod(second.canonical, 0o444)) }).pipe(Effect.flip)
+        expect(error).toMatchObject({ _tag: "FileMutation.StaleContentError", path: second.canonical })
+        expect(yield* Effect.promise(() => fs.readFile(first.canonical, "utf8"))).toBe("first")
+        expect(yield* Effect.promise(() => fs.readFile(second.canonical, "utf8"))).toBe(drift === "bytes" ? "foreign" : "second")
+      }
+    }).pipe(provide(directory))),
+  )
+
+  it.live("pins transaction targets and bytes before awaited hooks", () =>
+    withTmp((directory) => Effect.gen(function* () {
+      const original = path.join(directory, "approved.txt")
+      const foreign = path.join(directory, "foreign.txt")
+      const target = { canonical: original, resource: "approved.txt" }
+      const bytes = new TextEncoder().encode("approved")
+      yield* (yield* FileMutation.Service).transact([{ type: "add", target, content: bytes }], {
+        before: Effect.sync(() => { target.canonical = foreign; bytes.fill(120) }),
+      })
+      expect(yield* Effect.promise(() => fs.readFile(original, "utf8"))).toBe("approved")
+      expect(yield* Effect.promise(() => fs.stat(foreign).then(() => true, () => false))).toBe(false)
+    }).pipe(provide(directory))),
+  )
+
   it.live("writes an existing internal file and returns a stable result", () =>
     withTmp((directory) =>
       Effect.gen(function* () {

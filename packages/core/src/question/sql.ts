@@ -25,6 +25,8 @@ export const QuestionTable = sqliteTable(
     action_metadata: text({ mode: "json" }).$type<ReadonlyArray<ActionMetadata>>().notNull().default([]),
     answers: text({ mode: "json" }).$type<ReadonlyArray<Answer>>(),
     receipt: text(),
+    // Legacy receipts remain unknown, never silently human.
+    answer_source: text().$type<"user" | "main" | "recommended">(),
     detached: integer({ mode: "boolean" }).notNull().default(false),
     allow_concurrent: integer({ mode: "boolean" }).notNull().default(false),
     activity_id: text(),

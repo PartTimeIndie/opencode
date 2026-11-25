@@ -4,8 +4,8 @@ import { LLMError, LLMEvent, TransportReason } from "@opencode-ai/llm"
 import { Cause, Effect, Exit, Scope, Stream } from "effect"
 import { AIChain } from "../ai-chain"
 
-const PROVIDER_STREAM_IDLE_TIMEOUT_MS = 60_000
-const EXTENDED_PROGRESS_IDLE_TIMEOUT_MS = 240_000
+const PROVIDER_STREAM_IDLE_TIMEOUT_MS = 90_000
+const PROGRESS_IDLE_TIMEOUT_MS = 240_000
 
 export function providerStreamIdleTimeoutMs(
   configured: string | undefined = process.env.OPENCODE_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
@@ -17,7 +17,7 @@ export function providerStreamIdleTimeoutMs(
 }
 
 export function providerStreamIdleTimeouts(
-  model: { provider: string; id: string },
+  _model: { provider: string; id: string },
   configured: string | undefined = process.env.OPENCODE_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
 ) {
   const idleTimeoutMs = providerStreamIdleTimeoutMs(configured)
@@ -25,12 +25,8 @@ export function providerStreamIdleTimeouts(
   const hasExplicitOverride = configured !== undefined && configured.trim().length > 0 && Number.isFinite(Number(configured))
   return {
     initialMs: idleTimeoutMs,
-    afterProgressMs:
-      !hasExplicitOverride &&
-      (model.id.toLowerCase().startsWith("glm-") ||
-        (model.provider === "openai" && /^gpt-6(?:[.-]|$)/i.test(model.id)))
-        ? EXTENDED_PROGRESS_IDLE_TIMEOUT_MS
-        : idleTimeoutMs,
+    // All models share the same phase budgets; an explicit override still sets both.
+    afterProgressMs: hasExplicitOverride ? idleTimeoutMs : PROGRESS_IDLE_TIMEOUT_MS,
   }
 }
 
@@ -69,13 +65,14 @@ export function withProviderStreamIdleTimeout(
       // per-pull budget; start events, provider errors and transport keepalives do not.
       let phaseIdleTimeoutMs = initialIdleTimeoutMs
       let remaining = initialIdleTimeoutMs
+      const completedReasoning = new Set<string>()
       return Effect.suspend(() => {
         if (remaining <= 0) return Effect.fail(stalledProviderStreamFailure(phaseIdleTimeoutMs))
         const started = Date.now()
         return pull.pipe(
           Effect.tap((events) =>
             Effect.sync(() => {
-              if (events.some(providerStreamEventHasProgress)) {
+              if (events.map((event) => providerStreamEventHasProgress(event, completedReasoning)).some(Boolean)) {
                 phaseIdleTimeoutMs = afterProgressIdleTimeoutMs
                 remaining = afterProgressIdleTimeoutMs
                 return
@@ -101,7 +98,15 @@ export function withProviderStreamIdleTimeout(
   )
 }
 
-function providerStreamEventHasProgress(event: LLMEvent) {
+function providerStreamEventHasProgress(event: LLMEvent, completedReasoning: Set<string>) {
+  // Codex can complete real reasoning items without exposing summary text.
+  // Count the opaque result, not lifecycle starts or repeated end notifications.
+  if (event.type === "reasoning-end") {
+    const encrypted = event.providerMetadata?.openai?.reasoningEncryptedContent
+    if (typeof encrypted !== "string" || encrypted.trim().length === 0 || completedReasoning.has(event.id)) return false
+    completedReasoning.add(event.id)
+    return true
+  }
   if (event.type === "text-delta" || event.type === "reasoning-delta" || event.type === "tool-input-delta")
     return event.text.length > 0
   return (

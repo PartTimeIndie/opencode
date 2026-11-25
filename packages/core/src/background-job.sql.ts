@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core"
+import { isNull, notInArray, or } from "drizzle-orm"
 import { Timestamps } from "./database/schema.sql"
 import type { SessionSchema } from "./session/schema"
 
@@ -17,6 +18,8 @@ export const BackgroundJobTable = sqliteTable(
     owner_id: text(),
     lease_until: integer(),
     heartbeat_at: integer(),
+    cleanup_token: text(),
+    time_owner_settled: integer(),
     output: text(),
     error: text(),
     delivery_status: text().notNull().default("pending"),
@@ -29,3 +32,14 @@ export const BackgroundJobTable = sqliteTable(
     index("background_job_child_session_idx").on(table.child_session_id),
   ],
 )
+
+/** Terminal status and lease expiry do not attest independent owner cleanup.
+ * Old/repaired rows intentionally remain unknown until explicitly reconciled. */
+export function unsettled() {
+  return or(
+    notInArray(BackgroundJobTable.status, ["completed", "error", "cancelled"]),
+    isNull(BackgroundJobTable.owner_id),
+    isNull(BackgroundJobTable.cleanup_token),
+    isNull(BackgroundJobTable.time_owner_settled),
+  )
+}

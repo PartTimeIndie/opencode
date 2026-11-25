@@ -16,6 +16,7 @@ import { SessionFollowupDock } from "@/pages/session/composer/session-followup-d
 import { SessionGoalDock } from "@/pages/session/composer/session-goal-dock"
 import { SessionRevertDock } from "@/pages/session/composer/session-revert-dock"
 import { SubagentSessionBar } from "@/pages/session/composer/subagent-session-bar"
+import type { GoalStatus } from "@/utils/session-goal-state"
 import type { SessionComposerState } from "@/pages/session/composer/session-composer-state"
 import { composerModelLoading } from "@/pages/session/composer/session-composer-readiness"
 import { providerQueryErrorVisible } from "@/context/global-sync/provider-query-state"
@@ -29,6 +30,7 @@ import {
   sessionActivitySettled,
   sessionActivityStartedAt,
 } from "@/utils/session-activity"
+import { sessionQueuedInputCount } from "@/utils/session-queued-inputs"
 import { questionDockPaneId, questionRequestKey } from "@/pages/session/composer/session-request-tree"
 import type { FollowupDraft } from "@/components/prompt-input/submit"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
@@ -103,6 +105,10 @@ export function SessionComposerRegion(props: {
   goal?: {
     value: string
     onClear: () => void
+    status?: GoalStatus
+    onControl?: (action: "pause" | "resume") => void
+    controlPending?: boolean
+    controlUnavailableReason?: string
   }
   revert?: {
     items: { id: string; text: string }[]
@@ -421,6 +427,7 @@ export function SessionComposerRegion(props: {
       current: local.agent.current()?.name ?? "",
       loading: agentsQuery.isLoading,
       visible: settings.visibility.customAgents(),
+      disabled: local.session.handoff.busy(),
       refresh: async () => {
         const result = await agentsQuery.refetch()
         if (result.data) sync().set("agent", reconcile(result.data, { merge: false }))
@@ -431,6 +438,7 @@ export function SessionComposerRegion(props: {
       selection: local.model,
       paid: providers.paid().length > 0,
       retrying: providerRetrying(),
+      handoffBusy: local.session.handoff.busy(),
       loading: composerModelLoading({
         directoryLoading: !directoryProviders().provider_ready,
         directoryHasProviders: directoryProviders().provider.all.size > 0,
@@ -811,6 +819,10 @@ export function SessionComposerRegion(props: {
                   goal={props.goal!.value}
                   onClear={props.goal!.onClear}
                   running={runningStatus() !== undefined}
+                  status={props.goal!.status}
+                  onControl={props.goal!.onControl}
+                  controlPending={props.goal!.controlPending}
+                  controlUnavailableReason={props.goal!.controlUnavailableReason}
                 />
               </Show>
               <Show when={props.followup?.items.length}>
@@ -874,6 +886,20 @@ export function SessionComposerRegion(props: {
                                   activityGeneration={() => sessionActivityGeneration(sdk().directory, id())}
                                   activitySettled={() => sessionActivitySettled(sdk().directory, id())}
                                 />
+                              )}
+                            </Show>
+                            <Show when={sessionID()}>
+                              {(id) => (
+                                <Show when={sessionQueuedInputCount(sdk().directory, id()) > 0}>
+                                  <span class="shrink-0 text-text-subtle" data-slot="queued-inputs-status">
+                                    {language.t(
+                                      sessionQueuedInputCount(sdk().directory, id()) === 1
+                                        ? "session.followupDock.summary.one"
+                                        : "session.followupDock.summary.other",
+                                      { count: sessionQueuedInputCount(sdk().directory, id()) },
+                                    )}
+                                  </span>
+                                </Show>
                               )}
                             </Show>
                           </div>

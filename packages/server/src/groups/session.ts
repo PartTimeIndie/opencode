@@ -403,7 +403,7 @@ export const SessionGroup = HttpApiGroup.make("server.session")
       params: { sessionID: SessionV2.ID },
       payload: Schema.Struct({ skill: Schema.String }),
       success: HttpApiSchema.NoContent,
-      error: SessionNotFoundError,
+      error: [SessionNotFoundError, InvalidRequestError],
     })
       .middleware(SessionLocationMiddleware)
       .annotateMerge(
@@ -412,6 +412,107 @@ export const SessionGroup = HttpApiGroup.make("server.session")
           summary: "Inject session skill",
           description:
             "Load a skill and append its instructions as a synthetic session message without scheduling execution.",
+        }),
+      ),
+  )
+  .add(
+    HttpApiEndpoint.get("session.skillSelections", "/api/session/:sessionID/skill-selections", {
+      params: { sessionID: SessionV2.ID },
+      success: Schema.Struct({
+        data: Schema.Struct({
+          sessionID: SessionV2.ID,
+          revision: Schema.Finite,
+          serverNow: Schema.Finite,
+          selections: Schema.Array(
+            Schema.Struct({
+              name: Schema.String,
+              status: Schema.Literals([
+                "active",
+                "expired_time",
+                "expired_messages",
+                "forgotten",
+                "renewal_declined",
+                "missing",
+                "origin_unverified",
+                "state_unavailable",
+              ]),
+              generation: Schema.Finite,
+              originKind: Schema.Literals(["input", "chat_send", "command", "renewal"]),
+              selectedAt: Schema.Finite,
+              expiresAt: Schema.Finite.pipe(Schema.optional),
+              remainingMs: Schema.Finite,
+              remainingMessages: Schema.Finite,
+              limitMinutes: Schema.Finite,
+              limitMessages: Schema.Finite,
+              recognized: Schema.Boolean,
+            }),
+          ),
+        }),
+      }),
+      error: [SessionNotFoundError, ServiceUnavailableError],
+    })
+      .middleware(SessionLocationMiddleware)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.skill_selections",
+          summary: "List remembered skill selections",
+          description:
+            "Read the durable same-chat skill selection ledger for one session with derived remaining validity.",
+        }),
+      ),
+  )
+  .add(
+    HttpApiEndpoint.post("session.skillSelectionForget", "/api/session/:sessionID/skill-selections/forget", {
+      params: { sessionID: SessionV2.ID },
+      payload: Schema.Struct({
+        name: Schema.String.pipe(Schema.optional),
+        all: Schema.Boolean.pipe(Schema.optional),
+        expectedRevision: Schema.Finite,
+        operationID: Schema.String,
+      }),
+      success: Schema.Struct({
+        data: Schema.Struct({
+          revision: Schema.Finite,
+          outcome: Schema.Literals(["forgotten", "revision_conflict", "duplicate_operation"]),
+        }),
+      }),
+      error: [SessionNotFoundError, InvalidRequestError, ConflictError],
+    })
+      .middleware(SessionLocationMiddleware)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.skill_selection_forget",
+          summary: "Forget remembered skill selections",
+          description:
+            "Forget one skill selection or all selections of this session. Never touches durable allow/deny policy.",
+        }),
+      ),
+  )
+  .add(
+    HttpApiEndpoint.post("session.chatSend", "/api/session/:sessionID/chat-send", {
+      params: { sessionID: SessionV2.ID },
+      payload: Schema.Struct({
+        requestID: Schema.String,
+        text: Schema.String,
+        id: Schema.String,
+      }),
+      success: Schema.Struct({
+        data: Schema.Struct({
+          admitted: SessionInput.Admitted,
+          selections: Schema.Array(Schema.String),
+        }),
+      }),
+      error: [SessionNotFoundError, InvalidRequestError, ConflictError],
+    })
+      .middleware(SessionLocationMiddleware)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.chat_send",
+          summary: "Send the one-click chat approval",
+          description:
+            "Host-bound chat-send adapter for a pending blocking question: verifies the stored chatSend text, " +
+            "admits the exact interactive prompt with a stable input id, and settles the question. " +
+            "Skill selection is established only by normal input promotion and the consuming gate, never by the click itself.",
         }),
       ),
   )
@@ -433,6 +534,7 @@ export const SessionGroup = HttpApiGroup.make("server.session")
   .add(
     HttpApiEndpoint.get("session.activity", "/api/session/:sessionID/activity", {
       params: { sessionID: SessionV2.ID },
+      query: Schema.Struct({ messageID: SessionMessage.ID.pipe(Schema.optional) }),
       success: Schema.Struct({
         data: Schema.Struct({
           type: Schema.Literals(["idle", "busy"]),
@@ -441,6 +543,7 @@ export const SessionGroup = HttpApiGroup.make("server.session")
             Schema.optional,
           ),
           lastError: Schema.String.pipe(Schema.optional),
+          turnCompletionResult: Schema.Literals(["done", "incomplete", "unknown", "skipped"]).pipe(Schema.optional),
         }),
       }),
       error: SessionNotFoundError,

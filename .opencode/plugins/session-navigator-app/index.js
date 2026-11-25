@@ -10,6 +10,7 @@ const FAVORITES_STORAGE_KEY = "favorites.v1"
 const AUTO_OPEN_STORAGE_KEY = "opencode.app-plugin.session-navigator-app.auto-opened.v1"
 const SHOW_SUBAGENTS_STORAGE_KEY = "show-subagents.v1"
 const SHOW_SUBAGENTS_LOCAL_STORAGE_KEY = "opencode.app-plugin.session-navigator-app.show-subagents.v1"
+const HIDDEN_PROJECTS_STORAGE_KEY = "hidden-projects.v1"
 const MOBILE_DOCK_MEDIA_QUERY = "(max-width: 767px), (pointer: coarse) and (max-height: 600px)"
 const navigatorStatesByHost = new WeakMap()
 
@@ -48,12 +49,21 @@ function mountNavigator(api, context) {
   context.element.replaceChildren(root)
 
   const unsubscribeProjects = api.host.projects.subscribe((projects) => {
-    state.projects = projects
-    for (const project of projects) ensureProjectGroup(state, project.worktree)
+    state.projects = groupNavigatorProjects(projects)
+    const keys = new Set(state.projects.map(projectGroupKey))
+    for (const key of state.groups.keys()) if (!keys.has(key)) state.groups.delete(key)
+    for (const project of state.projects) {
+      const group = ensureProjectGroup(state, project)
+      if (group.expanded && group.reloadPreview && !group.loading) {
+        group.reloadPreview = false
+        void loadGroup(api, group, state, group.loadedAll ? "all" : group.sessions.length || undefined)
+      }
+    }
     render()
   })
   const unsubscribeFavorites = subscribeFavorites(api, state)
   const unsubscribeSessionStatus = subscribeSessionStatus(api, state)
+  const unsubscribeAttention = api.host.sessions.attention?.subscribe?.(() => updateVisibleSessionRows(api, state)) ?? (() => {})
   const closeContextMenu = () => {
     if (!state.contextMenu) return
     state.contextMenu = undefined
@@ -102,6 +112,7 @@ function mountNavigator(api, context) {
     unsubscribeProjects()
     unsubscribeFavorites()
     unsubscribeSessionStatus()
+    unsubscribeAttention()
     unsubscribeSessionEvents()
     state.render = undefined
     state.root = undefined
@@ -213,8 +224,18 @@ function mountNavigator(api, context) {
 
     const body = document.createElement("div")
     body.className = "oc-session-nav__body"
-    if (state.query.trim()) renderSearch(api, state, body)
-    if (!state.query.trim()) {
+    const manage = actionButton("Manage hidden projects")
+    manage.setAttribute("aria-pressed", String(state.manageHiddenProjects))
+    manage.dataset.visibilityControl = "manage"
+    manage.addEventListener("click", () => {
+      state.manageHiddenProjects = !state.manageHiddenProjects
+      state.contextMenu = undefined
+      renderLater(state)
+    })
+    shell.append(manage)
+    if (state.manageHiddenProjects) renderProjectVisibility(api, state, body)
+    else if (state.query.trim()) renderSearch(api, state, body)
+    else {
       state.favorites.sessions = favoriteSessions(state)
       state.favorites.loaded = true
       state.favorites.loadedAll = true
@@ -222,6 +243,7 @@ function mountNavigator(api, context) {
       const primaryGroups = mobile.matches ? [state.recent, state.favorites] : [state.favorites, state.recent]
       for (const group of primaryGroups) renderGroup(api, state, body, renderInputForGroup(state, group))
       for (const [index, project] of state.projects.entries()) {
+        if (state.hiddenProjects.has(projectGroupKey(project))) continue
         renderProject(api, state, body, project, index)
       }
     }
@@ -233,9 +255,15 @@ function mountNavigator(api, context) {
     const focused = previousInput === document.activeElement || (state.searchFocused && state.query.trim())
     const selectionStart = previousInput?.selectionStart ?? input.value.length
     const selectionEnd = previousInput?.selectionEnd ?? selectionStart
+    const visibilityFocus = root.contains(document.activeElement) ? document.activeElement?.dataset.visibilityControl : undefined
     root.replaceChildren(root.querySelector("style") || styleNode(), shell)
     restoreNavigatorScroll(state, scrollTop)
-    if (focused) {
+    if (visibilityFocus) {
+      const control = [...root.querySelectorAll("[data-visibility-control]")].find(
+        (button) => button.dataset.visibilityControl === visibilityFocus,
+      ) ?? manage
+      control.focus({ preventScroll: true })
+    } else if (focused && !state.manageHiddenProjects) {
       const next = root.querySelector("input")
       next?.focus({ preventScroll: true })
       next?.setSelectionRange(selectionStart, selectionEnd)
@@ -250,7 +278,7 @@ export function restoreNavigatorState(api, context) {
   const existing = navigatorStatesByHost.get(host)
   if (existing) {
     existing.api = api
-    existing.projects = api.host.projects.list()
+    existing.projects = groupNavigatorProjects(api.host.projects.list())
     existing.favorites ??= createGroup(undefined, true)
     existing.favorites.key ??= "favorites"
     existing.active ??= createGroup(undefined, true, "active")
@@ -266,7 +294,10 @@ export function restoreNavigatorState(api, context) {
     existing.search.duration ??= 0
     existing.searchContent ??= {}
     existing.missingSessions ??= new Set()
+    existing.missingFavorites ??= new Set()
     existing.showSubagents ??= readShowSubagents(api)
+    existing.hiddenProjects = readHiddenProjects(api)
+    existing.manageHiddenProjects = false
     existing.recent.key ??= "recent"
     for (const group of existing.groups.values()) group.key ??= `project:${group.directory}`
     existing.dockArea = context.area
@@ -279,7 +310,7 @@ export function restoreNavigatorState(api, context) {
     api,
     host,
     query: "",
-    projects: api.host.projects.list(),
+    projects: groupNavigatorProjects(api.host.projects.list()),
     groups: new Map(),
     active: createGroup(undefined, true, "active"),
     favorites: createGroup(undefined, true, "favorites"),
@@ -290,7 +321,10 @@ export function restoreNavigatorState(api, context) {
     search: createSearchState(),
     searchContent: {},
     missingSessions: new Set(),
+    missingFavorites: new Set(),
     showSubagents: readShowSubagents(api),
+    hiddenProjects: readHiddenProjects(api),
+    manageHiddenProjects: false,
     confirmDelete: undefined,
     contextMenu: undefined,
     pendingSessionActivation: undefined,
@@ -311,6 +345,15 @@ function navigatorHost(api) {
 function navigatorApi(api, state) {
   if (state.host !== navigatorHost(api)) return undefined
   return state.api
+}
+
+function readHiddenProjects(api) {
+  try {
+    const paths = api.kv?.get?.(HIDDEN_PROJECTS_STORAGE_KEY)
+    return new Set(Array.isArray(paths) ? paths.filter((path) => typeof path === "string" && path) : [])
+  } catch {
+    return new Set()
+  }
 }
 
 function readShowSubagents(api) {
@@ -364,8 +407,15 @@ function sessionVisible(state, session) {
 }
 
 function visibleSessions(state, sessions) {
-  if (state.showSubagents) return sessions
-  return sessions.filter((session) => sessionVisible(state, session))
+  return subagentFilteredSessions(state, sessions).filter((session) => {
+    if (!session.directory || !state.hiddenProjects?.size) return true
+    const project = projectForDirectory(state, session.directory)
+    return !state.hiddenProjects.has(projectWorktreeKey(project?.worktree ?? session.directory))
+  })
+}
+
+function subagentFilteredSessions(state, sessions) {
+  return state.showSubagents ? sessions : sessions.filter((session) => sessionVisible(state, session))
 }
 
 function sessionParentID(state, session) {
@@ -406,12 +456,59 @@ function createSearchState(sequence = 0) {
   }
 }
 
-function ensureProjectGroup(state, directory) {
-  const current = state.groups.get(directory)
-  if (current) return current
-  const group = createGroup(directory, false)
-  state.groups.set(directory, group)
+function projectGroupKey(project) {
+  return projectWorktreeKey(project.worktree)
+}
+
+export function groupNavigatorProjects(projects) {
+  const grouped = new Map()
+  for (const project of projects) {
+    const key = projectGroupKey(project)
+    const previous = grouped.get(key)
+    const directories = [...new Set([
+      ...(previous?.sessionDirectories ?? []), project.worktree, ...(project.sessionDirectories ?? []),
+    ])]
+    grouped.set(key, { ...(previous ?? project), sessionDirectories: directories })
+  }
+  // Canonical worktrees own their paths; an alias claimed by multiple worktrees belongs to neither.
+  const owners = new Map()
+  for (const [key, project] of grouped) {
+    for (const directory of project.sessionDirectories) {
+      const alias = projectWorktreeKey(directory)
+      const owner = owners.get(alias)
+      owners.set(alias, grouped.has(alias) ? alias : owner === undefined || owner === key ? key : null)
+    }
+  }
+  return [...grouped].map(([key, project]) => ({
+    ...project,
+    sessionDirectories: project.sessionDirectories.filter((directory) => owners.get(projectWorktreeKey(directory)) === key),
+  }))
+}
+
+function ensureProjectGroup(state, project) {
+  const key = projectGroupKey(project)
+  const current = state.groups.get(key)
+  const group = current ?? createGroup(project.worktree, false, `project:${key}`)
+  const known = project.sessionDirectories ?? [project.worktree]
+  const keys = new Set(known.map(projectWorktreeKey))
+  const eventDirectories = [...(group.eventDirectories ?? [])].filter((directory) => keys.has(projectWorktreeKey(directory)))
+  const directories = [...new Set([...known, ...eventDirectories])]
+  group.eventDirectories = new Set(eventDirectories)
+  if (current && (group.directories?.length !== directories.length || directories.some((dir) => !group.directories?.includes(dir)))) {
+    if (group.loading || group.expanded) group.reloadPreview = true
+    else group.loaded = false
+  }
+  group.directory = project.worktree
+  group.directories = directories
+  group.sessions = group.sessions.filter((session) => groupOwnsDirectory(group, session.directory))
+  state.groups.set(key, group)
   return group
+}
+
+function groupOwnsDirectory(group, directory) {
+  if (!directory) return false
+  const key = projectWorktreeKey(directory)
+  return (group.directories ?? [group.directory]).some((candidate) => candidate && projectWorktreeKey(candidate) === key)
 }
 
 export async function refreshLoadedNavigatorGroups(api, state) {
@@ -430,8 +527,9 @@ export async function refreshLoadedNavigatorGroups(api, state) {
 
 async function loadGroup(api, group, state, target) {
   if (group.loading) return
+  const accepts = (session) => group === state.recent || groupOwnsDirectory(group, session.directory)
   const pinned = group.sessions.filter(
-    (session) => sessionVisible(state, session) && sessionActiveRank(api, state, session, group.directory) < 2,
+    (session) => accepts(session) && sessionVisible(state, session) && sessionActiveRank(api, state, session, group.directory) < 2,
   )
   const showSubagents = state.showSubagents
   group.loading = true
@@ -447,35 +545,17 @@ async function loadGroup(api, group, state, target) {
           ? group.sessions.length + MORE_STEP
           : limit
     const sessions = []
-    let cursor
-    let guard = 0
-    while (true) {
-      const page = await listSessions(
-        api,
-        {
-          directory: group.directory,
-          limit: wantAll ? FETCH_PAGE_LIMIT : want + 1,
-          cursor,
-        },
-        state,
-      )
-      mergeSessions(sessions, page)
-      if (!wantAll) break
-      const last = page.at(-1)
-      if (!last || page.length < FETCH_PAGE_LIMIT) break
-      cursor = sessionUpdated(last)
-      guard++
-      if (guard > 100) break
-    }
+    const directories = group.directories ?? [group.directory]
+    const pages = await Promise.all(directories.map((directory) => loadNavigatorDirectory(api, state, directory, want, accepts)))
+    for (const page of pages) mergeRecentSessions(sessions, page.filter(accepts))
+    mergeRecentSessions(sessions, pinned.filter(accepts))
     if (group === state.recent) {
-      mergeRecentSessions(sessions, pinned)
       mergeRecentSessions(sessions, state.active?.sessions ?? [])
-    } else {
-      mergeSessions(sessions, pinned)
     }
     sessions.sort(compareSessions(api, state, group.directory))
     const visible = Math.max(want, pinned.length)
-    const displayable = visibleSessions(state, sessions)
+    // Hide only in the view so showing a project again restores cached rows.
+    const displayable = subagentFilteredSessions(state, sessions)
     group.sessions = wantAll ? displayable : displayable.slice(0, visible)
     group.hasMore = wantAll ? false : displayable.length > visible
     group.loaded = true
@@ -488,6 +568,21 @@ async function loadGroup(api, group, state, target) {
     renderGroupLater(api, state, group)
     if (reload) void loadGroup(api, group, state, reloadTarget)
   }
+}
+
+export async function loadNavigatorDirectory(api, state, directory, want, accepts = () => true) {
+  const result = []
+  const cursors = new Set()
+  let cursor
+  while (result.length <= want) {
+    const limit = Math.min(FETCH_PAGE_LIMIT, want + 1 - result.length)
+    const page = await listSessionPage(api, { directory, limit, cursor }, state)
+    mergeRecentSessions(result, page.sessions.filter(accepts))
+    if (!page.cursor || cursors.has(page.cursor)) break
+    cursors.add(page.cursor)
+    cursor = page.cursor
+  }
+  return result
 }
 
 function previewLimit() {
@@ -578,6 +673,10 @@ async function loadSearch(api, state, query, sequence) {
 }
 
 async function listSessions(api, input, state) {
+  return (await listSessionPage(api, input, state)).sessions
+}
+
+async function listSessionPage(api, input, state) {
   const response = await api.client.experimental.session.list({
     roots: state?.showSubagents === false ? true : undefined,
     archived: false,
@@ -587,8 +686,11 @@ async function listSessions(api, input, state) {
     limit: input.limit,
   })
   const data = response?.data ?? response
-  if (!Array.isArray(data)) return []
-  return data.filter((session) => !state.missingSessions?.has(sessionKey(session, session.directory || input.directory)))
+  if (!Array.isArray(data)) return { sessions: [] }
+  return {
+    sessions: data.filter((session) => !state?.missingSessions?.has(sessionKey(session, session.directory || input.directory))),
+    cursor: response?.response?.headers?.get("x-next-cursor") || undefined,
+  }
 }
 
 function mergeSessions(target, next, fallbackDirectory) {
@@ -650,7 +752,7 @@ function searchCandidates(state) {
   // stale metadata.
   const known = new Set()
   const addCandidates = (rows) => {
-    for (const session of visibleSessions(state, rows)) {
+    for (const session of subagentFilteredSessions(state, rows)) {
       if (!session?.id || known.has(session.id)) continue
       sessions.push(session)
       known.add(session.id)
@@ -765,25 +867,26 @@ function readFavorites(api) {
   if (Array.isArray(hostFavorites)) return favoriteItemsFromList(hostFavorites)
   const stored = api.kv?.get?.(FAVORITES_STORAGE_KEY, {})
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return {}
-  return Object.fromEntries(Object.entries(stored).filter((entry) => entry[1]?.id && entry[1]?.directory))
+  // Older builds persisted entries under a directory:id key; the session id is the key now.
+  return favoriteItemsFromList(Object.values(stored))
 }
 
 function favoriteItemsFromList(items) {
-  return Object.fromEntries(
-    items
-      .filter((item) => item?.id && item?.directory)
-      .map((item) => [
-        sessionKey(item, item.directory),
-        {
-          id: item.id,
-          parentID: typeof item.parentID === "string" || item.parentID === null ? item.parentID : undefined,
-          title: item.title,
-          slug: item.slug,
-          directory: item.directory,
-          time: item.time,
-        },
-      ]),
-  )
+  const favorites = {}
+  // One session can be stored under two directories, for example after a repository
+  // move. The host lists the newest entry first; that row wins and its twin is dropped.
+  for (const item of items) {
+    if (!item?.id || !item?.directory || favorites[item.id]) continue
+    favorites[item.id] = {
+      id: item.id,
+      parentID: typeof item.parentID === "string" || item.parentID === null ? item.parentID : undefined,
+      title: item.title,
+      slug: item.slug,
+      directory: item.directory,
+      time: item.time,
+    }
+  }
+  return favorites
 }
 
 function saveFavorites(api, state) {
@@ -817,15 +920,17 @@ export async function refreshFavoriteParents(api, state) {
     const updates = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
     if (updates.length === 0) return
     for (const update of updates) {
+      const current = state.favoriteItems[update.favorite.id]
+      if (!current) continue
       if (update.missing) {
-        removeFavorite(serverApi, state, update.favorite, update.favorite.directory)
+        // A favorite whose session is gone stays listed until the user removes it.
+        state.missingFavorites ??= new Set()
+        state.missingFavorites.add(update.favorite.id)
         continue
       }
-      const key = favoriteKeyInState(state, update.favorite, update.favorite.directory)
-      const current = state.favoriteItems[key]
-      if (!current) continue
+      state.missingFavorites?.delete(update.favorite.id)
       const favorite = { ...current, parentID: update.parentID }
-      state.favoriteItems[key] = favorite
+      state.favoriteItems[update.favorite.id] = favorite
       serverApi.host?.sessions?.favorites?.set?.(favorite, true)
     }
     saveFavorites(serverApi, state)
@@ -887,70 +992,65 @@ function favoriteSession(session, directory) {
   }
 }
 
-function isFavorite(state, session, directory) {
-  return Boolean(state.favoriteItems[sessionKey(session, directory)])
+// The host identifies a favorite by session id: set(input, true) adds or updates that
+// entry and set(input, false) removes it, whatever directory the input carries.
+function isFavorite(state, session) {
+  return Boolean(state.favoriteItems[session?.id])
 }
 
 function toggleFavorite(api, state, session, directory) {
   const serverApi = navigatorApi(api, state)
   if (!serverApi) return
-  const key = sessionKey(session, directory)
   if (serverApi.host?.sessions?.favorites) {
-    serverApi.host.sessions.favorites.set(favoriteSession(session, directory), !state.favoriteItems[key])
+    serverApi.host.sessions.favorites.set(favoriteSession(session, directory), !isFavorite(state, session))
     state.favoriteItems = readFavorites(serverApi)
-    renderLater(state)
-    return
+  } else {
+    if (state.favoriteItems[session.id]) delete state.favoriteItems[session.id]
+    else state.favoriteItems[session.id] = favoriteSession(session, directory)
+    saveFavorites(serverApi, state)
   }
-  if (state.favoriteItems[key]) delete state.favoriteItems[key]
-  else state.favoriteItems[key] = favoriteSession(session, directory)
-  saveFavorites(serverApi, state)
+  // A favorite added again starts visible; the next probe re-marks it if still gone.
+  state.missingFavorites?.delete(session.id)
   renderLater(state)
 }
 
 function syncFavorite(api, state, session, directory) {
   const serverApi = navigatorApi(api, state)
-  if (!serverApi) return
-  const key = favoriteKeyInState(state, session, directory)
-  if (!state.favoriteItems[key]) return
+  if (!serverApi || !state.favoriteItems[session.id]) return
+  // A live session event proves the favorite still exists.
+  state.missingFavorites?.delete(session.id)
   if (serverApi.host?.sessions?.favorites) {
     serverApi.host.sessions.favorites.set(favoriteSession(session, directory), true)
     state.favoriteItems = readFavorites(serverApi)
     return
   }
-  state.favoriteItems[key] = favoriteSession(session, directory)
+  state.favoriteItems[session.id] = favoriteSession(session, directory)
   saveFavorites(serverApi, state)
 }
 
 function removeFavorite(api, state, session, directory) {
   const serverApi = navigatorApi(api, state)
-  if (!serverApi) return
-  const key = favoriteKeyInState(state, session, directory)
-  if (!state.favoriteItems[key]) return
+  if (!serverApi || !state.favoriteItems[session.id]) return
   if (serverApi.host?.sessions?.favorites) {
     serverApi.host.sessions.favorites.set(favoriteSession(session, directory), false)
     state.favoriteItems = readFavorites(serverApi)
     return
   }
-  delete state.favoriteItems[key]
+  delete state.favoriteItems[session.id]
   saveFavorites(serverApi, state)
 }
 
-function removeFavoriteByID(api, state, id, directory) {
+function removeFavoriteByID(api, state, id) {
   const serverApi = navigatorApi(api, state)
-  if (!serverApi) return
-  const identity = directoryIdentity(directory)
-  if (!identity) return
-  const entries = Object.entries(state.favoriteItems).filter(
-    (entry) => entry[1]?.id === id && directoryIdentity(entry[1]?.directory) === identity,
-  )
+  if (!id) return
+  const favorite = state.favoriteItems[id]
+  if (!serverApi || !favorite) return
   if (serverApi.host?.sessions?.favorites) {
-    for (const entry of entries) serverApi.host.sessions.favorites.set(entry[1], false)
+    serverApi.host.sessions.favorites.set(favorite, false)
     state.favoriteItems = readFavorites(serverApi)
     return
   }
-  const keys = entries.map((entry) => entry[0])
-  if (keys.length === 0) return
-  for (const key of keys) delete state.favoriteItems[key]
+  delete state.favoriteItems[id]
   saveFavorites(serverApi, state)
 }
 
@@ -959,6 +1059,8 @@ function subscribeFavorites(api, state) {
   if (!favorites?.subscribe) return () => {}
   return favorites.subscribe((items) => {
     state.favoriteItems = favoriteItemsFromList(items)
+    // A missing marker never outlives the favorite it describes.
+    for (const id of state.missingFavorites ?? []) if (!state.favoriteItems[id]) state.missingFavorites.delete(id)
     renderLater(state)
   })
 }
@@ -1031,7 +1133,7 @@ export function updateSessionTitleFromEvent(api, state, event, context) {
     const reload = [
       state.recent,
       ...[...state.groups.values()].filter(
-        (group) => eventDirectory && directoryIdentity(group.directory) === eventDirectory,
+        (group) => eventDirectory && (group.directories ?? [group.directory]).some((dir) => directoryIdentity(dir) === eventDirectory),
       ),
     ]
     reload.forEach((group) => {
@@ -1073,23 +1175,17 @@ export function updateSessionTitleFromEvent(api, state, event, context) {
 function upsertSessionFromEvent(api, state, event, context) {
   const info = eventSession(event)
   if (!info?.id) return
-  // The host and other listeners share the event payload. Normalize only our
-  // own copy so project grouping cannot change another consumer's placement.
   const session = { ...info }
-  // Transport directory is the normalized SSE key; prefer it when the payload
-  // carries a missing or differently-spelled Windows path. The pseudo "global"
-  // scope is not a path: an event published outside any instance (for example
-  // while the owning project instance bootstraps) must keep its payload
-  // directory instead of re-parenting the session to the global project.
+  // The SSE scope may be canonicalized; only the payload has the stored path.
   if (
+    !session.directory &&
     typeof context?.directory === "string" &&
-    directoryIdentity(context.directory) !== "global" &&
-    directoryIdentity(session.directory) !== directoryIdentity(context.directory)
+    directoryIdentity(context.directory) !== "global"
   ) {
     session.directory = context.directory
   }
   if (session.time?.archived) {
-    removeFavoriteByID(api, state, session.id, session.directory)
+    removeFavoriteByID(api, state, session.id)
     removeSessionByID(state, session.id, session.directory)
     if (
       !updateVisibleGroupSections(api, state, [
@@ -1105,11 +1201,16 @@ function upsertSessionFromEvent(api, state, event, context) {
   state.missingSessions?.delete(sessionKey(session, session.directory))
   upsertSessionInGroup(api, state, state.recent, session)
   syncFavorite(api, state, session, session.directory)
-  for (const group of state.groups.values()) {
-    if (directoryIdentity((session.directory || group.directory)) !== directoryIdentity(group.directory)) continue
-    if (session.directory !== group.directory) session.directory = group.directory
+  const project = projectForDirectory(state, session.directory)
+  const group = project ? ensureProjectGroup(state, project) : legacyGroupForDirectory(state, session.directory)
+  if (group) {
+    const directories = group.directories ?? [group.directory]
+    if (session.directory && !directories.includes(session.directory)) {
+      group.eventDirectories ??= new Set()
+      group.eventDirectories.add(session.directory)
+      group.directories = [...directories, session.directory]
+    }
     upsertSessionInGroup(api, state, group, session)
-    syncFavorite(api, state, session, group.directory)
   }
   upsertSessionInSearch(api, state, session)
   if (state.query.trim()) {
@@ -1130,16 +1231,14 @@ function upsertSessionFromEvent(api, state, event, context) {
 function removeSessionFromEvent(api, state, event, context) {
   const id = eventSession(event)?.id || event.properties?.sessionID || event.sessionID
   let directory = eventSession(event)?.directory
-  // Same pseudo-scope rule as upsertSessionFromEvent: "global" is not a path,
-  // so keep the payload directory when the event arrives without an instance.
   if (
+    !directory &&
     typeof context?.directory === "string" &&
-    directoryIdentity(context.directory) !== "global" &&
-    directoryIdentity(directory) !== directoryIdentity(context.directory)
+    directoryIdentity(context.directory) !== "global"
   ) {
     directory = context.directory
   }
-  removeFavoriteByID(api, state, id, directory)
+  removeFavoriteByID(api, state, id)
   removeSessionByID(state, id, directory)
   if (
     !updateVisibleGroupSections(api, state, [
@@ -1266,7 +1365,7 @@ function renderInputForGroup(state, group) {
       projectBadges: true,
     }
   }
-  const project = state.projects.find((item) => item.worktree === group.directory)
+  const project = projectForDirectory(state, group.directory)
   if (!project) return
   return {
     title: undefined,
@@ -1298,6 +1397,7 @@ function sessionFromState(state, id, directory) {
 }
 
 function updateSessionRow(api, state, row, session, directory) {
+  updatePriorityRow(api, row, session, directory)
   const title = session.title || session.slug || "New session"
   const titleNode = row.querySelector(".oc-session-nav__session-title")
   if (titleNode) titleNode.textContent = title
@@ -1307,11 +1407,29 @@ function updateSessionRow(api, state, row, session, directory) {
 
   const favorite = row.querySelector(".oc-session-nav__favorite")
   if (!favorite) return
-  const picked = isFavorite(state, session, directory)
+  const picked = isFavorite(state, session)
   favorite.title = picked ? `Remove ${title} from favorites` : `Add ${title} to favorites`
   favorite.setAttribute("aria-label", favorite.title)
   favorite.setAttribute("aria-pressed", String(picked))
   favorite.replaceChildren(navIcon("favorite", picked))
+}
+
+function updatePriorityRow(api, row, session, directory) {
+  const priority = directory && api.host.sessions.attention?.get?.({ directory, sessionID: session.id })
+  row.classList.toggle("oc-session-nav__session--important", !!priority?.available && !!priority?.enabled)
+  row.classList.toggle("oc-session-nav__session--unseen", !!priority?.pendingCount)
+  let label = row.querySelector(".oc-session-nav__important-label")
+  if (!priority?.available || !priority.enabled) {
+    label?.remove()
+    return
+  }
+  if (!label) {
+    label = document.createElement("span")
+    label.className = "oc-session-nav__important-label"
+    row.querySelector(".oc-session-nav__session-main")?.append(label)
+  }
+  label.textContent = priority.pendingCount ? (priority.error ? "! Wichtig: Fehler" : "! Wichtig: Ergebnis") : "✦ Wichtig"
+  label.setAttribute("aria-label", label.textContent)
 }
 
 export function sessionVisualStatus(api, session, directory) {
@@ -1410,6 +1528,7 @@ function sessionSortTime(api, state, session, fallbackDirectory) {
 
 function renderSearch(api, state, body) {
   const projectMatches = state.projects.filter((project) =>
+    !state.hiddenProjects.has(projectGroupKey(project)) &&
     `${project.name} ${project.worktree}`.toLowerCase().includes(state.query.trim().toLowerCase()),
   )
   const section = document.createElement("div")
@@ -1423,7 +1542,7 @@ function renderSearch(api, state, body) {
     const row = document.createElement("button")
     row.type = "button"
     row.className = "oc-session-nav__project-result"
-    row.textContent = project.name
+    row.textContent = projectLabel(state, project)
     row.addEventListener("click", () =>
       navigatorApi(api, state)?.host.navigation.newSession({ directory: project.worktree }),
     )
@@ -1438,8 +1557,39 @@ function renderSearch(api, state, body) {
   body.append(section)
 }
 
+function renderProjectVisibility(api, state, body) {
+  const projects = new Map(state.projects.map((project) => [projectGroupKey(project), project.worktree]))
+  for (const key of state.hiddenProjects) if (!projects.has(key)) projects.set(key, key)
+  if (!projects.size) body.append(empty("No projects"))
+  for (const [key, worktree] of projects) {
+    const row = document.createElement("div")
+    row.className = "oc-session-nav__visibility-row"
+    const path = document.createElement("span")
+    path.textContent = worktree
+    const button = actionButton(state.hiddenProjects.has(key) ? "Show" : "Hide")
+    button.setAttribute("aria-label", `${button.textContent} ${worktree} in Navigator`)
+    button.dataset.visibilityControl = key
+    button.addEventListener("click", () => {
+      const hostApi = navigatorApi(api, state)
+      if (!hostApi?.kv?.set) return
+      const next = new Set(state.hiddenProjects)
+      if (!next.delete(key)) next.add(key)
+      try {
+        hostApi.kv.set(HIDDEN_PROJECTS_STORAGE_KEY, [...next])
+      } catch {
+        path.textContent = `${worktree} — could not save visibility`
+        return
+      }
+      state.hiddenProjects = next
+      renderLater(state)
+    })
+    row.append(path, button)
+    body.append(row)
+  }
+}
+
 function renderProject(api, state, body, project, index) {
-  const group = ensureProjectGroup(state, project.worktree)
+  const group = ensureProjectGroup(state, project)
   const section = document.createElement("div")
   section.className = "oc-session-nav__project"
 
@@ -1459,17 +1609,20 @@ function renderProject(api, state, body, project, index) {
   const avatar = projectAvatar(project)
   const name = document.createElement("span")
   name.className = "oc-session-nav__project-name"
-  name.textContent = project.name
+  name.textContent = projectLabel(state, project)
+  toggle.title = project.worktree
   toggle.append(chevron, avatar, name)
-  const moveUp = projectMoveButton("↑", `Move ${project.name} up`, index === 0, (event) => {
+  const previous = state.projects.findLastIndex((item, position) => position < index && !state.hiddenProjects.has(projectGroupKey(item)))
+  const next = state.projects.findIndex((item, position) => position > index && !state.hiddenProjects.has(projectGroupKey(item)))
+  const moveUp = projectMoveButton("↑", `Move ${project.name} up`, previous < 0, (event) => {
     event.preventDefault()
     event.stopPropagation()
-    moveProject(api, state, project.worktree, index - 1)
+    moveProject(api, state, project.worktree, previous)
   })
-  const moveDown = projectMoveButton("↓", `Move ${project.name} down`, index === state.projects.length - 1, (event) => {
+  const moveDown = projectMoveButton("↓", `Move ${project.name} down`, next < 0, (event) => {
     event.preventDefault()
     event.stopPropagation()
-    moveProject(api, state, project.worktree, index + 1)
+    moveProject(api, state, project.worktree, next)
   })
   const add = document.createElement("button")
   add.type = "button"
@@ -1568,6 +1721,7 @@ function sessionRow(api, state, session, fallbackDirectory, indented, projectBad
   const row = document.createElement("div")
   row.className = "oc-session-nav__session"
   if (indented) row.classList.add("oc-session-nav__session--indented")
+  if (state.missingFavorites?.has(session.id)) row.classList.add("oc-session-nav__session--missing")
   row.dataset.sessionId = session.id
   row.dataset.directory = directory || ""
 
@@ -1605,15 +1759,16 @@ function sessionRow(api, state, session, fallbackDirectory, indented, projectBad
   const meta = document.createElement("span")
   meta.className = "oc-session-nav__session-meta"
   updateSessionMeta(api, meta, session, directory)
-  const project = projectBadges ? projectForDirectory(state, directory) : undefined
+  const project = projectBadges ? projectForSession(state, { ...session, directory }) : undefined
   if (project) {
     open.classList.add("oc-session-nav__session-main--project")
     open.append(projectAvatar(project))
   }
   open.append(title, meta)
   row.append(open)
+  updatePriorityRow(api, row, session, directory)
 
-  const favorite = favoriteButton(state, session, directory)
+  const favorite = favoriteButton(state, session)
   favorite.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || !directory) return
     state.pendingSessionActivation = {
@@ -1630,6 +1785,9 @@ function sessionRow(api, state, session, fallbackDirectory, indented, projectBad
   favorite.addEventListener("click", (event) => {
     event.preventDefault()
     event.stopPropagation()
+    // The first click of a double-click re-renders the list, so the second one lands on
+    // whichever star took this row's place. Only a single click toggles.
+    if (event.detail > 1) return
     toggleFavorite(api, state, session, directory)
   })
   row.append(favorite)
@@ -1679,7 +1837,7 @@ function sessionContextMenu(api, state) {
 
   const rename = contextMenuButton("Rename", () => openSessionRenameDialog(api, state, input.session, input.directory))
   const favorite = contextMenuButton(
-    isFavorite(state, input.session, input.directory) ? "Remove from favorites" : "Add to favorites",
+    isFavorite(state, input.session) ? "Remove from favorites" : "Add to favorites",
     () => {
       toggleFavorite(api, state, input.session, input.directory)
       state.contextMenu = undefined
@@ -1883,7 +2041,10 @@ async function deleteSession(api, state, session, directory) {
   if (!directory) return
   const serverApi = navigatorApi(api, state)
   if (!serverApi) return
-  await removeSession(serverApi, state, { directory, sessionID: session.id })
+  // A favorite whose session is already gone must still leave the list.
+  await removeSession(serverApi, state, { directory, sessionID: session.id }).catch((error) => {
+    if (!isSessionNotFound(error)) throw error
+  })
   removeFavorite(serverApi, state, session, directory)
   removeSessionFromState(serverApi, state, session.id, directory)
   navigateAfterRemoval(serverApi, state, session.id, directory)
@@ -1893,18 +2054,25 @@ async function deleteSession(api, state, session, directory) {
 export function openSession(api, state, session, directory) {
   const serverApi = navigatorApi(api, state)
   if (!serverApi || !state.root?.isConnected) return
-  const favorite = isFavorite(state, session, directory)
+  const favorite = isFavorite(state, session)
   if (!favorite) serverApi.host.navigation.openSession({ directory, sessionID: session.id, area: "middle" })
   return sessionExists(serverApi, { directory, sessionID: session.id })
     .then((exists) => {
       if (navigatorApi(api, state) !== serverApi) return
       if (exists) {
         if (favorite) serverApi.host.navigation.openSession({ directory, sessionID: session.id, area: "middle" })
+        state.missingFavorites?.delete(session.id)
         return
       }
-      state.missingSessions ??= new Set()
-      state.missingSessions.add(sessionKey(session, directory))
-      removeFavorite(serverApi, state, session, directory)
+      // A favorite whose session is gone stays listed (dimmed) until the user removes it.
+      if (favorite) {
+        state.missingFavorites ??= new Set()
+        state.missingFavorites.add(session.id)
+      }
+      if (!favorite) {
+        state.missingSessions ??= new Set()
+        state.missingSessions.add(sessionKey(session, directory))
+      }
       removeSessionByID(state, session.id, directory)
       renderLater(state)
     })
@@ -2064,17 +2232,18 @@ function navigateAfterRemoval(api, state, id, directory) {
   if (!serverApi) return
   const current = serverApi.host.navigation.current()
   if (current.sessionID !== id || current.directory !== directory) return
-  const group = state.groups.get(directory)
-  const next =
-    group?.sessions.find((session) => session.id !== id) ||
-    state.recent.sessions.find((session) => {
-      return session.id !== id && (session.directory || directory) === directory
-    })
+  const project = projectForDirectory(state, directory)
+  const group = project ? state.groups.get(projectGroupKey(project)) : legacyGroupForDirectory(state, directory)
+  const sameWorkspace = (session) => session.id !== id && !!session.directory && (
+    project ? projectForDirectory(state, session.directory) === project :
+      projectWorktreeKey(session.directory) === projectWorktreeKey(directory)
+  )
+  const next = group?.sessions.find(sameWorkspace) || state.recent.sessions.find(sameWorkspace)
   if (next) {
-    serverApi.host.navigation.openSession({ directory, sessionID: next.id })
+    serverApi.host.navigation.openSession({ directory: next.directory, sessionID: next.id })
     return
   }
-  serverApi.host.navigation.newSession({ directory })
+  serverApi.host.navigation.newSession({ directory: project?.worktree ?? directory })
 }
 
 function moveProjectOptimistic(state, worktree, toIndex) {
@@ -2153,18 +2322,6 @@ function sessionKey(session, directory) {
   return `${directoryIdentity(directory || session.directory)}:${session.id}`
 }
 
-function favoriteKeyInState(state, session, directory) {
-  const key = sessionKey(session, directory)
-  if (state.favoriteItems[key]) return key
-  return (
-    Object.entries(state.favoriteItems).find(
-      (entry) =>
-        entry[1]?.id === session.id &&
-        directoryIdentity(entry[1]?.directory) === directoryIdentity(directory || session.directory),
-    )?.[0] ?? key
-  )
-}
-
 function directoryIdentity(directory) {
   const value = String(directory || "").replace(/\\/g, "/").replace(/\/+$/, "")
   if (/^[a-zA-Z]:\//.test(value) || value.startsWith("//")) return value.toLowerCase()
@@ -2179,9 +2336,14 @@ function initial(value) {
 function projectAvatar(project) {
   const avatar = document.createElement("span")
   avatar.className = "oc-session-nav__avatar"
-  if (project.icon?.override) {
+  const url = project.icon?.url
+  // Layout can keep a cached fallback color after an ICO is discovered.
+  const favicon = typeof url === "string" && url.length <= 512 * 1024 &&
+    /^data:image\/(?:vnd\.microsoft\.icon|x-icon);base64,[A-Za-z0-9+/]+=*$/i.test(url) ? url : undefined
+  const artwork = project.icon?.override || favicon
+  if (artwork) {
     const image = document.createElement("img")
-    image.src = project.icon.override
+    image.src = artwork
     image.draggable = false
     image.alt = ""
     avatar.append(image)
@@ -2218,7 +2380,35 @@ function cssUrl(src) {
 }
 
 function projectForDirectory(state, directory) {
-  return state.projects.find((project) => project.worktree === directory)
+  if (!directory) return undefined
+  const key = projectWorktreeKey(directory)
+  return state.projects?.find((project) =>
+    projectWorktreeKey(project.worktree) === key ||
+    project.sessionDirectories?.some((alias) => projectWorktreeKey(alias) === key),
+  )
+}
+
+function projectForSession(state, session) {
+  return projectForDirectory(state, session.directory)
+}
+
+function legacyGroupForDirectory(state, directory) {
+  if (!directory || state.projects?.length) return undefined
+  const key = projectWorktreeKey(directory)
+  return [...state.groups.values()].find((group) => group.directory && projectWorktreeKey(group.directory) === key)
+}
+
+function projectWorktreeKey(path) {
+  const windows = /^[a-z]:/i.test(path) || path.startsWith("\\\\")
+  const value = (windows ? path.replaceAll("\\", "/") : path).replace(/\/\.(?=\/|$)\/?/g, "/")
+  const trimmed = value.replace(/\/+$/, "") || "/"
+  return windows || value.startsWith("//") ? trimmed.toLowerCase() : trimmed
+}
+
+function projectLabel(state, project) {
+  return state.projects.some((other) => other !== project && other.name === project.name)
+    ? `${project.name} — ${project.worktree}`
+    : project.name
 }
 
 function spinner() {
@@ -2247,8 +2437,8 @@ function groupAvatar(kind) {
   return avatar
 }
 
-function favoriteButton(state, session, directory) {
-  const picked = isFavorite(state, session, directory)
+function favoriteButton(state, session) {
+  const picked = isFavorite(state, session)
   const title = session.title || session.slug || "session"
   const button = document.createElement("button")
   button.type = "button"
@@ -2378,6 +2568,14 @@ function styleNode() {
       flex: 1;
       overflow: auto;
       padding: 0 8px 12px;
+    }
+    .oc-session-nav__visibility-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px;
+      overflow-wrap: anywhere;
     }
     .oc-session-nav__section,
     .oc-session-nav__project {
@@ -2550,6 +2748,19 @@ function styleNode() {
     }
     .oc-session-nav__session--indented {
       margin-left: 20px;
+    }
+    .oc-session-nav__session--important .oc-session-nav__important-label {
+      color: var(--text-interactive-base, var(--text-base));
+      font-size: 11px;
+      grid-column: 1 / -1;
+    }
+    .oc-session-nav__session--unseen {
+      outline: 2px solid var(--border-focus, currentColor);
+      background: var(--surface-hover-base);
+    }
+    .oc-session-nav__session--missing .oc-session-nav__session-main {
+      color: var(--text-weak);
+      opacity: 0.6;
     }
     .oc-session-nav__session-main {
       min-width: 0;

@@ -3,6 +3,7 @@ export * as ConfigAgent from "./agent"
 import { Schema } from "effect"
 import path from "path"
 import { PermissionSchema } from "../permission/schema"
+import { ConfigSkillInvocation } from "./skill-invocation"
 import { ConfigProvider } from "./provider"
 import { PositiveInt } from "../schema"
 import { Wildcard } from "../util/wildcard"
@@ -62,6 +63,16 @@ export const Tools = Schema.Struct({
   mode: Schema.Literals(["inherit", "explicit"]),
   entries: Schema.Record(Schema.String, ToolEntry).pipe(Schema.optional),
 })
+
+/** Inheritance is a sparse field override; only explicit mode replaces the list. */
+export function mergeTools(base: typeof Tools.Type | undefined, next: typeof Tools.Type): typeof Tools.Type {
+  if (next.mode === "explicit" || !base) return next
+  const entries = { ...base.entries }
+  for (const [name, entry] of Object.entries(next.entries ?? {})) {
+    entries[name] = { ...entries[name], ...entry }
+  }
+  return { mode: "inherit", ...(base.entries || next.entries ? { entries } : {}) }
+}
 
 export function toolPermissionAction(tool: string) {
   if (tool === "write" || tool === "patch" || tool === "apply_patch") return "edit"
@@ -150,4 +161,5 @@ export class Info extends Schema.Class<Info>("ConfigV2.Agent")({
   tool_budget: ToolBudget.pipe(Schema.optional),
   disabled: Schema.Boolean.pipe(Schema.optional),
   permissions: PermissionSchema.Ruleset.pipe(Schema.optional),
+  skills: Schema.Record(Schema.String, ConfigSkillInvocation.SkillEntry).pipe(Schema.optional),
 }) {}

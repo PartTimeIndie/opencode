@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["bun"],
+    "typeRoots": ["./node_modules/@types", "../opencode/node_modules/@types"],
+    "noUncheckedIndexedAccess": false
+  },
+  "include": ["index.ts", "test"]
+}

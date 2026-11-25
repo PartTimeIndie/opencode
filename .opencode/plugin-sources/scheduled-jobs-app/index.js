@@ -394,7 +394,7 @@ async function schedulerResponse(api, input) {
   const result = await api.services.call({ pluginID: "opencode-scheduler", serviceID: "jobs", version: 1,
     input: { ...input, method: input.method ?? "GET" }, directory: input.directory,
   })
-  if (!result.ok) throw new Error(`Scheduler backend unavailable: ${result.error}`)
+  if (!result.ok) throw Object.assign(new Error(`Scheduler backend unavailable: ${result.error}`), { status: result.status })
   return result.data
 }
 

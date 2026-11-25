@@ -235,6 +235,8 @@ export function PluginToolbarMobileOverflow(props: {
 }
 
 function PluginToolbarButton(props: { item: ToolbarItem; context: ToolbarContext }) {
+  const plugins = useAppPluginRuntime()
+  const armed = () => plugins.toolbarItemArmed(props.item.id, props.context)
   const [running, setRunning] = createSignal(false)
   const enabled = () => !running() && !!props.item.run && toolbarItemEnabled(props.item, props.context)
   const label = () => props.item.tooltip ?? props.item.title
@@ -274,6 +276,12 @@ function PluginToolbarButton(props: { item: ToolbarItem; context: ToolbarContext
         }}
         disabled={!enabled()}
         onClick={() => void run()}
+        aria-pressed={armed()}
+        style={
+          armed()
+            ? { background: "var(--background-element-hover)", "box-shadow": "inset 0 0 0 1px currentColor" }
+            : undefined
+        }
         aria-label={props.item.title}
         icon={
           <Show

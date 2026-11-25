@@ -41,7 +41,7 @@ function activation() {
     },
   }
   plugin.app(api)
-  return { owner, audio, calls, toolbars }
+  return { owner, audio, calls, toolbars, registered }
 }
 
 const until = async (check, budget = 2500) => {
@@ -54,6 +54,21 @@ const until = async (check, budget = 2500) => {
 }
 
 describe("spoken summary activation", () => {
+  test("voices use the public catalogue field without changing model or override contracts", () => {
+    const env = activation()
+    try {
+      const field = (key) => env.registered.fields.find((item) => item.key === key)
+      expect(field("voice")).toMatchObject({ type: "voice", targetKey: "speechTarget", languageKey: "language", allowCustom: true, default: "" })
+      expect(field("speechTarget").type).toBe("model-target")
+      expect(field("voiceOverrides").type).toBe("list")
+      expect(field("voiceOverrides").description).toContain("überschreiben")
+      expect(field("language").label).toBe("Sprache der Zusammenfassung")
+      expect(field("language").default).toBe("de")
+      expect(field("targetWords")).toMatchObject({ default: 40, min: 30, max: 60 })
+      expect(field("speed").default).toBe(0.9)
+      expect(env.calls.tts).toEqual([])
+    } finally { env.owner.abort() }
+  })
   test("stored model targets survive activation; one click reaches AI and TTS", async () => {
     const previous = globalThis.AudioContext
     const env = activation()

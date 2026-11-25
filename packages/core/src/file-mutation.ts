@@ -30,7 +30,7 @@ export interface RemoveInput {
   readonly target: Target
 }
 
-export type ExpectedState = { readonly exists: false } | { readonly exists: true; readonly sha256: string }
+export type ExpectedState = { readonly exists: false } | { readonly exists: true; readonly sha256: string; readonly mode?: number }
 
 export interface GuardedWriteInput extends WriteInput {
   readonly expected: ExpectedState
@@ -41,11 +41,12 @@ export interface GuardedRemoveInput extends RemoveInput {
 }
 
 export type TransactionChange =
-  | { readonly type: "add"; readonly target: Target; readonly content: string | Uint8Array }
+  | { readonly type: "add"; readonly target: Target; readonly content: string | Uint8Array; readonly mode?: number }
   | {
       readonly type: "update"
       readonly target: Target
       readonly content: string | Uint8Array
+      readonly mode?: number
       readonly expected: Extract<ExpectedState, { readonly exists: true }>
     }
   | {
@@ -59,6 +60,7 @@ export const CheckpointState = Schema.Struct({
   exists: Schema.Boolean,
   bytes: Schema.Number.pipe(Schema.optional),
   sha256: Schema.String.pipe(Schema.optional),
+  mode: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(0o777)).pipe(Schema.optional),
 })
 export type CheckpointState = typeof CheckpointState.Type
 
@@ -115,6 +117,12 @@ export interface RemoveResult {
 
 export interface TransactionHooks<E> {
   readonly before?: Effect.Effect<void, E>
+  /** Runs under target locks, after durable pending markers, across writes and
+   * commit hooks. A failed authority transaction must not erase uncertainty. */
+  readonly fence?: <A, E2>(operation: Effect.Effect<A, E2>) => Effect.Effect<A, E | E2>
+  /** Prepare the owning journal under the authority fence. Failure attempts
+   * guarded rollback; post-commit receipt failures retain existing uncertainty. */
+  readonly journal?: (results: ReadonlyArray<WriteResult | RemoveResult>) => Effect.Effect<void, E>
   readonly committed?: (results: ReadonlyArray<WriteResult | RemoveResult>) => Effect.Effect<void, E>
   readonly rolledBack?: Effect.Effect<void, E>
 }
@@ -179,16 +187,20 @@ const baseLayer = Layer.effect(
       }
     const withTargetLock = (target: Target) => withTargetLocks([target])
 
-    const contentState = (content: Uint8Array): ContentState => ({
+    const contentState = (content: Uint8Array, mode?: number): ContentState => ({
       exists: true,
       bytes: content.byteLength,
       sha256: createHash("sha256").update(content).digest("hex"),
       content,
+      ...(mode === undefined ? {} : { mode }),
     })
 
     const fileState = (target: Target): Effect.Effect<ContentState, FSUtil.Error> =>
-      fs.readFile(target.canonical).pipe(
-        Effect.map(contentState),
+      Effect.gen(function* () {
+        const content = yield* fs.readFile(target.canonical)
+        const info = yield* fs.stat(target.canonical)
+        return contentState(content, info.mode & 0o777)
+      }).pipe(
         Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed({ exists: false } satisfies ContentState)),
       )
 
@@ -199,7 +211,7 @@ const baseLayer = Layer.effect(
     ): Effect.Effect<ContentState, StaleContentError | TargetExistsError> => {
       if (!expected.exists)
         return actual.exists ? Effect.fail(new TargetExistsError({ path: target.canonical })) : Effect.succeed(actual)
-      if (!actual.exists || actual.sha256 !== expected.sha256)
+      if (!actual.exists || actual.sha256 !== expected.sha256 || (expected.mode !== undefined && actual.mode !== expected.mode))
         return Effect.fail(new StaleContentError({ path: target.canonical, sha256: actual.sha256 }))
       return Effect.succeed(actual)
     }
@@ -207,17 +219,29 @@ const baseLayer = Layer.effect(
     const atomicReplace = Effect.fn("FileMutation.atomicReplace")(function* (
       target: Target,
       content: string | Uint8Array,
+      mode?: number,
     ) {
+      const retainedMode = mode ?? (yield* fs.stat(target.canonical).pipe(
+        Effect.map((info) => info.mode & 0o777),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)),
+      ))
       yield* fs.ensureDir(dirname(target.canonical))
       const staged = `${target.canonical}.opencode-stage-${randomUUID()}`
-      yield* typeof content === "string"
-        ? fs.writeFileString(staged, content, { flag: "wx" })
-        : fs.writeFile(staged, content, { flag: "wx" })
-      yield* fs.rename(staged, target.canonical).pipe(Effect.ensuring(fs.remove(staged).pipe(Effect.ignore)))
+      yield* Effect.gen(function* () {
+        yield* typeof content === "string"
+          ? fs.writeFileString(staged, content, { flag: "wx" })
+          : fs.writeFile(staged, content, { flag: "wx" })
+        if (retainedMode !== undefined) {
+          yield* fs.chmod(staged, retainedMode)
+          if (((yield* fs.stat(staged)).mode & 0o777) !== retainedMode)
+            return yield* new FSUtil.FileSystemError({ method: "atomicReplace.mode" })
+        }
+        yield* fs.rename(staged, target.canonical)
+      }).pipe(Effect.ensuring(fs.remove(staged).pipe(Effect.ignore)))
     })
 
     const checkpointState = (state: ContentState): CheckpointState =>
-      state.exists ? { exists: true, bytes: state.bytes, sha256: state.sha256 } : { exists: false }
+      state.exists ? { exists: true, bytes: state.bytes, sha256: state.sha256, mode: state.mode } : { exists: false }
 
     const checkpoint = (target: Target, before: ContentState, after: ContentState): Checkpoint => ({
       target: target.canonical,
@@ -268,7 +292,9 @@ const baseLayer = Layer.effect(
           const current = yield* fs
             .readFile(input.target.canonical)
             .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)))
-          const before: ContentState = current ? contentState(current) : { exists: false }
+          const before: ContentState = current
+            ? contentState(current, (yield* fs.stat(input.target.canonical)).mode & 0o777)
+            : { exists: false }
           yield* fs.writeWithDirs(
             input.target.canonical,
             joinBom(next.text, Boolean(current && hasUtf8Bom(current)) || next.bom),
@@ -306,7 +332,7 @@ const baseLayer = Layer.effect(
           if (!sameBytes(current, input.expected)) {
             return yield* new StaleContentError({ path: input.target.canonical })
           }
-          const before = contentState(current)
+          const before = contentState(current, (yield* fs.stat(input.target.canonical)).mode & 0o777)
           yield* typeof input.content === "string"
             ? fs.writeFileString(input.target.canonical, input.content)
             : fs.writeFile(input.target.canonical, input.content)
@@ -371,9 +397,15 @@ const baseLayer = Layer.effect(
       ),
     )
 
-    const transact = <E = never>(changes: readonly TransactionChange[], hooks?: TransactionHooks<E>) =>
-      withTargetLocks(changes.map((change) => change.target))(
+    const transact = <E = never>(request: readonly TransactionChange[], hooks?: TransactionHooks<E>) => {
+      // Caller-owned targets/bytes cannot retarget locks or change the approved
+      // candidate while preparation and authority hooks await.
+      const changes = structuredClone(request)
+      return withTargetLocks(changes.map((change) => change.target))(
         Effect.gen(function* () {
+          if (changes.some((change) => change.type !== "delete" && change.mode !== undefined &&
+            (!Number.isSafeInteger(change.mode) || change.mode < 0 || change.mode > 0o777)))
+            return yield* new FSUtil.FileSystemError({ method: "transact.mode" })
           const states = yield* Effect.forEach(changes, (change) => fileState(change.target))
           yield* Effect.forEach(
             changes,
@@ -393,6 +425,14 @@ const baseLayer = Layer.effect(
             readonly expected: ExpectedState
           }> = []
           let uncertain: string | undefined
+          const revalidate = (change: TransactionChange, index: number) => Effect.gen(function* () {
+            const before = states[index] ?? { exists: false }
+            if (before.exists && !before.sha256) return yield* new FSUtil.FileSystemError({ method: "transact.preflight" })
+            const actual = yield* fileState(change.target)
+            return yield* requireExpected(change.target, before.exists && before.sha256
+              ? { exists: true, sha256: before.sha256, mode: before.mode }
+              : { exists: false }, actual)
+          })
           const commit = Effect.forEach(
             changes,
             (change, index) =>
@@ -411,35 +451,27 @@ const baseLayer = Layer.effect(
                       Effect.fail(new TargetExistsError({ path: change.target.canonical })),
                     ),
                   )
-                  applied.push({
-                    change,
-                    before,
-                    expected: {
-                      exists: true,
-                      sha256: contentState(
-                        typeof change.content === "string" ? new TextEncoder().encode(change.content) : change.content,
-                      ).sha256!,
-                    },
-                  })
-                  return writeResult(change.target, before, yield* fileState(change.target))
+                  if (change.mode !== undefined) yield* fs.chmod(change.target.canonical, change.mode)
+                  const after = yield* fileState(change.target)
+                  if (change.mode !== undefined && after.mode !== change.mode)
+                    return yield* new FSUtil.FileSystemError({ method: "transact.mode" })
+                  const sha256 = createHash("sha256").update(change.content).digest("hex")
+                  if (after.sha256 !== sha256) return yield* new FSUtil.FileSystemError({ method: "transact.add" })
+                  applied.push({ change, before, expected: { exists: true, sha256, mode: after.mode } })
+                  return writeResult(change.target, before, after)
                 }
                 if (change.type === "delete") {
                   yield* fs.remove(change.target.canonical)
                   applied.push({ change, before, expected: { exists: false } })
                   return removeResult(change.target, before, yield* fileState(change.target))
                 }
-                yield* atomicReplace(change.target, change.content)
-                applied.push({
-                  change,
-                  before,
-                  expected: {
-                    exists: true,
-                    sha256: contentState(
-                      typeof change.content === "string" ? new TextEncoder().encode(change.content) : change.content,
-                    ).sha256!,
-                  },
-                })
-                return writeResult(change.target, before, yield* fileState(change.target))
+                yield* atomicReplace(change.target, change.content, change.mode ?? before.mode)
+                const after = yield* fileState(change.target)
+                const sha256 = createHash("sha256").update(change.content).digest("hex")
+                if (after.sha256 !== sha256 || after.mode !== (change.mode ?? before.mode))
+                  return yield* new FSUtil.FileSystemError({ method: "transact.update" })
+                applied.push({ change, before, expected: { exists: true, sha256, mode: after.mode } })
+                return writeResult(change.target, before, after)
               }).pipe(
                 Effect.catchCause((cause) =>
                   Effect.gen(function* () {
@@ -450,7 +482,7 @@ const baseLayer = Layer.effect(
                         Effect.catchCause(() => Effect.succeed(undefined)),
                       )
                       const before = states[index] ?? { exists: false }
-                      if (!current || current.exists !== before.exists || current.sha256 !== before.sha256)
+                      if (!current || current.exists !== before.exists || current.sha256 !== before.sha256 || current.mode !== before.mode)
                         uncertain = change.target.canonical
                     }
                     return yield* Effect.failCause(cause)
@@ -460,7 +492,9 @@ const baseLayer = Layer.effect(
             { concurrency: 1 },
           )
 
-          const results = yield* commit.pipe(
+          const guarded = Effect.forEach(changes, revalidate, { discard: true }).pipe(
+            Effect.andThen(commit),
+            Effect.tap((results) => hooks?.journal ? hooks.journal(results) : Effect.void),
             Effect.catchCause((cause) =>
               Effect.forEach(
                 applied.toReversed(),
@@ -470,7 +504,7 @@ const baseLayer = Layer.effect(
                     // external change with our older before-image.
                     yield* requireExpected(item.change.target, item.expected, yield* fileState(item.change.target))
                     yield* item.before.exists && item.before.content
-                      ? atomicReplace(item.change.target, item.before.content)
+                      ? atomicReplace(item.change.target, item.before.content, item.before.mode)
                       : fs
                           .remove(item.change.target.canonical)
                           .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.void))
@@ -502,11 +536,12 @@ const baseLayer = Layer.effect(
                 Effect.andThen(Effect.failCause(cause)),
               ),
             ),
+            Effect.tap((results) => hooks?.committed ? hooks.committed(results) : Effect.void),
           )
-          if (hooks?.committed) yield* hooks.committed(results)
-          return results
+          return yield* hooks?.fence ? hooks.fence(guarded) : guarded
         }),
       )
+    }
 
     return Service.of({
       create,

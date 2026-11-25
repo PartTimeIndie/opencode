@@ -2,8 +2,22 @@ import { describe, expect, test } from "bun:test"
 import { createStore } from "solid-js/store"
 import { selectSessionTabStore, selectSessionTabSync } from "./session-tab-sync"
 import { sessionTabStatus, sessionTabUnread } from "./project-avatar-unread"
-import type { ServerSync } from "@/context/server-sync"
-import { latestAssistantSettled, resolveLifecycleStatus, resolveSessionStatus, sessionIsWorking } from "@/utils/session-status"
+import { reconcileSessionStatusSnapshot, type ServerSync } from "@/context/server-sync"
+import {
+  finishSessionActivity,
+  sessionActivity,
+  sessionActivityGenerationSnapshot,
+  sessionActivitySettled,
+  sessionActivityStartedAt,
+  startSessionActivity,
+} from "@/utils/session-activity"
+import {
+  latestAssistantCompletedBefore,
+  latestAssistantSettled,
+  resolveLifecycleStatus,
+  resolveSessionStatus,
+  sessionIsWorking,
+} from "@/utils/session-status"
 import type { TurnCompletionStatus } from "@/utils/session-status"
 
 // Regression coverage for the tab avatar using the same canonical directory store as the
@@ -232,6 +246,49 @@ describe("Solid store reactivity compatibility", () => {
 })
 
 describe("tab avatar lifecycle resolver wiring", () => {
+  test("keeps the spinner running after an idle snapshot at the start of a new turn", () => {
+    const directory = "/tab-avatar-fresh-activity"
+    const sessionID = "ses_fresh_avatar"
+    const startedAt = Date.now()
+    const store = {
+      session_status: { [sessionID]: { type: "busy" } },
+      message: {
+        [sessionID]: [
+          {
+            id: "msg_previous",
+            role: "assistant",
+            finish: "stop",
+            time: { created: startedAt - 10_000, completed: startedAt - 5_000 },
+          },
+        ],
+      },
+      part: { msg_previous: [{ type: "text" }] },
+    } as never
+    startSessionActivity(directory, sessionID, "activity_fresh", { timestamp: startedAt })
+    try {
+      const snapshot = reconcileSessionStatusSnapshot({
+        directory,
+        sessionID,
+        generations: sessionActivityGenerationSnapshot(directory),
+        incoming: { type: "idle" },
+        store,
+      })
+      const settled = sessionActivitySettled(directory, sessionID)
+      const status = resolveLifecycleStatus({
+        activity: sessionActivity(directory, sessionID)?.type,
+        activityTracked: latestAssistantCompletedBefore(store, sessionID, sessionActivityStartedAt(directory, sessionID)),
+        activitySettled: settled,
+        store: snapshot?.type,
+        latestAssistantSettled: latestAssistantSettled(store, sessionID),
+      })
+      expect(
+        resolveSessionStatus({ working: sessionIsWorking(store, sessionID, status, settled), question: false, status }),
+      ).toBe("running")
+    } finally {
+      finishSessionActivity(directory, sessionID, "activity_fresh")
+    }
+  })
+
   test("clears the spinner when store idle and the latest assistant has finished", () => {
     const messages = {
       message: { ses: [{ id: "msg", role: "assistant" as const, finish: "stop", time: { completed: 1 } }] },

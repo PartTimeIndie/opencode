@@ -55,6 +55,22 @@ export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", 
       project.directories({ projectID: ctx.params.projectID }),
     )
 
+    const directoryIcons = Effect.fn("ProjectHttpApi.directoryIcons")(function* () {
+      return yield* svc.directoryIcons()
+    })
+
+    const directoryIcon = Effect.fn("ProjectHttpApi.directoryIcon")(function* (ctx: {
+      payload: Project.DirectoryIconInput
+    }) {
+      return yield* svc.setDirectoryIcon(ctx.payload)
+    })
+
+    const resolve = Effect.fn("ProjectHttpApi.resolve")(function* (ctx: {
+      payload: { directories: readonly string[] }
+    }) {
+      return yield* svc.resolveDirectories(ctx.payload.directories)
+    })
+
     const requireIconResult = Effect.fnUntraced(function* (
       projectID: ProjectV2.ID,
       result: Project.Info | undefined,
@@ -84,5 +100,8 @@ export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", 
       .handle("generateIcon", generateIcon)
       .handle("retryIcon", retryIcon)
       .handle("directories", directories)
+      .handle("directoryIcons", directoryIcons)
+      .handle("directoryIcon", directoryIcon)
+      .handle("resolve", resolve)
   }),
 )

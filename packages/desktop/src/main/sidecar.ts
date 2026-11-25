@@ -1,5 +1,7 @@
 import * as http from "node:http"
 import * as tls from "node:tls"
+import { createShutdownCoordinator } from "./shutdown"
+import { startSidecarDiagnostics, type SidecarActivityUpdate, type SidecarDiagnostic } from "./sidecar-diagnostics"
 
 type NodeHttpWithEnvProxy = typeof http & {
   setGlobalProxyFromEnv: () => void
@@ -16,6 +18,7 @@ type StartCommand = {
   port: number
   password: string
   userDataPath: string
+  recovery?: { ownerID: string; previousOwners: string[] }
 }
 
 type StopCommand = { type: "stop" }
@@ -24,6 +27,9 @@ type SidecarCommand = StartCommand | StopCommand
 type SidecarMessage =
   | { type: "ready" }
   | { type: "stopped" }
+  | { type: "execution-owner"; ownerID: string }
+  | { type: "diagnostic"; sample: SidecarDiagnostic }
+  | { type: "activity"; update: SidecarActivityUpdate }
   | { type: "error"; error: { message: string; stack?: string } }
 
 type ParentPort = {
@@ -37,6 +43,18 @@ type Listener = {
 
 const parentPort = getParentPort()
 let listener: Listener | undefined
+let starting = false
+let stopping = false
+let stopDiagnostics: (() => void) | undefined
+const shutdown = createShutdownCoordinator({
+  // Desktop keeps long-lived event streams open. Close their connections while
+  // the listener scope drains so an ordinary Quit can finish without force.
+  cleanup: async () => { await listener?.stop(true) },
+  onCleanupError: (error) => {
+    stopping = false
+    parentPort.postMessage({ type: "error", error: serializeError(error) })
+  },
+})
 
 parentPort.on("message", (event) => {
   const command = parseCommand(event.data)
@@ -49,12 +67,20 @@ parentPort.on("message", (event) => {
 })
 
 async function start(command: StartCommand) {
+  if (starting || stopping) return
+  starting = true
+  stopDiagnostics = startSidecarDiagnostics((sample) => parentPort.postMessage({ type: "diagnostic", sample }))
   try {
     prepareSidecarEnv(command.password, command.userDataPath)
     ensureLoopbackNoProxy()
     useSystemCertificates()
     useEnvProxy()
-    const { Server } = await import("virtual:opencode-server")
+    const { Server, DesktopRecovery, CrashActivity } = await import("virtual:opencode-server")
+    if (stopping) return
+    CrashActivity.configure((update) => parentPort.postMessage({ type: "activity", update }))
+    if (command.recovery) DesktopRecovery.configure(command.recovery, (ownerID) => {
+      parentPort.postMessage({ type: "execution-owner", ownerID })
+    })
 
     listener = await Server.listen({
       port: command.port,
@@ -65,19 +91,21 @@ async function start(command: StartCommand) {
     })
     parentPort.postMessage({ type: "ready" })
   } catch (error) {
+    stopDiagnostics?.()
     parentPort.postMessage({ type: "error", error: serializeError(error) })
     setImmediate(() => process.exit(1))
   }
 }
 
 async function stop() {
-  try {
-    await listener?.stop()
-  } finally {
+  if (stopping) return
+  stopping = true
+  stopDiagnostics?.()
+  await shutdown.request(() => {
     listener = undefined
     parentPort.postMessage({ type: "stopped" })
     setImmediate(() => process.exit(0))
-  }
+  })
 }
 
 function prepareSidecarEnv(password: string, userDataPath: string) {
@@ -136,12 +164,16 @@ function parseCommand(value: unknown): SidecarCommand | undefined {
   if (typeof command.port !== "number") return
   if (typeof command.password !== "string") return
   if (typeof command.userDataPath !== "string") return
+  if (command.recovery && (typeof command.recovery.ownerID !== "string" ||
+    !Array.isArray(command.recovery.previousOwners) ||
+    !command.recovery.previousOwners.every((id) => typeof id === "string"))) return
   return {
     type: "start",
     hostname: command.hostname,
     port: command.port,
     password: command.password,
     userDataPath: command.userDataPath,
+    recovery: command.recovery,
   }
 }
 

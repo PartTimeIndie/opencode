@@ -17,6 +17,12 @@ const modes = [
   "final-exhausted",
   "auth-abort",
   "auth-chain",
+  "chain-retry-success",
+  "chain-retry-fallback",
+  "chain-empty-retry",
+  "chain-empty-filter",
+  "chain-retry-stop",
+  "chain-empty-stop",
   "quota-abort",
   "auth-idle",
   "quota-idle",
@@ -205,6 +211,12 @@ async function probe(mode: (typeof modes)[number]) {
     const chain =
       mode === "chain-tool" ||
       mode === "auth-chain" ||
+      mode === "chain-retry-success" ||
+      mode === "chain-retry-fallback" ||
+      mode === "chain-empty-retry" ||
+      mode === "chain-empty-filter" ||
+      mode === "chain-retry-stop" ||
+      mode === "chain-empty-stop" ||
       mode === "structured-chain" ||
       mode === "empty-error-budget" ||
       mode === "catalog-budget"
@@ -301,6 +313,23 @@ async function probe(mode: (typeof modes)[number]) {
                 },
               )
             }
+            if ((mode === "chain-retry-stop" || mode === "chain-empty-stop") && requests.length === 2)
+              return new Response(new ReadableStream({ start() {} }), { headers })
+            if (mode === "chain-retry-stop")
+              return new Response(frame({ type: "error", message: "temporary provider outage", code: "server_error" }), { headers })
+            if (mode === "chain-empty-stop") return new Response(finish, { headers })
+            if (mode === "chain-empty-retry" || mode === "chain-empty-filter")
+              return new Response(requests.length === 1 ? finish : mode === "chain-empty-filter"
+                ? frame({ type: "response.output_text.delta", item_id: "blocked", delta: "Partial" }) +
+                  frame({ type: "response.incomplete", response: { incomplete_details: { reason: "content_filter" } } })
+                : recovered, { headers })
+            if (mode === "chain-retry-success" || mode === "chain-retry-fallback")
+              return new Response(
+                requests.length === 1 || (mode === "chain-retry-fallback" && requests.length === 2)
+                  ? frame({ type: "error", message: "temporary provider outage", code: "server_error" })
+                  : recovered,
+                { headers },
+              )
             if (mode === "raw-retry-deferred")
               return new Response('{"error":{"message":"rate limit fixture","type":"rate_limit_error"}}', {
                 status: 429,
@@ -857,9 +886,13 @@ async function probe(mode: (typeof modes)[number]) {
       expect(stepEndings).toHaveLength(0)
       yield* Deferred.succeed(releaseHook, undefined)
     }
-    if (mode === "interrupted") {
+    if (mode === "interrupted" || mode === "chain-retry-stop" || mode === "chain-empty-stop") {
       yield* Effect.gen(function* () {
-        while (requests.length === 0 || textDeltas.length === 0) yield* Effect.sleep(10)
+        if (mode === "interrupted") {
+          while (requests.length === 0 || textDeltas.length === 0) yield* Effect.sleep(10)
+        } else {
+          while (requests.length < 2) yield* Effect.sleep(10)
+        }
         yield* executionService.interrupt(id)
       }).pipe(Effect.timeout(15_000))
     }
@@ -901,6 +934,12 @@ async function probe(mode: (typeof modes)[number]) {
       "final-exhausted": { activity: "failed", settled: "error", requests: 7, completed: 0, failed: 1, tools: 1 },
       "auth-abort": { activity: "failed", settled: "error", requests: 1, completed: 0, failed: 1, tools: 0 },
       "auth-chain": { activity: "completed", settled: "completed", requests: 2, completed: 1, failed: 0, tools: 0 },
+      "chain-retry-success": { activity: "completed", settled: "completed", requests: 2, completed: 1, failed: 0, tools: 0 },
+      "chain-retry-fallback": { activity: "completed", settled: "completed", requests: 3, completed: 1, failed: 0, tools: 0 },
+      "chain-empty-retry": { activity: "completed", settled: "completed", requests: 2, completed: 1, failed: 0, tools: 0 },
+      "chain-empty-filter": { activity: "failed", settled: "error", requests: 2, completed: 0, failed: 1, tools: 0 },
+      "chain-retry-stop": { activity: "interrupted", settled: "interrupted", requests: 2, completed: 0, failed: 0, tools: 0 },
+      "chain-empty-stop": { activity: "interrupted", settled: "interrupted", requests: 2, completed: 0, failed: 0, tools: 0 },
       "quota-abort": { activity: "failed", settled: "error", requests: 1, completed: 0, failed: 1, tools: 0 },
       "auth-idle": { activity: "failed", settled: "error", requests: 1, completed: 0, failed: 1, tools: 0 },
       "quota-idle": { activity: "failed", settled: "error", requests: 1, completed: 0, failed: 1, tools: 0 },
@@ -1144,6 +1183,17 @@ async function probe(mode: (typeof modes)[number]) {
       expect(switches).toHaveLength(1)
       expect(retried).toEqual([])
       expect(JSON.parse(requests[1]).model).toBe("fallback")
+    }
+    if (["chain-retry-success", "chain-retry-fallback", "chain-empty-retry", "chain-empty-filter", "chain-retry-stop", "chain-empty-stop"].includes(mode)) {
+      expect(retried).toEqual([1])
+      expect(switches).toHaveLength(mode === "chain-retry-fallback" ? 1 : 0)
+      expect(requests.map((request) => JSON.parse(request).model)).toEqual(
+        mode === "chain-retry-fallback" ? ["fixture", "fixture", "fallback"] : ["fixture", "fixture"],
+      )
+      if (mode === "chain-empty-filter") {
+        expect(JSON.stringify(stepFailures)).toContain("provider.content-policy")
+        expect(rows[0].last_error).toContain("content filter")
+      } else expect(stepFailures).toEqual([])
     }
     if (["chain-tool", "same-tool", "patch-tool", "abort-tool", "final-partial"].includes(mode)) {
       expect(successfulTools).toHaveLength(1)

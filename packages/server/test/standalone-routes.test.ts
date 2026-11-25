@@ -5,10 +5,10 @@ import path from "node:path"
 import { Layer } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 
-test("standalone routes bind activity and keep persistent tools authenticated and Location-scoped", async () => {
+for (const enabled of [false, true]) test(`standalone routes bind activity and tools, not legacy orchestration (enabled=${enabled})`, async () => {
   if (process.env.OPENCODE_STANDALONE_ROUTES_TEST === "1") return probe()
   const root = await mkdtemp(path.join(os.tmpdir(), "opencode-standalone-routes-"))
-  const child = Bun.spawn([process.execPath, "test", import.meta.path], {
+  const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", `enabled=${enabled}`], {
     cwd: root,
     env: {
       ...process.env,
@@ -17,7 +17,7 @@ test("standalone routes bind activity and keep persistent tools authenticated an
       OPENCODE_DB: path.join(root, "test.db"),
       OPENCODE_CONFIG_DIR: path.join(root, "config"),
       OPENCODE_CONFIG: "",
-      OPENCODE_CONFIG_CONTENT: "{}",
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({ experimental: { session_orchestrator: enabled } }),
       OPENCODE_DISABLE_PROJECT_CONFIG: "1",
       OPENCODE_DISABLE_MODELS_FETCH: "1",
       OPENCODE_DEFER_BACKGROUND_STARTUP: "1",
@@ -142,6 +142,14 @@ async function probe() {
       if (suffix === "/visibility") expect((await result.json()).hidden).toBe(true)
     }
     expect(db.query("SELECT id FROM surface_tool ORDER BY id").all()).toEqual([{ id: "sft_routes_1" }])
+    const base = "/api/session/ses_routes_0/orchestrator"
+    // Old configuration cannot restore the removed execution/control API.
+    for (const [suffix, method] of [["", "GET"], ["", "PUT"], ["/operate", "POST"],
+      ["/control", "POST"], ["/retire", "POST"]] as const) {
+      const result = await request(base + suffix, method, method === "GET" ? undefined : { expectedRevision: 0 })
+      expect(result.status, await result.clone().text()).toBe(404)
+    }
+    expect(db.query("SELECT * FROM session_orchestrator").all()).toEqual([])
   } finally {
     await server.dispose()
   }

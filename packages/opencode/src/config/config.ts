@@ -21,9 +21,12 @@ import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, S
 
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { ConfigFileWriter } from "@opencode-ai/core/config/file-writer"
+import { ConfigFileTarget } from "@opencode-ai/core/config/file-target"
 import { containsPath, type InstanceContext } from "../project/instance-context"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
+import { mergeTools, Tools } from "@opencode-ai/core/config/agent"
 import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
@@ -38,7 +41,7 @@ import { Npm } from "@opencode-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { pluginDependency } from "./dependency"
 
-// Structured tool policies are atomic; unrelated config fields still deep-merge.
+// Explicit lists replace; inheritance carries sparse overrides across config scopes.
 // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
 function mergeConfig(target: Info, source: Info): Info {
   const merged = mergeDeep(target, source) as Info
@@ -53,11 +56,15 @@ function mergeConfig(target: Info, source: Info): Info {
             ? ConfigParse.schema(ConfigAgentV1.Info, { tools: agent.options.__agentTools }, `agent:${id}:tools`).tools
             : undefined
       if (!tools || !("mode" in tools)) continue
-      // A tool policy is one contract, not a patch to the previous allowlist.
-      // Keep its normalized V1 copy atomic too: Agent.Service reads that copy.
+      const previous = target[key]?.[id]
+      const inherited = previous?.tools && "mode" in previous.tools ? previous.tools : previous?.options?.__agentTools
+      const policy = ConfigParse.schema(ConfigAgentV1.Info, { tools: mergeTools(
+        inherited ? Schema.decodeUnknownSync(Tools)(inherited) : undefined,
+        Schema.decodeUnknownSync(Tools)(tools),
+      ) }, `agent:${id}:tools`).tools
       merged[key] = {
         ...merged[key],
-        [id]: { ...current, tools, options: { ...current.options, __agentTools: tools } },
+        [id]: { ...current, tools: policy, options: { ...current.options, __agentTools: policy } },
       }
     }
   }
@@ -227,13 +234,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Co
 export const use = serviceUse(Service)
 
 function globalConfigFile() {
-  const candidates = ["opencode.jsonc", "opencode.json", "config.json"].map((file) =>
-    path.join(Global.Path.config, file),
-  )
-  for (const file of candidates) {
-    if (existsSync(file)) return file
-  }
-  return candidates[0]
+  return ConfigFileTarget.global(Global.Path.config)
 }
 
 function patchJsonc(input: string, patch: unknown, path: string[] = []): string {
@@ -287,10 +288,95 @@ function mergeGlobalConfig(target: Info, source: Info) {
   return merged
 }
 
+type SkillPolicyPatch = NonNullable<ConfigV1.UpdateInfo["skill_policy"]>
+
+type SkillEntryStored = { visible?: boolean; invocation?: "allow" | "ask" | "manual" | "deny" }
+
+function cleanSkillPolicyEntries(
+  stored: Record<string, SkillEntryStored> | undefined,
+  patch: Record<string, { visible?: boolean | null; invocation?: "allow" | "ask" | "manual" | "deny" | null }>,
+): Record<string, SkillEntryStored> {
+  const entries: Record<string, SkillEntryStored> = { ...(stored ?? {}) }
+  for (const [name, entry] of Object.entries(patch)) {
+    if (!isRecord(entry)) continue
+    const current: SkillEntryStored = { ...entries[name] }
+    const visible = entry.visible
+    if (visible === null) delete current.visible
+    else if (visible !== undefined) current.visible = visible
+    const invocation = entry.invocation
+    if (invocation === null) delete current.invocation
+    else if (invocation !== undefined) current.invocation = invocation
+    if ("visible" in current || "invocation" in current) entries[name] = current
+    else delete entries[name]
+  }
+  return entries
+}
+
+/**
+ * Apply a skill_policy update patch. Null deletes exactly that stored field;
+ * empty entries are removed. The result never contains null.
+ */
+export function applySkillPolicyPatch(existing: Info, patch: SkillPolicyPatch | undefined): Info {
+  if (!patch) return existing
+  let next = existing
+  if (patch.global) {
+    const stored = next.skill_invocation ?? {}
+    const entries = cleanSkillPolicyEntries(stored.entries, patch.global)
+    const skillInvocation = { ...stored }
+    if (Object.keys(entries).length === 0) delete skillInvocation.entries
+    else skillInvocation.entries = entries
+    next = { ...next, skill_invocation: skillInvocation }
+  }
+  if (patch.agents) {
+    const agents = { ...(next.agent ?? {}) }
+    for (const [id, skills] of Object.entries(patch.agents)) {
+      const storedAgent = agents[id]
+      if (!isRecord(storedAgent)) continue
+      const agent = { ...storedAgent }
+      const cleaned = cleanSkillPolicyEntries(agent.skills, skills)
+      if (Object.keys(cleaned).length === 0) delete agent.skills
+      else agent.skills = cleaned
+      agents[id] = agent
+    }
+    next = { ...next, agent: agents }
+  }
+  return next
+}
+
+function jsonEquals(left: unknown, right: unknown) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
+}
+
+/**
+ * Rewrite only the skill-policy subtrees in JSONC text via atomic subtree
+ * replacement, preserving comments and formatting everywhere else. The parent
+ * object is always written as a cleaned (null-free) value, so field-level
+ * deletions take effect without storing null.
+ */
+function applySkillPolicyJsonc(input: string, before: Info, final: Info): string {
+  let result = input
+  if (!jsonEquals(before.skill_invocation, final.skill_invocation)) {
+    const edits = modify(result, ["skill_invocation"], final.skill_invocation ?? {}, {
+      formattingOptions: { insertSpaces: true, tabSize: 2 },
+    })
+    result = applyEdits(result, edits)
+  }
+  for (const [id, agent] of Object.entries(final.agent ?? {})) {
+    const beforeAgent = before.agent?.[id]
+    if (jsonEquals(beforeAgent?.skills, agent.skills)) continue
+    const edits = modify(result, ["agent", id], agent, {
+      formattingOptions: { insertSpaces: true, tabSize: 2 },
+    })
+    result = applyEdits(result, edits)
+  }
+  return result
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
+    const writer = yield* ConfigFileWriter.Service.pipe(Effect.provide(ConfigFileWriter.layer))
     const authSvc = yield* Auth.Service
     const accountSvc = yield* Account.Service
     const env = yield* Env.Service
@@ -794,11 +880,13 @@ export const layer = Layer.effect(
 
     const updateBody = Effect.fn("Config.update.write")(function* (config: Info) {
       const dir = yield* InstanceState.directory
-      const file = path.join(dir, ".opencode", "opencode.json")
-      const existing = yield* loadFile(file)
-      yield* fs
-        .writeWithDirs(file, JSON.stringify(writable(mergeConfig(existing, normalizeLegacyModes(config))), null, 2))
-        .pipe(Effect.orDie)
+      const file = ConfigFileTarget.project(dir)
+      yield* writer.update({ file }, (current) => Effect.gen(function* () {
+        const existing = yield* loadFile(file)
+        const text = patchJsonc(current.text ?? "{}", writable(mergeConfig(existing, normalizeLegacyModes(config))))
+        ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(text, file), file)
+        return { text, value: undefined }
+      })).pipe(Effect.orDie)
       yield* ScopedCache.invalidate(state.cache, dir)
     })
 
@@ -813,43 +901,40 @@ export const layer = Layer.effect(
 
     const updateGlobalBody = Effect.fn("Config.updateGlobal.write")(function* (config: UpdateInfo) {
       const file = globalConfigFile()
-      const before = (yield* readConfigFile(file)) ?? "{}"
-      // JSON bodies cannot carry undefined, so clients unset the default with
-      // null; the stored key must be deleted, not merged, or the old default
-      // would survive every clear.
-      const { default_model_chain: requestedDefault, ...rest } = config
-      const clearDefault = requestedDefault === null
-      // A PATCH without the key must not touch the stored default: JSON bodies
-      // cannot carry undefined, so an absent key arrives here as undefined and
-      // only null is the explicit clear. Spreading an undefined value into the
-      // merge patch overwrote the stored default on every unrelated global
-      // update.
-      const patch = writableGlobal({
-        ...rest,
-        ...(requestedDefault === undefined ? {} : { default_model_chain: clearDefault ? undefined : requestedDefault }),
-      })
+      const saved = yield* writer.update({ file }, (current) => Effect.sync(() => {
+        const before = current.text ?? "{}"
+        // JSON bodies cannot carry undefined, so clients unset the default with
+        // null; the stored key must be deleted, not merged, or the old default
+        // would survive every clear.
+        const { default_model_chain: requestedDefault, skill_policy: skillPolicy, ...rest } = config
+        const clearDefault = requestedDefault === null
+        // An absent key must not touch the stored default on unrelated saves.
+        const patch = writableGlobal({
+          ...rest,
+          ...(requestedDefault === undefined ? {} : { default_model_chain: clearDefault ? undefined : requestedDefault }),
+        })
 
-      let next: Info
-      let changed: boolean
-      if (!file.endsWith(".jsonc")) {
-        const existing = writableGlobal(ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file))
-        const merged = writableGlobal(mergeGlobalConfig(existing, patch))
-        if (clearDefault) delete merged.default_model_chain
-        const serialized = JSON.stringify(merged, null, 2)
-        changed = serialized !== before
-        if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
-        next = merged
-      } else {
+        if (!file.endsWith(".jsonc")) {
+          const document = ConfigParse.jsonc(before, file)
+          const existing = writableGlobal(ConfigParse.schema(ConfigV1.Info, document, file))
+          const merged = writableGlobal(applySkillPolicyPatch(mergeGlobalConfig(existing, patch), skillPolicy))
+          if (clearDefault) delete merged.default_model_chain
+          // Older loaders ignore newer keys, but a settings save must not erase
+          // them. Known keys still follow their normal clear/migration rules.
+          const unknown = isRecord(document) ? Object.fromEntries(Object.entries(document).filter(([key]) => !(key in ConfigV1.Info.fields))) : {}
+          return { text: JSON.stringify({ ...unknown, ...merged }, null, 2), value: merged }
+        }
         const updated = patchJsonc(before, patch)
-        next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
-        changed = updated !== before
-        if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
-      }
+        const parsedUpdated = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
+        const final = applySkillPolicyPatch(parsedUpdated, skillPolicy)
+        const withPolicy = skillPolicy ? applySkillPolicyJsonc(updated, parsedUpdated, final) : updated
+        return { text: withPolicy, value: ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(withPolicy, file), file) }
+      })).pipe(Effect.orDie)
 
-      if (changed) {
+      if (saved.changed) {
         yield* invalidate()
       }
-      return { info: next, changed }
+      return { info: saved.value, changed: saved.changed }
     })
 
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: UpdateInfo) {
@@ -879,6 +964,6 @@ export const defaultLayer = layer.pipe(
   Layer.provide(FetchHttpClient.layer),
 )
 
-export const node = LayerNode.make(layer, [FSUtil.node, Auth.node, Account.node, Env.node, Npm.node, httpClient])
+export const node = LayerNode.make(layer, [FSUtil.node, Auth.node, Account.node, Env.node, Npm.node, httpClient, EffectFlock.node])
 
 export * as Config from "./config"

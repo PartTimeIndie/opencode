@@ -19,6 +19,7 @@ import {
   type ProviderErrorEvent,
   type ProviderOptions,
   ToolDefinition,
+  StructuredJsonSubset,
   type ToolChoice,
 } from "@opencode-ai/llm"
 import { and, eq } from "drizzle-orm"
@@ -33,7 +34,6 @@ import {
   Layer,
   Option,
   Schema,
-  SchemaRepresentation,
   Semaphore,
   Stream,
 } from "effect"
@@ -44,6 +44,7 @@ import { SessionResume } from "../resume"
 import { SessionCompaction, SummaryFailed } from "../compaction"
 import { Catalog } from "../../catalog"
 import { CapabilityLease } from "../../capability/lease"
+import { SkillV2 } from "../../skill"
 import { Config } from "../../config"
 import { ConfigVision } from "../../config/vision"
 import { ConfigOptimization } from "../../config/optimization"
@@ -63,6 +64,7 @@ import { ProviderV2 } from "../../provider"
 import { QuestionV2 } from "../../question"
 import { QuestionTable } from "../../question/sql"
 import { Perf } from "../../observability/perf"
+import { CrashActivity } from "../../observability/crash-activity"
 import { SystemContext } from "../../system-context/index"
 import { SystemContextRegistry } from "../../system-context/registry"
 import { SkillGuidance } from "../../skill/guidance"
@@ -73,23 +75,30 @@ import { Snapshot } from "../../snapshot"
 import { ToolRegistry } from "../../tool/registry"
 import { ToolOutputStore } from "../../tool-output-store"
 import { ContentStore } from "../../content-store"
+import { isArchiveAttachment } from "../archive-attachment"
 import { Token } from "../../util/token"
 import { SkillCatalog } from "../../skill/catalog"
 import { ContextBudget } from "../../util/context-budget"
 import { SessionContextEpoch } from "../context-epoch"
+import { DelegationPreferences } from "../delegation-preferences"
 import { SessionEvent } from "../event"
+import { SessionExecutionOwner } from "../execution/owner"
+import { StructuredOutputAttempt } from "../structured-output-attempt"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
 import { SessionMessage } from "../message"
 import { FileAttachment } from "../prompt"
 import { SessionSchema } from "../schema"
 import { SessionHostContext } from "../host-context"
+import { LegacyDelegationGuard } from "../legacy-delegation/guard"
+import { WorkspaceCheckout } from "../workspace/checkout"
 import { SessionStore } from "../store"
 import { SessionContextEpochTable, SessionTable } from "../sql"
 import { SessionToolCancellation } from "../tool-cancellation"
 import { SessionTodo } from "../todo"
 import { SessionTurnContinuation } from "../turn-continuation"
 import { providerHeaders } from "../provider-headers"
+import { ProviderError } from "../provider-error"
 import {
   providerStreamIdleTimeouts,
   withProviderStreamAbortNormalization,
@@ -110,7 +119,7 @@ import { media, modelSupportsFile, toLLMMessages, type ImageInputCapabilities } 
 import { providerFacingRequestTools } from "./tool-compatibility"
 import { VisionDelegation } from "./vision-delegation"
 import { CircuitBreaker } from "../circuit-breaker"
-import { nextModel as nextChainModel, configuredModelRef } from "./model-chain"
+import { nextModel as nextChainModel, configuredModelRef, shouldRetryChainStep } from "./model-chain"
 import { McpTool } from "../../mcp/tool"
 
 /**
@@ -285,6 +294,7 @@ export const layer = Layer.effect(
     const permission = yield* PermissionV2.Service
     const tools = yield* ToolRegistry.Service
     const capabilityLeases = Option.getOrUndefined(yield* Effect.serviceOption(CapabilityLease.Service))
+    const skillService = Option.getOrUndefined(yield* Effect.serviceOption(SkillV2.Service))
     const mcpTools = Option.getOrUndefined(yield* Effect.serviceOption(McpTool.Service))
     const resources = yield* ToolOutputStore.Service
     const plugin = Option.getOrUndefined(yield* Effect.serviceOption(PluginV2.Service))
@@ -320,6 +330,42 @@ export const layer = Layer.effect(
       if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
       return session
     })
+    const ordinaryQuestionsDisabled = Effect.fn("SessionRunner.ordinaryQuestionsDisabled")(
+      function* (session: SessionSchema.Info) {
+        if (session.agentPolicy?.source.type !== "task") return false
+        // The dispatch source session is the preferences owner, not an arbitrary parent.
+        const parent = yield* store.get(SessionSchema.ID.make(session.agentPolicy.source.sessionID))
+        if (!parent) return false
+        const stored = parent.metadata?.[DelegationPreferences.METADATA_KEY]
+        // A mirror child cannot reliably read its Main location's document
+        // rules from here; unreadable source configuration keeps human contact
+        // instead of muting the child, so only same-location documents apply.
+        const documents = Location.same(parent.location, location)
+          ? yield* config.entries({ refresh: true }).pipe(Effect.option)
+          : Option.none()
+        const configured = Option.isNone(documents)
+          ? []
+          : DelegationPreferences.documentLayers(documents.value)
+        // Only an affirmative task > session > document resolution refuses the
+        // question. Unreadable state or config keeps human contact instead of
+        // silently muting the child; permissions and host consent are unaffected.
+        if (stored === undefined)
+          return DelegationPreferences.resolveLayers({ layers: configured, topics: [], candidates: [] })
+            .ordinaryQuestions === false
+        const state = yield* Schema.decodeUnknownEffect(DelegationPreferences.State)(stored).pipe(Effect.option)
+        if (Option.isNone(state)) return false
+        const task = state.value.tasks[session.id]
+        return DelegationPreferences.resolveLayers({
+          layers: [
+            ...(task ? [{ scope: "task" as const, value: task }] : []),
+            { scope: "session" as const, value: state.value.session },
+            ...configured,
+          ],
+          topics: [],
+          candidates: [],
+        }).ordinaryQuestions === false
+      },
+    )
     const compaction = SessionCompaction.make({
       events,
       llm,
@@ -380,6 +426,7 @@ export const layer = Layer.effect(
           return
         }
       }),
+      commandNames: SkillV2.commandNamesFrom(skillService),
     })
     const modelSwitchContext = Effect.fn("SessionRunner.modelSwitchContext")(function* (input: {
       readonly sessionID: SessionSchema.ID
@@ -493,6 +540,7 @@ export const layer = Layer.effect(
       const output = Schema.decodeUnknownOption(SurfaceTool.BlockingOutput)({
         mode: "blocking",
         answers: saved.answers,
+        answerSource: saved.answer_source,
       })
       if (Option.isNone(output) || output.value.answers.length !== saved.request.questions.length) return false
       const bounded = yield* resources.bound({
@@ -551,7 +599,7 @@ export const layer = Layer.effect(
       }
     })
 
-    const awaitToolFibers = (fibers: FiberSet.FiberSet<void, ToolOutputStore.Error>) =>
+    const awaitToolFibers = (fibers: FiberSet.FiberSet<void, ToolOutputStore.Error | LegacyDelegationGuard.Blocked | WorkspaceCheckout.Blocked>) =>
       Effect.raceFirst(FiberSet.join(fibers), FiberSet.awaitEmpty(fibers))
 
     // Match V1: declining a permission prompt halts the loop instead of becoming model-facing tool output.
@@ -603,7 +651,7 @@ export const layer = Layer.effect(
     type PrepareLLMRequestInput = (
       | {
           readonly purpose: "session"
-          readonly hostSession: Pick<SessionSchema.Info, "id" | "parentID">
+          readonly hostSession: Pick<SessionSchema.Info, "id" | "parentID" | "agentPolicy">
         }
       | { readonly purpose: "auxiliary" }
     ) & {
@@ -613,10 +661,12 @@ export const layer = Layer.effect(
       readonly system: ReadonlyArray<string>
       readonly messages: ReadonlyArray<Message>
       readonly tools: ReadonlyArray<ToolDefinition>
+      readonly retainedSchemaNotice?: string
       readonly toolChoice?: ToolChoice.Input
       readonly generation?: GenerationOptionsFields
       readonly providerOptions?: ProviderOptions
       readonly headers?: Readonly<Record<string, string>>
+      readonly affinity?: string
       readonly requestID?: string
       readonly body?: Readonly<Record<string, unknown>>
       readonly message?: unknown
@@ -691,6 +741,7 @@ export const layer = Layer.effect(
         ...providerHeaders({
           provider: String(input.model.provider),
           sessionID: input.sessionID,
+          affinity: input.affinity,
           requestID: input.requestID,
           projectID: location.project.id,
         }),
@@ -713,13 +764,20 @@ export const layer = Layer.effect(
       if (input.timings) input.timings.headers_hook_ms = elapsed(headersHookStarted)
       return LLM.request({
         model: input.model,
-        // Bind identity after plugin transforms, from the session read by this runner.
+        // Bind identity after plugin transforms. Supported routes keep the shared
+        // prefix independent of the host Session; other chats retain their old layout.
         system: [
           ...systemOutput.system,
-          ...(input.purpose === "session" ? [SessionHostContext.render(input.hostSession)] : []),
+          ...(input.purpose === "session" && input.model.route.runtimeContext !== "late-system"
+            ? [SessionHostContext.render(input.hostSession)]
+            : []),
         ]
           .filter((part) => part.length > 0)
           .map(SystemPart.make),
+        runtimeContext:
+          input.purpose === "session" && input.model.route.runtimeContext === "late-system"
+            ? [SystemPart.make([SessionHostContext.render(input.hostSession, location.directory), input.retainedSchemaNotice].filter(Boolean).join("\n"))]
+            : undefined,
         messages: messageOutput.messages,
         tools: input.tools,
         toolChoice: input.toolChoice,
@@ -779,6 +837,13 @@ export const layer = Layer.effect(
       const toolOutputBudget = { remaining: ToolOutputStore.MAX_PROVIDER_TOTAL_PREVIEW_BYTES }
       const materializeFile = Effect.fn("SessionRunner.materializeAttachment")(function* (file: FileAttachment) {
         if (!file.uri.startsWith(ContentStore.URI_PREFIX)) return file
+        // An opted-in archive becomes a bounded text manifest, not provider media.
+        if (file.unpack && isArchiveAttachment(file))
+          return yield* contentStore.materialize({
+            file,
+            sessionID,
+            maxBytes: ContentStore.MAX_ATTACHMENT_BYTES,
+          })
         const located = yield* contentStore.locate({ uri: file.uri, sessionID })
         if (!located)
           return yield* new ContentStore.StorageError({
@@ -1169,6 +1234,8 @@ export const layer = Layer.effect(
         readonly continuation?: SessionTurnContinuation.Info
       },
     ) {
+      yield* LegacyDelegationGuard.assertRunner(db, sessionID)
+      yield* WorkspaceCheckout.assertRunner(db, sessionID)
       const recoverOverflow = options?.recoverOverflow
       const providerRecovery = options?.providerRecovery ?? SessionResume.recoveryBudget()
       let continuation = options?.continuation ?? (yield* SessionTurnContinuation.pending(db, sessionID))
@@ -1230,6 +1297,25 @@ export const layer = Layer.effect(
       if (!Location.same(ready.location, location)) return yield* Effect.interrupt
       if ((yield* agents.select(ready.agent)).id !== preflightAgent.id || !sameModel(ready.model, initial.model))
         return yield* Effect.die(rebuildPreparedTurn(promotion))
+      // A session that never chose an agent runs on the default selection resolved
+      // per turn. Scheduled prompts and direct REST sessions arrive without one, and
+      // an unpersisted selection permanently fails the crash guard's saved-selection
+      // check. Persisting the adopted agent through AgentSwitched — before this
+      // turn's promotion — keeps the session row on the regular selection contract;
+      // the rebuild reloads the persisted ref.
+      if (!ready.agent && preflightAgent.info) {
+        yield* events.publish(SessionEvent.AgentSwitched, {
+          sessionID: ready.id,
+          messageID: SessionMessage.ID.create(),
+          timestamp: yield* DateTime.now,
+          agent: preflightAgent.id,
+        })
+        yield* Effect.logWarning("session runner adopted the default agent for a session without a persisted selection", {
+          sessionID: ready.id,
+          agent: preflightAgent.id,
+        })
+        return yield* Effect.die(rebuildPreparedTurn(promotion))
+      }
       let needsContinuation = false
       let toolBudgetExceeded = false
       let invalidToolInput = false
@@ -1273,7 +1359,7 @@ export const layer = Layer.effect(
             ? preinitialized
             : undefined
       assemblyTimings.context_epoch_ms += elapsed(initializedStarted)
-      const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
+      const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error | LegacyDelegationGuard.Blocked | WorkspaceCheckout.Blocked>()
       const clearToolFibers = FiberSet.clear(toolFibers)
       const awaitAllToolFibers = awaitToolFibers(toolFibers)
       const questionDismissed = yield* Deferred.make<void>()
@@ -1463,6 +1549,11 @@ export const layer = Layer.effect(
       const loadedEntries =
         cachedHistory?.entries ?? (yield* SessionHistory.entriesForRunner(db, session.id, system.baselineSeq))
       const historyLoadMs = cachedHistory ? 0 : Date.now() - historyLoadStarted
+      const latestUserEntry = loadedEntries.findLast((entry) => entry.message.type === "user")
+      const commandInput = latestUserEntry && !loadedEntries.some((entry) =>
+        entry.seq > latestUserEntry.seq && entry.message.type === "assistant")
+        ? yield* SessionInput.find(db, latestUserEntry.message.id) : undefined
+      const subtask = commandInput?.prompt.subtask
       const historyBoundStarted = performance.now()
       const historyLimit = SessionCompaction.runnerHistoryTokenLimit(model)
       const boundedHistory = SessionCompaction.boundRunnerHistory(loadedEntries, historyLimit, model)
@@ -1475,7 +1566,7 @@ export const layer = Layer.effect(
         generation: agentRequest?.generation,
       })
       if (
-        historyEstimateTokens > historyLimit &&
+        !subtask && historyEstimateTokens > historyLimit &&
         (yield* compaction.compactAfterOverflow({
           sessionID: session.id,
           entries: loadedEntries,
@@ -1495,17 +1586,40 @@ export const layer = Layer.effect(
       const entries = boundedHistory.entries
       const context = entries.map((entry) => entry.message)
       const lastUser = context.findLast((message): message is SessionMessage.User => message.type === "user")
-      const structuredOutput = lastUser?.format?.type === "json_schema" ? lastUser.format : undefined
+      // The scheduler result tool stays visible for the whole open scheduled
+      // run: the latest host-injected contracted prompt that has not seen a
+      // completed result call keeps the gate open across interjected human
+      // inputs, surface answers, model and allowed agent switches.
+      const openContractMarkers = ToolRegistry.openContractMarkers(context, yield* tools.contractTools())
+      const structuredInput = (yield* StructuredOutputAttempt.taskInput(db, session.id)) ?? lastUser
+      const structuredOutput = structuredInput?.format?.type === "json_schema" ? structuredInput.format : undefined
+      const structuredContract = structuredOutput ? yield* Effect.try({
+        try: () => StructuredJsonSubset.prepare(structuredOutput.schema),
+        catch: () => new LLMError({
+          module: "SessionRunner", method: "structuredOutput",
+          reason: new InvalidRequestReason({ message: "Unsupported structured-output JSON Schema" }),
+        }),
+      }) : undefined
+      const previousStructuredAttempts = structuredContract && structuredInput
+        ? yield* StructuredOutputAttempt.load(db, session.id, structuredInput.id).pipe(Effect.orDie)
+        : []
+      // A newly promoted input starts its own assignment; it must not inherit
+      // the prior assignment's correction guidance or effect restrictions.
+      const finalTurn = options?.finalTurn === "structured-retry" && previousStructuredAttempts.length === 0
+        ? undefined : options?.finalTurn
       const effectiveToolPolicy = session.agentPolicy?.tools ?? agent.info?.tools
       const mcpEnsureStarted = performance.now()
       if (mcpTools) yield* mcpTools.ensurePolicy(effectiveToolPolicy).pipe(Effect.orDie)
       assemblyTimings.mcp_ensure_ms = elapsed(mcpEnsureStarted)
       if (lastUser && capabilityLeases) {
-        yield* CapabilityLease.activateFromSlash({
+        if (skillService) yield* CapabilityLease.activateFromSlash({
           sessionID: session.id,
           agent: agent.id,
           text: lastUser.text,
-        })
+        }).pipe(
+          Effect.provideService(CapabilityLease.Service, capabilityLeases),
+          Effect.provideService(SkillV2.Service, skillService),
+        )
       }
       const capabilitySnapshotBeforeTools = capabilityLeases
         ? yield* capabilityLeases.snapshot(session.id, agent.id)
@@ -1519,24 +1633,75 @@ export const layer = Layer.effect(
       const toolMaterialization = yield* tools.materialize(materializationRules, effectiveToolPolicy, {
         sessionID: session.id,
         agent: agent.id,
-        // Contract-scoped tools (scheduler result contract) are advertised only
-        // while the latest user prompt still carries their marker; a plain chat
-        // message hides them again.
+        // Contract-scoped tools (scheduler result contract) are advertised
+        // while the latest user prompt carries their marker or the session's
+        // latest contracted prompt is still unsettled; a plain chat in a
+        // session without an open scheduled run hides them again.
         lastUserText: lastUser?.text,
+        openContractMarkers,
       })
       assemblyTimings.tool_materialization_ms = elapsed(toolMaterializationStarted)
+      if (subtask && commandInput) {
+        // A durable command is a host-selected local call, not a fabricated
+        // provider response. Run it inside this coordinator-owned activity and
+        // through the same materialized tool/permission/admission boundaries.
+        const commandPublisher = createLLMEventPublisher(events, {
+          sessionID: session.id, agent: agent.id, model: configuredModelRef(session.model, agent.info?.model, model),
+          cost: [], publishLiveProgress: Config.latest(configEntries, "experimental")?.tool_live_progress !== false,
+        })
+        const callID = `command:${commandInput.id}`
+        const args = {
+          description: subtask.description,
+          prompt: commandInput.prompt.text,
+          subagent_type: subtask.agent,
+          ...(subtask.model === undefined ? {} : {
+            model: `${subtask.model.providerID}/${subtask.model.id}`,
+            ...(subtask.model.variant === undefined ? {} : { variant: subtask.model.variant }),
+          }),
+          ...(subtask.workspace === undefined ? {} : { workspace: subtask.workspace }),
+          command: subtask.command,
+        }
+        const commandRun = Effect.gen(function* () {
+          yield* LegacyDelegationGuard.assertRunner(db, session.id)
+          yield* WorkspaceCheckout.assertRunner(db, session.id)
+          const before = plugin
+            ? yield* plugin.trigger("tool.execute.before", { tool: "task", sessionID: session.id, callID }, { args })
+            : { args }
+          yield* LegacyDelegationGuard.assertRunner(db, session.id)
+          yield* WorkspaceCheckout.assertRunner(db, session.id)
+          const call = LLMEvent.toolCall({ id: callID, name: "task", input: before.args })
+          yield* commandPublisher.publish(call)
+          const cancellation = toolCancellation ? yield* toolCancellation.register({ sessionID: session.id, callID }) : undefined
+          const settle = toolMaterialization.settle({
+            sessionID: session.id, agent: agent.id,
+            assistantMessageID: yield* commandPublisher.assistantMessageID(callID),
+            call, progress: (snapshot) => commandPublisher.progress(callID, snapshot),
+          })
+          const settlement = yield* (cancellation ? Effect.raceFirst(settle, cancellation.cancelled.pipe(
+            Effect.map((cancelled) => ({ result: ToolResultValue.make(cancelled.message, "error") })),
+          )) : settle).pipe(Effect.ensuring(cancellation?.unregister ?? Effect.void))
+          const output = plugin ? yield* plugin.trigger("tool.execute.after", {
+            tool: "task", sessionID: session.id, callID, args: before.args,
+          }, settlement) : settlement
+          yield* commandPublisher.publish(LLMEvent.toolResult({ id: callID, name: "task", ...output }))
+          yield* commandPublisher.publish(LLMEvent.finish({ reason: "tool-calls" }))
+          yield* commandPublisher.finishStep()
+        })
+        yield* commandRun.pipe(Effect.onExit((exit) => exit._tag === "Success" ? Effect.void :
+          commandPublisher.failUnsettledTools(Cause.pretty(exit.cause)).pipe(
+            Effect.andThen(commandPublisher.interruptStep()),
+          )))
+        return { needsContinuation: false }
+      }
       const snapshotStartStarted = performance.now()
       const startSnapshotFiber =
         snapshotEnabled && needsSnapshotForTools(toolMaterialization.definitions)
           ? yield* withSnapshotBoundary("start", snapshots.track(initial.location)).pipe(Effect.forkScoped)
           : undefined
       assemblyTimings.snapshot_start_ms = elapsed(snapshotStartStarted)
-      const structuredOutputTool = structuredOutput ? createStructuredOutputTool(structuredOutput.schema) : undefined
+      const structuredOutputTool = structuredContract ? createStructuredOutputTool(structuredContract.schema) : undefined
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
-      const requestSystem = [
-        agent.info?.system,
-        system.baseline,
-        Number.isFinite(historyLimit) ? TOOL_OUTPUT_CONTEXT_GUIDANCE : undefined,
+      const turnGuidance = [
         boundedHistory.omittedEntries > 0
           ? "Older session history was omitted from this provider context to keep memory bounded; it remains stored durably. Ask the user for missing details if needed."
           : undefined,
@@ -1548,13 +1713,19 @@ export const layer = Layer.effect(
         continuation
           ? "The previous turn was judged incomplete. Continue the original unfinished request from the conversation history and summary now. Use the available tools to complete the remaining work. Do not ask the user for new input or wait for another instruction; finish the work and then provide a final report."
           : undefined,
-        options?.finalTurn === "step-limit"
+        finalTurn === "step-limit"
           ? "The configured agent step limit has been reached. Investigation tools are unavailable for this final turn. Return the final answer now using only the evidence already present in the conversation. State any remaining uncertainty instead of requesting or inventing more evidence."
-          : options?.finalTurn === "structured-retry"
+          : finalTurn === "structured-retry"
             ? "The requested structured output is still missing or did not match the requested schema. Investigation tools are unavailable for this retry turn. Call StructuredOutput now with the final answer derived from the evidence already present in the conversation. Record remaining uncertainty inside the structured fields instead of requesting more evidence."
-            : options?.finalTurn === "tool-budget"
+            : finalTurn === "tool-budget"
               ? "The investigation tool budget has been exhausted. Investigation tools are unavailable for this final turn. Synthesize the best final answer now from the evidence already present in the conversation. State unfinished work and uncertainty explicitly instead of requesting more evidence or another tool call."
               : undefined,
+      ].filter((part): part is string => part !== undefined && part.length > 0)
+      const requestSystem = [
+        agent.info?.system,
+        system.baseline,
+        Number.isFinite(historyLimit) ? TOOL_OUTPUT_CONTEXT_GUIDANCE : undefined,
+        ...turnGuidance,
       ]
         .concat(structuredOutput ? [STRUCTURED_OUTPUT_SYSTEM_PROMPT] : [])
         .filter((part): part is string => part !== undefined && part.length > 0)
@@ -1582,15 +1753,16 @@ export const layer = Layer.effect(
       )
       const modelMessagesMs = elapsed(modelMessagesStarted)
       assemblyTimings.model_messages_ms = modelMessagesMs
-      const composedRequestTools = options?.finalTurn
-        ? structuredOutputTool
-          ? [structuredOutputTool]
-          : []
-        : structuredOutputTool
-          ? [...toolMaterialization.definitions, structuredOutputTool]
-          : modelCapabilities.tools
-            ? toolMaterialization.definitions
+      const composedRequestTools =
+        finalTurn
+          ? structuredOutputTool
+            ? [structuredOutputTool]
             : []
+          : structuredOutputTool
+            ? [...toolMaterialization.definitions, structuredOutputTool]
+            : modelCapabilities.tools
+              ? toolMaterialization.definitions
+              : []
       const providerFacingTools = providerFacingRequestTools(model, composedRequestTools)
       const prepareTimings: PrepareLLMRequestTimings = {
         system_transform_ms: 0,
@@ -1634,7 +1806,12 @@ export const layer = Layer.effect(
       assemblyTimings.hook_params_ms = prepareTimings.params_hook_ms
       assemblyTimings.hook_headers_ms = prepareTimings.headers_hook_ms
       const systemText = request.system.map((part) => part.text).join("\n")
-      const footprint = { system: request.system, messages: request.messages, tools: request.tools }
+      const footprint = {
+        system: request.system,
+        runtimeContext: request.runtimeContext,
+        messages: request.messages,
+        tools: request.tools,
+      }
       const contextEstimateStarted = performance.now()
       const contextEstimateTokens = Token.estimateFootprint(footprint)
       const contextEstimateMs = performance.now() - contextEstimateStarted
@@ -1649,6 +1826,7 @@ export const layer = Layer.effect(
         message_count: request.messages.length,
         system_prompt_chars: systemText.length,
         system_prompt_estimate_tokens: Token.estimate(systemText),
+        runtime_context_chars: request.runtimeContext?.reduce((total, part) => total + part.text.length, 0) ?? 0,
         tool_count: toolMaterialization.definitions.length,
         tool_ids: toolIDs,
         surface_available: toolIDs.includes(SurfaceTool.name),
@@ -1659,6 +1837,7 @@ export const layer = Layer.effect(
           ? {
               boundary: "prepared-runner",
               system: ContextBudget.measure(systemText),
+              runtimeContext: ContextBudget.measure((request.runtimeContext ?? []).map((part) => part.text).join("\n")),
               messages: ContextBudget.measure(JSON.stringify(request.messages)),
               tools: ContextBudget.tools(request.tools ?? []),
             }
@@ -1686,13 +1865,14 @@ export const layer = Layer.effect(
         contextEstimateTokens,
       })
       if (
-        yield* compaction.compactIfNeeded({
+        recoverOverflow &&
+        (yield* compaction.compactIfNeeded({
           sessionID: session.id,
           entries,
           model,
           request,
           contextEstimateTokens,
-        })
+        }))
       ) {
         if (optimization.features.runner_request_metrics)
           yield* Effect.logInfo("session runner compaction triggered", { sessionID: session.id, reason: "auto" })
@@ -1744,6 +1924,29 @@ export const layer = Layer.effect(
         )
       }
       const startSnapshot = startSnapshotFiber ? yield* Fiber.join(startSnapshotFiber) : undefined
+      const structuredOutputAttempt = structuredContract && structuredInput ? yield* Effect.gen(function* () {
+        const binding = StructuredOutputAttempt.bind({
+          inputID: structuredInput.id,
+          input: structuredInput,
+          schema: structuredContract.schema,
+          model: {
+            id: ModelV2.ID.make(model.id), providerID: ProviderV2.ID.make(model.provider),
+            variant: session.model?.variant,
+          },
+          mode: "tool",
+        })
+        const previous = yield* StructuredOutputAttempt.load(db, session.id, structuredInput.id).pipe(Effect.orDie)
+        return yield* Effect.try({
+          try: () => StructuredOutputAttempt.next({
+            binding, previous, correction: finalTurn === "structured-retry",
+            retryCount: structuredOutput?.retryCount ?? 1,
+          }),
+          catch: (error) => new LLMError({
+            module: "SessionRunner", method: "structuredOutputAdmission",
+            reason: new InvalidRequestReason({ message: error instanceof Error ? error.message : "Structured-output attempt cannot be admitted safely" }),
+          }),
+        })
+      }) : undefined
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,
         agent: agent.id,
@@ -1754,12 +1957,16 @@ export const layer = Layer.effect(
         },
         cost: modelCost,
         snapshot: startSnapshot,
+        structuredOutputAttempt,
+        publishLiveProgress: Config.latest(configEntries, "experimental")?.tool_live_progress !== false,
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
         withPublication(publisher.publish(event, outputPaths))
       let structuredValue: unknown
+      let structuredOutcomes = 0
       let missingStructuredOutput = false
+      let structuredCorrectionAllowed = false
       let continuationHistory: RunnerHistorySnapshot | undefined
       let recoveredRetryableFailure = false
       let continuationRetryDelayMs: number | undefined
@@ -1790,9 +1997,11 @@ export const layer = Layer.effect(
         let providerDeltaCount = 0
         const publishedDeltaStart = publisher.publishedDeltaCount()
         let providerToolCalls = 0
+        let structuredStepFinishes = 0
         let blockingQuestionStarted = false
         let blockingQuestionCompleted = false
         let blockingQuestionCancelled = false
+        const nativeDispatchReady = yield* Deferred.make<boolean>()
         const idleTimeouts = providerStreamIdleTimeouts(model)
         // Moves the current attempt's streaming window into the cross-attempt total
         // and reports the measured value for one Step.Ended. Resetting the window
@@ -1810,8 +2019,41 @@ export const layer = Layer.effect(
           providerContentObserved = false
           return observed ? providerGenerationMs : undefined
         }
+        yield* WorkspaceCheckout.assertRunner(db, sessionID)
+        if (structuredOutputAttempt) {
+          if (structuredOutputAttempt.phase === "correction") {
+            yield* SessionExecutionOwner.assertOwner(db, sessionID).pipe(Effect.orDie)
+            if (request.tools?.some((tool) => tool.native !== undefined) ||
+              [request.model.route.defaults.http?.body, request.http?.body].some((body) => body !== undefined &&
+                ["tools", "functions", "tool_choice", "function_call", "web_search_options", "plugins"].some((key) => Object.hasOwn(body, key))))
+              return yield* Effect.fail(new LLMError({
+              module: "SessionRunner", method: "structuredOutputCorrection",
+              reason: new InvalidRequestReason({ message: "Structured-output correction cannot execute hosted tools" }),
+            }))
+          }
+          if (yield* SessionInput.hasPending(db, session.id, "steer"))
+            return yield* Effect.die(rebuildPreparedTurn("steer"))
+          yield* publisher.startAssistant()
+          if (structuredOutputAttempt.phase === "correction")
+            yield* SessionExecutionOwner.assertOwner(db, sessionID).pipe(Effect.orDie)
+          yield* WorkspaceCheckout.assertRunner(db, sessionID)
+          if (yield* SessionInput.hasPending(db, session.id, "steer"))
+            return yield* Effect.die(rebuildPreparedTurn("steer"))
+          if (!(yield* SessionContextEpoch.current(db, session.id, agent.id, system.revision)))
+            return yield* Effect.die(rebuildPreparedTurn())
+          const currentSession = yield* getSession(session.id)
+          if (currentSession.model?.id !== session.model?.id ||
+            currentSession.model?.providerID !== session.model?.providerID ||
+            currentSession.model?.variant !== session.model?.variant)
+            return yield* Effect.fail(new LLMError({
+              module: "SessionRunner", method: "structuredOutputAdmission",
+              reason: new InvalidRequestReason({ message: "Structured-output model selection changed before dispatch" }),
+            }))
+          if (structuredOutputAttempt.phase === "correction")
+            yield* SessionExecutionOwner.assertOwner(db, sessionID).pipe(Effect.orDie)
+        }
         const providerStream = withProviderStreamIdleTimeout(
-          llm.stream(request),
+          Stream.suspend(() => llm.stream(request)),
           idleTimeouts.initialMs,
           idleTimeouts.afterProgressMs,
         ).pipe(
@@ -1840,6 +2082,7 @@ export const layer = Layer.effect(
           Stream.runForEach((event) =>
             Effect.gen(function* () {
               if (event.type === "tool-call") calledToolIds.add(event.id)
+              if (event.type === "step-finish") structuredStepFinishes++
               if (overflowFailure || retryFailure || chainFailure || publisher.hasProviderError()) return
               if (
                 event.type === "tool-call" ||
@@ -1913,13 +2156,18 @@ export const layer = Layer.effect(
               // correct it (budgeted per activity). Errors for executed calls
               // keep their existing contracts below.
               if (event.type === "tool-error" && !calledToolIds.has(event.id)) {
-                needsContinuation = true
-                invalidToolInput = true
+                if (event.name === STRUCTURED_OUTPUT_TOOL && structuredOutput) {
+                  structuredOutcomes++
+                  invalidStructuredOutput = true
+                } else {
+                  needsContinuation = true
+                  invalidToolInput = true
+                }
               }
               if (event.type === "tool-error" && event.name === "apply_patch") needsContinuation = true
               if (
                 event.type === "tool-call" &&
-                options?.finalTurn &&
+                (finalTurn || (structuredOutput && (structuredValue !== undefined || invalidStructuredOutput))) &&
                 !(event.name === STRUCTURED_OUTPUT_TOOL && structuredOutput)
               ) {
                 // Advertising no tools is not an execution boundary. Reject
@@ -1940,8 +2188,10 @@ export const layer = Layer.effect(
                 return
               }
               if (event.name === STRUCTURED_OUTPUT_TOOL) {
+                structuredOutcomes++
                 yield* publish(event)
-                if (structuredOutput && !isValidStructuredOutput(structuredOutput.schema, event.input)) {
+                const issue = structuredContract?.diagnose(event.input)
+                if (invalidStructuredOutput || structuredOutcomes !== 1 || issue) {
                   invalidStructuredOutput = true
                   yield* publish(
                     LLMEvent.toolResult({
@@ -1949,8 +2199,9 @@ export const layer = Layer.effect(
                       name: event.name,
                       result: {
                         type: "error",
-                        value:
-                          "StructuredOutput input does not match the requested schema. Call StructuredOutput again with the final answer matching the requested schema; do not answer in plain text.",
+                        value: issue
+                          ? `StructuredOutput input does not match the requested schema (${issue.path.slice(0, 240) || "/"}: expected ${issue.expected.slice(0, 240)}). Return exactly one valid result from existing evidence; do not use investigation tools.`
+                          : "StructuredOutput requires exactly one valid result. Return one final answer matching the original schema; do not use investigation tools.",
                       },
                     }),
                   )
@@ -1979,6 +2230,8 @@ export const layer = Layer.effect(
                     : undefined
                   const unregisterCancellation = cancellation?.unregister ?? Effect.void
                   const execute = Effect.gen(function* () {
+                    yield* LegacyDelegationGuard.assertRunner(db, session.id)
+                    yield* WorkspaceCheckout.assertRunner(db, session.id)
                     const before = plugin
                       ? yield* plugin.trigger(
                           "tool.execute.before",
@@ -1986,6 +2239,9 @@ export const layer = Layer.effect(
                           { args: event.input },
                         )
                       : { args: event.input }
+                    // Recheck admission after an awaited plugin hook.
+                    yield* LegacyDelegationGuard.assertRunner(db, session.id)
+                    yield* WorkspaceCheckout.assertRunner(db, session.id)
                     const toolCall =
                       before.args === event.input ? event : LLMEvent.toolCall({ ...event, input: before.args })
                     if (SNAPSHOT_MUTATING_TOOLS.has(toolCall.name)) workspaceMutationAttempted = true
@@ -2019,6 +2275,28 @@ export const layer = Layer.effect(
                       )
                       return
                     }
+                    if (
+                      toolCall.name === SurfaceTool.name &&
+                      SurfaceTool.isBlockingInput(toolCall.input) &&
+                      (yield* ordinaryQuestionsDisabled(session))
+                    ) {
+                      // The user delegated this task without ordinary questions.
+                      // The refusal is a normal tool error the child continues
+                      // from; it never touches permissions or host consent.
+                      needsContinuation = true
+                      yield* publish(
+                        LLMEvent.toolResult({
+                          id: toolCall.id,
+                          name: toolCall.name,
+                          result: {
+                            type: "error",
+                            value:
+                              "Ordinary questions are disabled for this delegated task by the user's delegation preferences (task > session > project > global). Do not ask the user; decide with the available context, record your assumptions in the result, and finish the assignment. Permission requests are not affected by this preference.",
+                          },
+                        }),
+                      )
+                      return
+                    }
                     const assistantMessageID = yield* publisher.assistantMessageID(toolCall.id)
                     const fileKnowledgeCutoff = yield* deliveredFileKnowledge
                     const toolStarted = Date.now()
@@ -2030,6 +2308,7 @@ export const layer = Layer.effect(
                       call: toolCall,
                       skillGroupOutputs: SkillCatalog.retainedOutputs(request.messages),
                       fileKnowledgeCutoff,
+                      progress: (snapshot) => publisher.progress(toolCall.id, snapshot),
                     })
                     const cancel = cancellation?.cancelled.pipe(
                       Effect.map((cancelled) => {
@@ -2117,7 +2396,8 @@ export const layer = Layer.effect(
                       ),
                       Effect.ensuring(unregisterCancellation),
                     )
-                    yield* blockingSurface ? settlement : restore(settlement)
+                    const traced = CrashActivity.track({ kind: "tool", sessionID: session.id, name: toolCall.name }, settlement)
+                    yield* blockingSurface ? traced : restore(traced)
                   }).pipe(
                     Effect.onError(() => unregisterCancellation),
                     Effect.onInterrupt(() => unregisterCancellation),
@@ -2130,7 +2410,13 @@ export const layer = Layer.effect(
                     )
                     return
                   }
-                  yield* restore(execute).pipe(FiberSet.run(toolFibers))
+                  // Fork admission binds a stable parent event fence. Provider
+                  // text/reasoning can still finish after a tool-call event;
+                  // don't weaken that fence or dispatch from a failed stream.
+                  const ready = event.name === "task" || event.name === "multi_agent_fanout"
+                    ? Deferred.await(nativeDispatchReady).pipe(Effect.flatMap((ready) => ready ? execute : Effect.void))
+                    : execute
+                  yield* restore(ready).pipe(FiberSet.run(toolFibers))
                 }),
               )
             }),
@@ -2152,7 +2438,9 @@ export const layer = Layer.effect(
                   new LLMError({
                     module: "SessionRunner",
                     method: "runProviderStream",
-                    reason: new TransportReason({
+                    reason: structuredOutput ? new InvalidProviderOutputReason({
+                      message: "Structured-output response did not complete cleanly",
+                    }) : new TransportReason({
                       message: missingVisibleAnswer
                         ? "Provider response is incomplete: no visible answer after reasoning"
                         : `Provider response is incomplete: finish reason ${finish}`,
@@ -2167,7 +2455,9 @@ export const layer = Layer.effect(
                   new LLMError({
                     module: "SessionRunner",
                     method: "runProviderStream",
-                    reason: new TransportReason({
+                    reason: structuredOutput ? new InvalidProviderOutputReason({
+                      message: "Structured-output stream ended without a finish reason",
+                    }) : new TransportReason({
                       message: "Provider stream ended without a finish reason",
                       kind: "stream-ended",
                       canRetry: true,
@@ -2183,7 +2473,10 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             const raced = yield* restore(
               Effect.raceFirst(
-                providerStream.pipe(
+                CrashActivity.track(
+                  { kind: "provider", sessionID: session.id, name: `${model.provider}/${model.id}` },
+                  providerStream,
+                ).pipe(
                   Effect.exit,
                   Effect.map((stream) => ({ type: "stream" as const, stream })),
                 ),
@@ -2216,6 +2509,8 @@ export const layer = Layer.effect(
               providerEventFailure !== undefined && isTerminalProviderEvent(providerEventFailure)
             const terminalProviderFinish =
               publisher.stepFinishReason() === "content-filter" || publisher.stepFinishReason() === "error"
+            yield* Deferred.succeed(nativeDispatchReady,
+              stream._tag === "Success" && providerEventFailure === undefined && !terminalProviderFinish)
             const eventFailureAuthoritative =
               !streamInterrupted &&
               (terminalProviderEvent || terminalProviderFinish) &&
@@ -2239,12 +2534,112 @@ export const layer = Layer.effect(
                 ? llmFailure
                 : undefined
               : !eventFailureAuthoritative && !AIChain.isQuotaExceededFailure(providerEventFailure)
-                ? (retryFailure ?? continuationFailure)
+                ? (retryFailure ??
+                  continuationFailure ??
+                  (chainFailure?.retryable === true && !isTerminalProviderEvent(chainFailure)
+                    ? chainFailure
+                    : undefined))
                 : undefined
-            const fallback = nextConfiguredModel()
+            const taskLane = implementationTaskLane(session)
+            const fallback = structuredOutputAttempt?.phase === "correction" ? undefined : nextConfiguredModel()
+            const observedFailure = llmFailure ?? providerEventFailure
+            const quotaFailure = AIChain.isQuotaExceededFailure(observedFailure) ? observedFailure : undefined
+            const taskFailure = quotaFailure ?? retryableFailure
+            if (
+              taskLane && taskFailure && !streamInterrupted && (!terminalProviderEvent || quotaFailure) &&
+              !terminalProviderFinish && !invalidStructuredOutput && !finalTurnToolRejected &&
+              structuredOutputAttempt?.phase !== "correction" && !publisher.hasAssistantStarted() &&
+              !publisher.hasRetryBarrier() && !publisher.hasStepFinish()
+            ) {
+              const current = configuredModelRef(session.model, agent.info?.model, model)
+              const providerRef = `${model.provider}/${model.id}`
+              const chain = current.chain ? JSON.stringify([current.chain.id, current.chain.steps]) : providerRef
+              const code = AIChain.providerFailureCode(taskFailure)
+              const pass = providerRecovery.observeChainFailure(chain, {
+                retryable: quotaFailure === undefined,
+                delayMs: retryDelayMs(taskFailure, 1),
+                attempt: `${providerRef}:${code}`,
+              })
+              const switchTo = (next: ModelV2.Ref) => withPublication(events.publish(SessionEvent.ModelSwitched, {
+                sessionID: session.id, messageID: SessionMessage.ID.create(), timestamp: DateTime.makeUnsafe(Date.now()), model: next,
+              }))
+              if (fallback) {
+                breakers.recordFailure(model.provider)
+                yield* withPublication(Effect.logWarning("task model chain advancing", {
+                  sessionID: session.id, chain: current.chain?.id, pass: pass.pass, providerRef, code,
+                  next: `${fallback.providerID}/${fallback.id}`,
+                }))
+                yield* switchTo(fallback)
+                return yield* Effect.die(rebuildPreparedTurn())
+              }
+              const first = current.chain?.steps[0]
+              const restart = first && current.chain ? { ...first, chain: { ...current.chain, active: 0 } } : current
+              const breakerOpen = () => (current.chain?.steps ?? [current]).some((step) => breakers.shouldSkip(step.providerID))
+              if (pass.retryable && !pass.quotaBlocked && pass.pass < SessionResume.MAX_CHAIN_PASSES &&
+                  SessionResume.canWaitForRetry(pass.delayMs) && !breakerOpen()) {
+                yield* withPublication(events.publish(SessionEvent.Retried, {
+                  sessionID: session.id, timestamp: yield* DateTime.now, attempt: pass.attempts.length,
+                  error: retryError(taskFailure), code, provider: model.provider, next: Date.now() + pass.delayMs,
+                }))
+                yield* restore(Effect.sleep(pass.delayMs))
+                if (yield* SessionInput.hasPending(db, session.id, "steer")) return yield* Effect.die(rebuildPreparedTurn("steer"))
+                const live = yield* getSession(session.id)
+                if (!sameModel(live.model, session.model)) return yield* Effect.die(rebuildPreparedTurn())
+                if (!breakerOpen()) {
+                 providerRecovery.restartChainPass(chain)
+                 if (!current.chain) return yield* restore(runProviderStream(attempt + 1))
+                 yield* switchTo(restart)
+                 return yield* Effect.die(rebuildPreparedTurn())
+               }
+              }
+              const exhausted = taskChainExhaustedFailure({ sessionID: session.id, failure: taskFailure, providerRef, pass,
+                deferredDelayMs: SessionResume.canWaitForRetry(pass.delayMs) ? undefined : pass.delayMs })
+              yield* withPublication(events.publish(SessionEvent.Step.Failed, {
+                sessionID: session.id, timestamp: yield* DateTime.now, assistantMessageID: yield* publisher.startAssistant(),
+                error: { type: "unknown", message: exhausted.message }, failure: exhausted.failure,
+              }))
+              return yield* Effect.fail(exhausted.error)
+            }
             const retryDeferred =
               retryableFailure !== undefined && !SessionResume.canWaitForRetry(retryDelayMs(retryableFailure, 1))
-            const chainEligible =
+            // A clean transient failure gets one same-model retry before moving
+            // to the next configured step. Durable output and tools are replay barriers.
+             const sameModelRetryAttempt = !taskLane && structuredOutputAttempt?.phase !== "correction" && shouldRetryChainStep({
+              hasFallback: fallback !== undefined,
+              attempt,
+              retryable: retryableFailure !== undefined && !terminalProviderEvent,
+              deferred: retryDeferred,
+              replayBarrier:
+                invalidStructuredOutput ||
+                finalTurnToolRejected ||
+                publisher.hasAssistantStarted() ||
+                publisher.hasRetryBarrier() ||
+                publisher.hasProviderError() ||
+                publisher.hasStepFinish() ||
+                streamInterrupted,
+            })
+              ? providerRecovery.next()
+              : undefined
+            if (retryableFailure && sameModelRetryAttempt !== undefined) {
+              const retryInMs = retryDelayMs(retryableFailure, sameModelRetryAttempt)
+              yield* withPublication(
+                events.publish(SessionEvent.Retried, {
+                  sessionID: session.id,
+                  timestamp: yield* DateTime.now,
+                  attempt: sameModelRetryAttempt,
+                  error: retryError(retryableFailure),
+                  code: AIChain.providerFailureCode(retryableFailure),
+                  provider: model.provider,
+                  next: Date.now() + retryInMs,
+                }),
+              )
+              yield* restore(Effect.sleep(retryInMs))
+              if (yield* SessionInput.hasPending(db, session.id, "steer"))
+                return yield* Effect.die(rebuildPreparedTurn("steer"))
+              return yield* restore(runProviderStream(attempt + 1))
+            }
+             const chainEligible =
+               !taskLane &&
               !invalidStructuredOutput &&
               !finalTurnToolRejected &&
               !(eventFailureAuthoritative && terminalProviderFinish) &&
@@ -2291,7 +2686,9 @@ export const layer = Layer.effect(
               return yield* Effect.die(rebuildPreparedTurn())
             }
             const chainContinuation = chainRecoveryAttempt !== undefined ? fallback : undefined
-            const retryAttempt =
+             const retryAttempt =
+               !taskLane &&
+              structuredOutputAttempt?.phase !== "correction" &&
               !invalidStructuredOutput &&
               !finalTurnToolRejected &&
               !terminalProviderEvent &&
@@ -2303,7 +2700,7 @@ export const layer = Layer.effect(
               !publisher.hasStepFinish() &&
               !streamInterrupted &&
               attempt < SessionResume.retryBudget(AIChain.providerFailureCode(retryableFailure))
-                ? providerRecovery.next()
+                ? providerRecovery.next(AIChain.providerFailureCode(retryableFailure))
                 : undefined
             if (retryableFailure && retryAttempt !== undefined) {
               const retryInMs = retryDelayMs(retryableFailure, retryAttempt)
@@ -2321,15 +2718,15 @@ export const layer = Layer.effect(
               yield* restore(Effect.sleep(retryInMs))
               if (yield* SessionInput.hasPending(db, session.id, "steer"))
                 return yield* Effect.die(rebuildPreparedTurn("steer"))
-              return yield* runProviderStream(attempt + 1)
+              return yield* restore(runProviderStream(attempt + 1))
             }
             // Durable output is a replay barrier. Recover with a fresh provider turn from projected history
             // instead of reissuing a request that may already have executed tools or emitted user-visible text.
-            // A StructuredOutput schema violation is never recoverable: the
-            // model produced a terminal typed failure, not retryable
-            // transport. Routing it into recovery would replace the typed
-            // invalid-tool-input failure with a later successful answer.
-            const continuationAttempt =
+            // Format errors use only the separately claimed structured lane.
+            // Neither they nor its correction may borrow transport recovery.
+             const continuationAttempt =
+               !taskLane &&
+              structuredOutputAttempt?.phase !== "correction" &&
               !invalidStructuredOutput &&
               !finalTurnToolRejected &&
               !terminalProviderEvent &&
@@ -2383,12 +2780,13 @@ export const layer = Layer.effect(
             }
             if (overflowFailure && !failure && !streamInterrupted) yield* publish(overflowFailure)
             if (llmFailure && !publisher.hasProviderError() && !terminalSettlement && !streamInterrupted) {
+              const failure = AIChain.providerFailure(llmFailure, `${model.provider}/${model.id}`)
               yield* withPublication(
                 publisher.failUnsettledTools(
                   "Provider did not return a tool result",
                   true,
                   undefined,
-                  AIChain.providerFailure(llmFailure),
+                  failure,
                 ),
               )
               yield* withPublication(
@@ -2397,7 +2795,7 @@ export const layer = Layer.effect(
                   timestamp: yield* DateTime.now,
                   assistantMessageID: yield* publisher.startAssistant(),
                   error: { type: "unknown", message: llmFailure.reason.message },
-                  failure: AIChain.providerFailure(llmFailure),
+                  failure,
                 }),
               )
             }
@@ -2549,21 +2947,36 @@ export const layer = Layer.effect(
               !streamInterrupted &&
               !(settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             ) {
-              const failure = invalidStructuredOutputFailure()
-              const message = "StructuredOutput input does not match the requested schema"
-              yield* withPublication(
-                events.publish(SessionEvent.Step.Failed, {
-                  sessionID: session.id,
-                  timestamp: yield* DateTime.now,
-                  assistantMessageID: yield* publisher.startAssistant(),
-                  error: { type: "unknown", message },
-                  failure: SessionFailure.make("provider.invalid-response", {
-                    cause: { raw: message, detail: "structured output" },
-                    providerRef: `${model.provider}/${model.id}`,
+              const canCorrect = structuredOutputAttempt?.phase === "initial" &&
+                (structuredOutput?.retryCount ?? 1) > 0 && stream._tag === "Success" &&
+                providerEventFailure === undefined &&
+                (publisher.stepFinishReason() === "stop" || publisher.stepFinishReason() === "tool-calls")
+              if (canCorrect) {
+                // Keep the invalid tool part, but do not terminally fail its Activity
+                // before the single durable format correction is admitted.
+                invalidStructuredOutput = false
+                structuredValue = undefined
+                missingStructuredOutput = true
+                needsContinuation = false
+              }
+              if (!canCorrect) {
+                const failure = invalidStructuredOutputFailure()
+                const message = "StructuredOutput input does not match the requested schema"
+                yield* withPublication(
+                  events.publish(SessionEvent.Step.Failed, {
+                    sessionID: session.id,
+                    timestamp: yield* DateTime.now,
+                    assistantMessageID: yield* publisher.startAssistant(),
+                    error: { type: "unknown", message },
+                    failure: SessionFailure.make("provider.invalid-response", {
+                      retryability: "none",
+                      cause: { raw: message, detail: "structured output" },
+                      providerRef: `${model.provider}/${model.id}`,
+                    }),
                   }),
-                }),
-              )
-              return yield* Effect.fail(failure)
+                )
+                return yield* Effect.fail(failure)
+              }
             }
             if (
               retryDeferred &&
@@ -2603,6 +3016,7 @@ export const layer = Layer.effect(
             // context unanswered while still ending the activity as a normal stop. Recover with
             // another provider attempt instead of silently ending the turn.
             const emptyCompletion =
+              !structuredOutput &&
               (stream._tag === "Success" || recoveredQuestionInterruption) &&
               providerEventFailure === undefined &&
               !publisher.hasProviderError() &&
@@ -2618,6 +3032,34 @@ export const layer = Layer.effect(
                   },
                 )
               : undefined
+            const emptySameModelRetry =
+              shouldRetryChainStep({
+                hasFallback: emptyCompletionFallback !== undefined,
+                attempt,
+                retryable: emptyCompletion,
+                deferred: false,
+                // A clean empty finish has no emitted answer or tool to replay.
+                replayBarrier: publisher.hasRetryBarrier() || providerToolCalls > 0,
+              }) && publisher.clearEmptyFinish()
+                ? providerRecovery.next()
+                : undefined
+            if (emptySameModelRetry !== undefined) {
+              const failure = emptyCompletionFailure()
+              yield* withPublication(
+                events.publish(SessionEvent.Retried, {
+                  sessionID: session.id,
+                  timestamp: yield* DateTime.now,
+                  attempt: emptySameModelRetry,
+                  error: retryError(failure),
+                  code: AIChain.providerFailureCode(failure),
+                  provider: model.provider,
+                  next: Date.now(),
+                }),
+              )
+              if (yield* SessionInput.hasPending(db, session.id, "steer"))
+                return yield* Effect.die(rebuildPreparedTurn("steer"))
+              return yield* restore(runProviderStream(attempt + 1))
+            }
             if (emptyCompletionFallback && providerRecovery.next() !== undefined) {
               yield* withPublication(
                 events.publish(SessionEvent.ModelSwitched, {
@@ -2663,7 +3105,7 @@ export const layer = Layer.effect(
               // immediate retry is safe and keeps recovery free of timer scheduling.
               if (yield* SessionInput.hasPending(db, session.id, "steer"))
                 return yield* Effect.die(rebuildPreparedTurn("steer"))
-              return yield* runProviderStream(attempt + 1)
+              return yield* restore(runProviderStream(attempt + 1))
             }
             // Exhausted retries must not fall through to a successful stop: that is
             // exactly the silent busy-indicator loss this recovery exists to prevent.
@@ -2695,6 +3137,24 @@ export const layer = Layer.effect(
                   ? undefined
                   : yield* withSnapshotBoundary("end", snapshots.track(session.location))
               const finishReason = publisher.stepFinishReason()
+              if (structuredOutput && (structuredStepFinishes !== 1 ||
+                (finishReason !== "stop" && finishReason !== "tool-calls"))) {
+                const failure = new LLMError({
+                  module: "SessionRunner", method: "structuredOutputFinish",
+                  reason: new InvalidProviderOutputReason({ message: "Structured-output response requires exactly one clean finish" }),
+                })
+                yield* withPublication(publisher.finishStep(endSnapshot, undefined, undefined, stepGenerationMs))
+                yield* withPublication(events.publish(SessionEvent.Step.Failed, {
+                  sessionID: session.id, timestamp: yield* DateTime.now,
+                  assistantMessageID: yield* publisher.startAssistant(),
+                  error: { type: "unknown", message: failure.reason.message },
+                  failure: SessionFailure.make("provider.invalid-response", {
+                    retryability: "none", cause: { detail: "structured output finish" },
+                    providerRef: `${model.provider}/${model.id}`,
+                  }),
+                }))
+                return yield* Effect.fail(failure)
+              }
               yield* withPublication(
                 publisher.finishStep(
                   endSnapshot,
@@ -2725,13 +3185,18 @@ export const layer = Layer.effect(
                 )
               if (structuredOutput && structuredValue === undefined && !needsContinuation) {
                 missingStructuredOutput = true
-                yield* withPublication(
+                const canCorrect = structuredOutputAttempt?.phase === "initial" &&
+                  (structuredOutput.retryCount ?? 1) > 0 &&
+                  (finishReason === "stop" || finishReason === "tool-calls")
+                structuredCorrectionAllowed = canCorrect
+                if (!canCorrect) yield* withPublication(
                   events.publish(SessionEvent.Step.Failed, {
                     sessionID: session.id,
                     timestamp: yield* DateTime.now,
                     assistantMessageID: yield* publisher.startAssistant(),
                     error: { type: "unknown", message: "Model did not produce structured output" },
                     failure: SessionFailure.make("provider.invalid-response", {
+                      retryability: "none",
                       cause: { raw: "Model did not produce structured output", detail: "structured output" },
                       providerRef: `${model.provider}/${model.id}`,
                     }),
@@ -2833,7 +3298,7 @@ export const layer = Layer.effect(
         ...(invalidStructuredOutput ? { invalidStructuredOutput: true } : {}),
         ...(continuationHistory === undefined ? {} : { history: continuationHistory }),
         ...(missingStructuredOutput ? { missingStructuredOutput: true } : {}),
-        ...(structuredOutput?.retryCount === undefined ? {} : { structuredRetryCount: structuredOutput.retryCount }),
+        ...(structuredOutput ? { structuredRetryCount: structuredCorrectionAllowed ? 1 : 0 } : {}),
         ...(recoveredRetryableFailure ? { recoveredRetryableFailure: true } : {}),
         ...(continuationRetryDelayMs === undefined ? {} : { retryDelayMs: continuationRetryDelayMs }),
       }
@@ -2897,19 +3362,16 @@ export const layer = Layer.effect(
     }) {
       const session = yield* getSession(input.sessionID)
       const selectedAgent = yield* agents.select(session.agent)
-      const multiAgentUnlimited =
-        Config.latest(configEntries, "multi_agent")?.unlimited === true &&
-        selectedAgent.id === AgentV2.ID.make("review")
       const taskBudget = mergeReadBudgetLimits(
         selectedAgent.info?.toolBudget,
         readBudgetLimits(session.metadata?.tool_budget),
       )
       const createReadBudget = () =>
-        taskBudget
-          ? ToolReadBudget.limited(taskBudget)
-          : multiAgentUnlimited
-            ? ToolReadBudget.make(false)
-            : ToolReadBudget.make(optimization.features.tool_read_budget)
+        ToolReadBudget.forSession({
+          reviewer: selectedAgent.id === AgentV2.ID.make("review"),
+          enabled: optimization.features.tool_read_budget,
+          limits: taskBudget,
+        })
       const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
       if (input.force !== true && !hasSteer && !hasQueue) return
@@ -2921,7 +3383,6 @@ export const layer = Layer.effect(
         let needsContinuation = true
         let history: RunnerHistorySnapshot | undefined
         let step = 0
-        let structuredRetries = 0
         let structuredFinalTurn: "structured-retry" | undefined = undefined
         let toolBudgetFinalTurn: "tool-budget" | undefined = undefined
         const providerRecovery = SessionResume.recoveryBudget()
@@ -2929,16 +3390,16 @@ export const layer = Layer.effect(
         while (needsContinuation) {
           const stepLimit = (yield* agents.select((yield* getSession(input.sessionID)).agent)).info?.steps
           if (stepLimit !== undefined && step >= stepLimit) {
-            const result = yield* runTurn(input.sessionID, promotion, history, "step-limit", providerRecovery)
+            const result = yield* runTurn(input.sessionID, promotion, history, structuredFinalTurn ?? "step-limit", providerRecovery)
             // A malformed tool call on the final turn must not exit
             // successfully: the persisted failed call would otherwise let
             // LocalExecution complete the activity. Settle it terminally.
             if (result.invalidToolInput) return yield* Effect.fail(invalidToolInputFailure())
             if (result.invalidStructuredOutput) return yield* Effect.fail(invalidStructuredOutputFailure())
             if (result.missingStructuredOutput) {
-              if (structuredRetries >= (result.structuredRetryCount ?? 0))
+              if (!result.structuredRetryCount)
                 return yield* Effect.fail(missingStructuredOutputFailure())
-              structuredRetries++
+              structuredFinalTurn = "structured-retry"
               history = result.history
               promotion = "steer"
               continue
@@ -2964,28 +3425,20 @@ export const layer = Layer.effect(
           )
           step++
           if (result.invalidStructuredOutput) return yield* Effect.fail(invalidStructuredOutputFailure())
-          // Missing structured output follows the bounded correction lane. A
-          // schema-invalid StructuredOutput call already failed terminally
-          // inside runProviderStream with a typed Step.Failed event; routing it
-          // through the missing-output retry lane would silently convert that
-          // typed failure into another provider turn.
+          // Missing and invalid results share one durable correction claim.
+          // The provider turn reports eligibility, never a fresh retry budget.
           const retryStructuredOutput =
-            result.missingStructuredOutput === true && structuredRetries < (result.structuredRetryCount ?? 0)
+            result.missingStructuredOutput === true && result.structuredRetryCount === 1
           if (result.missingStructuredOutput && !retryStructuredOutput)
             return yield* Effect.fail(missingStructuredOutputFailure())
-          if (retryStructuredOutput) structuredRetries++
           structuredFinalTurn = retryStructuredOutput ? "structured-retry" : undefined
           toolBudgetFinalTurn = result.toolBudgetExceeded ? "tool-budget" : undefined
           needsContinuation = result.needsContinuation || retryStructuredOutput
           // Bounded model correction after a locally-failed tool call: allow up
           // to MAX_TOOL_ERROR_ROUNDS consecutive provider turns triggered by
           // tool-error events, then settle the failed call terminally instead of
-          // looping. A turn without a tool-error resets the streak. Schema-form
-          // StructuredOutput violations already failed inside runProviderStream
-          // with a typed Step.Failed event because fanout children carry an
-          // explicit retryCount yet arrive with a single terminal tool call;
-          // reusing the missing-output retry lane here would silently swallow
-          // that typed failure, so do not re-enter correction handling.
+          // looping. A turn without a tool-error resets the streak. Result-tool
+          // argument errors are excluded: they share the durable format claim.
           if (result.invalidToolInput) {
             toolErrorRounds++
             if (toolErrorRounds > MAX_TOOL_ERROR_ROUNDS) return yield* Effect.fail(invalidToolInputFailure())
@@ -2996,8 +3449,18 @@ export const layer = Layer.effect(
           if (result.recoveredRetryableFailure) {
             yield* Effect.sleep(result.retryDelayMs ?? 0)
           }
-          promotion = "steer"
-          if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+          // Re-check pending inputs at every turn boundary. Steers keep priority
+          // and continue the loop. A queued input joins only while the model is
+          // mid-activity (tool-driven continuation); when the turn ends, leave it
+          // to the outer loop, which opens a fresh activity with a fresh provider
+          // allowance (promoteNextQueued stays FIFO, one input per turn). Long
+          // tool-driven activities would otherwise hide queued messages until the
+          // activity ends.
+          const pendingSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+          if (needsContinuation && !pendingSteer && (yield* SessionInput.hasPending(db, input.sessionID, "queue")))
+            promotion = "queue"
+          else promotion = "steer"
+          if (!needsContinuation) needsContinuation = pendingSteer
           if (!needsContinuation) {
             history = undefined
             break
@@ -3009,35 +3472,40 @@ export const layer = Layer.effect(
       }
     })
 
-    const run = Effect.fn("SessionRunner.run")(
-      (input: { readonly sessionID: SessionSchema.ID; readonly force?: boolean }) =>
-        runSession(input).pipe(
-          // A drain can fail before the first provider turn (for example when model
-          // resolution rejects the configured model). The session still deserves a
-          // generated or prompt-fallback title, so scheduling is not success-only.
-          Effect.onExit((exit) =>
-            events
-              .publish(Settled, {
-                sessionID: input.sessionID,
-                status:
-                  exit._tag === "Success" ? "completed" : Cause.hasInterrupts(exit.cause) ? "interrupted" : "error",
-              })
-              .pipe(
-                Effect.ignore,
-                Effect.andThen(
-                  exit._tag === "Failure" && !Cause.hasInterrupts(exit.cause)
-                    ? scheduleTitle(input.sessionID)
-                    : Effect.void,
-                ),
+    const run = Effect.fn("SessionRunner.run")(function* (input: {
+      readonly sessionID: SessionSchema.ID
+      readonly force?: boolean
+    }) {
+      // Reject before settlement/title hooks: an unowned direct call must not
+      // report another owner's run as settled or schedule a helper provider call.
+      yield* LegacyDelegationGuard.assertRunner(db, input.sessionID)
+      yield* WorkspaceCheckout.assertRunner(db, input.sessionID)
+      return yield* runSession(input).pipe(
+        // A drain can fail before the first provider turn (for example when model
+        // resolution rejects the configured model). The session still deserves a
+        // generated or prompt-fallback title, so scheduling is not success-only.
+        Effect.onExit((exit) =>
+          events
+            .publish(Settled, {
+              sessionID: input.sessionID,
+              status: exit._tag === "Success" ? "completed" : Cause.hasInterrupts(exit.cause) ? "interrupted" : "error",
+            })
+            .pipe(
+              Effect.ignore,
+              Effect.andThen(
+                exit._tag === "Failure" && !Cause.hasInterrupts(exit.cause)
+                  ? scheduleTitle(input.sessionID)
+                  : Effect.void,
               ),
-          ),
-          Effect.ensuring(
-            Effect.sync(() => {
-              toolReadBudgets.settle(input.sessionID)
-            }),
-          ),
+            ),
         ),
-    )
+        Effect.ensuring(
+          Effect.sync(() => {
+            toolReadBudgets.settle(input.sessionID)
+          }),
+        ),
+      )
+    })
 
     return Service.of({
       run,
@@ -3343,6 +3811,40 @@ export function retryDelayMs(error: LLMError | ProviderErrorEvent, attempt: numb
   return SessionResume.delayMs(AIChain.providerFailureCode(error), attempt, error.retryAfterMs)
 }
 
+export function implementationTaskLane(session: Pick<SessionSchema.Info, "id" | "parentID" | "agent" | "agentPolicy" | "model">) {
+  return session.agentPolicy?.source.type === "task" && session.parentID === session.agentPolicy.source.sessionID &&
+    !session.agentPolicy.readOnly && session.agent !== "review" && session.model?.chain !== null
+}
+
+export function taskChainExhaustedFailure(input: {
+  sessionID: SessionSchema.ID
+  failure: LLMError | ProviderErrorEvent
+  providerRef: string
+  pass: SessionResume.ChainPass
+  deferredDelayMs?: number
+  now?: number
+}) {
+  const code = AIChain.providerFailureCode(input.failure)
+  const retryAfterMs = input.deferredDelayMs ?? input.failure.retryAfterMs
+  const normalized = ProviderError.normalize(input.failure, input.providerRef)
+  const retryAt = retryAfterMs === undefined ? undefined : (input.now ?? Date.now()) + retryAfterMs
+  const resetAt = retryAt === undefined ? normalized.resetAt : Math.max(normalized.resetAt ?? 0, retryAt)
+  const summary = SessionFailure.make(code).message.replace(/\.$/, "")
+  const message = `Task model chain exhausted after ${input.pass.pass} ${input.pass.pass === 1 ? "pass" : "passes"}: ${summary} (${input.providerRef}).` +
+    ` Tried ${input.pass.attempts.join(", ")}.` +
+    (resetAt === undefined ? "" : ` Earliest retry time: ${new Date(resetAt).toISOString()}.`) +
+    (input.deferredDelayMs === undefined ? "" : ` Retry-After ${input.deferredDelayMs} ms exceeds the ${SessionResume.MAX_AUTO_RETRY_WAIT_MS} ms automatic wait limit; no early retry was sent.`) +
+    ` Automatic recovery stopped. Resume this task later with a task follow-up for task_id ${input.sessionID}.`
+  return {
+    message,
+    failure: SessionFailure.make(code, { message, retryability: "none", remediation: "retry", providerRef: input.providerRef,
+      httpStatus: normalized.httpStatus, retryAfterMs, resetAt, cause: { raw: input.failure.message,
+        detail: `task-chain-exhausted;passes=${input.pass.pass};attempts=${input.pass.attempts.join(",")}` } }),
+    error: new LLMError({ module: "SessionRunner", method: "runProviderStream",
+      reason: new TransportReason({ message, kind: "task-chain-exhausted", canRetry: false, retryAfterMs }) }),
+  }
+}
+
 export function modelResolveInitTimeoutMs(
   configured: string | undefined = process.env.OPENCODE_SESSION_MODEL_RESOLVE_INIT_TIMEOUT_MS,
 ) {
@@ -3543,45 +4045,13 @@ function finalTurnToolFailure() {
   })
 }
 
-function isValidStructuredOutput(schema: Record<string, unknown>, input: unknown) {
-  // Validate the raw tool input against the compiled schema. Schema.Top is
-  // only the JSON-Schema representation's carrier for custom revivers; the
-  // UnknownFromJsonString wrapper in the fanout text path is not applicable
-  // to already-parsed provider tool input. Closed schema objects reject
-  // excess properties instead of silently stripping them: a stripped decode
-  // would mark payloads valid that the parent JSON decoder rejects.
-  const compiled = structuredOutputSchema(schema) as Schema.Codec<unknown>
-  const decode = Schema.decodeUnknownOption(compiled, { onExcessProperty: "error" })
-  return decode(input)._tag === "Some"
-}
-
-function structuredOutputSchema(schema: Record<string, unknown>) {
-  // Preserve local $defs/definitions so valid $ref schemas do not fail as
-  // unresolvable references during input validation.
-  const { $defs, definitions, ...rest } = schema as Record<string, unknown> & {
-    readonly $defs?: Record<
-      string,
-      Parameters<typeof SchemaRepresentation.fromJsonSchemaDocument>[0]["definitions"][string]
-    >
-    readonly definitions?: Record<
-      string,
-      Parameters<typeof SchemaRepresentation.fromJsonSchemaDocument>[0]["definitions"][string]
-    >
-  }
-  return SchemaRepresentation.toSchema(
-    SchemaRepresentation.fromJsonSchemaDocument({
-      dialect: "draft-2020-12",
-      schema: rest,
-      definitions: { ...definitions, ...$defs },
-    }),
-  )
-}
-
 function preflightContextOverflowMessage(model: Model, request: LLMRequest, contextEstimateTokens: number) {
   const context = model.route.defaults.limits?.context
   const limit = SessionCompaction.inputTokenLimit({ model, request })
   const output = SessionCompaction.outputTokenReserve({ model, request })
-  return `Request was not sent: the estimated ${contextEstimateTokens} context tokens exceed this model's ${limit} input token budget (${context} context tokens after reserving ${output} output tokens). OpenCode could not compact this session safely; the conversation is preserved. Send a shorter follow-up or switch to a model with more context, then retry.`
+  // Name the blocked model: after a chain advance it is the newly active step, not
+  // the model the session was using before, and no provider answered this request.
+  return `Request was not sent to ${model.provider}/${model.id}: the estimated ${contextEstimateTokens} context tokens exceed that model's ${limit} input token budget (${context} context tokens after reserving ${output} output tokens). This is a local pre-send block, not a provider error. OpenCode could not compact this session safely; the conversation is preserved. Send a shorter follow-up or switch to a model with more context, then retry.`
 }
 
 function createStructuredOutputTool(schema: Record<string, unknown>) {

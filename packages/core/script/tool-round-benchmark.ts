@@ -1,8 +1,8 @@
 /**
  * Reproducible tool-round benchmark over the managed runner pipeline.
  *
- * A deterministic in-process provider runs read, then a guarded write, then a
- * short text reply per round, so every round exercises the full request
+ * A deterministic in-process provider runs read, then a guarded apply_patch
+ * add, then a short text reply per round, so every round exercises the full request
  * assembly (context epoch, history bound, tool materialization), real tool
  * execution, result storage, and the session file-mutation journal. Metrics
  * come from the existing request_assembly perf event, filtered by the
@@ -58,7 +58,7 @@ import { SystemContextBuiltIns } from "@opencode-ai/core/system-context/builtins
 import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
 import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { ReadTool } from "@opencode-ai/core/tool/read"
-import { WriteTool } from "@opencode-ai/core/tool/write"
+import { ApplyPatchTool } from "@opencode-ai/core/tool/apply-patch"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
 import { LocationMutation } from "@opencode-ai/core/location-mutation"
 import { FileMutation } from "@opencode-ai/core/file-mutation"
@@ -90,7 +90,7 @@ const sessionCount = Number(value("--sessions", "1"))
 const rounds = Number(value("--rounds", "40"))
 const warmupRounds = Number(value("--warmup", "5"))
 const writeBenchOnly = flag("--write-bench")
-// Three provider turns per round: read, guarded write, text reply.
+// Three provider turns per round: read, guarded patch, text reply.
 const turnsPerRound = 3
 if (!Number.isInteger(sessionCount) || sessionCount < 1 || sessionCount > 2) fail("--sessions must be 1 or 2")
 if (!Number.isInteger(rounds) || rounds < 1) fail("--rounds must be a positive integer")
@@ -104,14 +104,14 @@ const percentile = (samples: number[], p: number) => {
 const mean = (samples: number[]) => (samples.length === 0 ? undefined : samples.reduce((a, b) => a + b, 0) / samples.length)
 
 // Deterministic provider seam: each round runs read (fixture file), then a
-// guarded write (unique note file, journaled), then a short text reply. No
-// network access, unlimited replays, and every round executes the real
-// read, write, and journal paths.
+// guarded apply_patch add (unique note file, journaled), then a short text
+// reply. No network access, unlimited replays, and every round executes the
+// real read, patch, and journal paths.
 const providerCalls = { current: 0 }
-const writeCallCount = { current: 0 }
+const patchCallCount = { current: 0 }
 // Self-synchronizing answers: the request body decides the reply, so title
 // requests or retries can never desynchronize the tool flow. Zero tool
-// messages -> read call, one -> guarded write call, two or more -> text.
+// messages -> read call, one -> guarded patch call, two or more -> text.
 const readBodyText = (request: HttpClientRequest.HttpClientRequest): string | undefined => {
   const body = request.body as unknown as { readonly _tag?: string; readonly body?: unknown } | undefined
   if (!body) return undefined
@@ -152,7 +152,7 @@ const fakeExecutor = Layer.succeed(
           return counted % 3
         })()
         if (process.env.BENCH_DEBUG_PROVIDER === "1")
-          console.error(`[bench-provider] call=${providerCalls.current} toolMessages=${step} reply=${step === 0 ? "read" : step === 1 ? "write" : "text"}`)
+          console.error(`[bench-provider] call=${providerCalls.current} toolMessages=${step} reply=${step === 0 ? "read" : step === 1 ? "patch" : "text"}`)
         const toolCall =
           step === 0
             ? sse(
@@ -160,7 +160,7 @@ const fakeExecutor = Layer.succeed(
               )
             : step === 1
               ? sse(
-                  `{"id":"chatcmpl-bench","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_bench_write_${++writeCallCount.current}","type":"function","function":{"name":"write","arguments":"{\\"path\\":\\"note-${writeCallCount.current}.txt\\",\\"content\\":\\"benchmark note ${writeCallCount.current}\\",\\"expectedAbsent\\":true}"}}]},"finish_reason":"tool_calls"}]}`,
+                  `{"id":"chatcmpl-bench","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_bench_patch_${++patchCallCount.current}","type":"function","function":{"name":"apply_patch","arguments":"{\\"patchText\\":\\"*** Begin Patch\\n*** Add File: note-${patchCallCount.current}.txt\\n+benchmark note ${patchCallCount.current}\\n*** End Patch\\"}"}}]},"finish_reason":"tool_calls"}]}`,
                 )
               : sse(
                   '{"id":"chatcmpl-bench","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"Done."}}]}',
@@ -283,10 +283,11 @@ const makeLayers = (dataDir: string, projectDir: string) => {
       Layer.provide(global),
       Layer.provide(config),
     ),
-    WriteTool.layer.pipe(
+    ApplyPatchTool.layer.pipe(
       Layer.provide(registry),
       Layer.provide(mutationResolution),
       Layer.provide(files),
+      Layer.provide(FSUtil.defaultLayer),
       Layer.provide(permission),
       Layer.provide(journal),
       Layer.provide(config),
@@ -341,6 +342,7 @@ const makeLayers = (dataDir: string, projectDir: string) => {
   const sessionLocations = Layer.succeed(
     LocationServiceMap,
     LocationServiceMap.of({
+      bindExecution: () => Effect.void,
       get: () => Layer.empty as never,
       invalidate: () => Effect.void,
     }),

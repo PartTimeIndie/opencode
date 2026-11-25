@@ -37,6 +37,7 @@ import { SettingsModelTargetPickerV2 } from "../settings-model-target-picker"
 import { safetyReviewTargetReference, safetyReviewTargetWrite } from "@/context/model-chain-safety-review-snapshot"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
+import { SettingsProjectIcons } from "./project-icons"
 import "./settings-v2.css"
 
 let demoSoundState = {
@@ -1095,6 +1096,8 @@ export const SettingsGeneralV2: Component = () => {
         <TurnCompletionSection />
 
         <AppearanceSection />
+
+        <SettingsProjectIcons />
 
         <NotificationsSection />
 

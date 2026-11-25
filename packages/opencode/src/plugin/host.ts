@@ -1,12 +1,16 @@
 import { Effect, Exit, Fiber, Scope, Schema } from "effect"
+import { and, desc, eq } from "drizzle-orm"
 import type { ServerPluginHost } from "@opencode-ai/plugin/server"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionLinks } from "@opencode-ai/core/session/links"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionInputTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
 import { SessionExecutionView } from "@opencode-ai/core/session/execution-view"
+import { OutputFormat } from "@opencode-ai/core/session/prompt"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionArchive } from "@opencode-ai/core/session-archive"
 import { Location } from "@opencode-ai/core/location"
@@ -20,8 +24,9 @@ import { SessionPlanDocument } from "@opencode-ai/core/session/plan-document"
 import { Surface } from "@opencode-ai/core/surface"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EffectBridge } from "@/effect/bridge"
-import { completionRegistry } from "./completion"
+import { completionRegistry, goalOwnershipRegistry } from "./completion"
 import { mediaRegistry } from "./media"
+import { samePluginScope } from "./directory"
 import { FanoutWorkflow } from "@opencode-ai/core/fanout-workflow"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 
@@ -52,6 +57,7 @@ export function createPluginHost(input: { pluginID: string; directory: string; b
   const identity = (link: { source_session_id: string; target_session_id: string }) => ({ sourceSessionID: link.source_session_id, targetSessionID: link.target_session_id })
   const host: ServerPluginHost = {
     version: InstallationVersion,
+    signal: controller.signal,
     media: { register: async (adapters) => {
       if (controller.signal.aborted) throw new Error("Plugin host has been unloaded")
       const scope = await lifetime
@@ -72,22 +78,122 @@ export function createPluginHost(input: { pluginID: string; directory: string; b
           await input.bridge.promise(Scope.addFinalizer(scope, Effect.sync(release)))
         },
       },
+      goalOwnership: {
+        project: (request) => run(Effect.gen(function* () {
+          const sessions = yield* SessionV2.Service
+          const sessionID = SessionSchema.ID.make(request.sessionID)
+          const session = yield* sessions.get(sessionID)
+          if (!(yield* Effect.promise(() => samePluginScope(session.location.directory, input.directory)))) throw new Error("Session belongs to another plugin location")
+          if (!sessions.compareAndPatchMetadata) throw new Error("Goal status CAS is unavailable")
+          return yield* sessions.compareAndPatchMetadata({ sessionID,
+            expectedMetadata: { "opencode.session.goal": request.condition, "opencode.session.goal_run": request.runID, "opencode.session.goal_status": request.expectedStatus },
+            patch: { set: { "opencode.session.goal_status": request.status } },
+          })
+        })),
+        clear: (request) => run(Effect.gen(function* () {
+          if (!request.runID) throw new Error("Goal cleanup requires a run ID")
+          const sessions = yield* SessionV2.Service
+          const sessionID = SessionSchema.ID.make(request.sessionID)
+          const session = yield* sessions.get(sessionID)
+          if (!(yield* Effect.promise(() => samePluginScope(session.location.directory, input.directory)))) throw new Error("Session belongs to another plugin location")
+          yield* sessions.patchMetadata({
+            sessionID,
+            expectedMetadata: { "opencode.session.goal": request.condition, "opencode.session.goal_run": request.runID },
+            patch: { unset: ["opencode.session.goal", "opencode.session.goal_run", "opencode.session.goal_status"] },
+          })
+        })),
+        register: async (policy) => {
+          if (controller.signal.aborted) throw new Error("Plugin host has been unloaded")
+          const scope = await lifetime
+          if (controller.signal.aborted) throw new Error("Plugin host has been unloaded")
+          const release = goalOwnershipRegistry.register(input.directory, policy)
+          await input.bridge.promise(Scope.addFinalizer(scope, Effect.sync(release)))
+        },
+      },
+      admissionHead: (request) => run(Effect.gen(function* () {
+        const sessionID = SessionSchema.ID.make(request.sessionID)
+        const session = yield* (yield* SessionV2.Service).get(sessionID)
+        if (!(yield* Effect.promise(() => samePluginScope(session.location.directory, input.directory)))) throw new Error("Session belongs to another plugin location")
+        const { db } = yield* Database.Service
+        const latest = yield* db.select({ id: SessionInputTable.id }).from(SessionInputTable)
+          .where(eq(SessionInputTable.session_id, sessionID)).orderBy(desc(SessionInputTable.admitted_seq))
+          .limit(1).get().pipe(Effect.orDie)
+        return { id: latest?.id ?? null }
+      })),
+      prompt: (request) => run(Effect.gen(function* () {
+        const sessions = yield* SessionV2.Service
+        const sessionID = SessionSchema.ID.make(request.sessionID)
+        const session = yield* sessions.get(sessionID)
+        if (!(yield* Effect.promise(() => samePluginScope(session.location.directory, input.directory)))) throw new Error("Session belongs to another plugin location")
+        const id = request.goal ? SessionMessage.ID.create() : undefined
+        const goalStatus = request.goal ? JSON.stringify({ ...JSON.parse(request.goal.status), active: { promptID: id } }) : undefined
+        // The host, not request text, attests plugin-generated admissions.
+        const admitted = yield* sessions.prompt({
+          sessionID,
+          ...(id ? { id } : {}),
+          ...(request.goal ? {
+            expectedMetadata: { "opencode.session.goal": request.goal.condition, "opencode.session.goal_run": request.goal.runID, "opencode.session.goal_status": request.goal.expectedStatus },
+            metadataPatchOnAdmission: { set: { "opencode.session.goal_status": goalStatus } },
+          } : {}),
+          prompt: {
+            text: request.text,
+            ...(request.format === undefined ? {} : { format: Schema.decodeUnknownSync(OutputFormat)(request.format) }),
+          },
+          origin: "plugin",
+          ...(request.expectedLatestInputID === undefined ? {} : {
+            expectedLatestInputID: request.expectedLatestInputID === null ? null : SessionMessage.ID.make(request.expectedLatestInputID),
+          }),
+        })
+        return { id: admitted.id, ...(goalStatus ? { goalStatus } : {}) }
+      })),
+      inputOrigin: (request) => run(Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const row = yield* db
+          .select({ origin: SessionInputTable.origin })
+          .from(SessionInputTable)
+          .where(
+            and(
+              eq(SessionInputTable.id, SessionMessage.ID.make(request.inputID)),
+              eq(SessionInputTable.session_id, SessionSchema.ID.make(request.sessionID)),
+            ),
+          )
+          .get()
+          .pipe(Effect.orDie)
+        return row?.origin ?? "unknown"
+      })),
       exists: (sessionID) => run(Effect.gen(function* () {
         const active = yield* (yield* SessionV2.Service).get(SessionSchema.ID.make(sessionID)).pipe(Effect.option)
-        if (active._tag === "Some") return active.value.location.directory === input.directory
+        if (active._tag === "Some") return yield* Effect.promise(() => samePluginScope(active.value.location.directory, input.directory))
         const archive = yield* Effect.serviceOption(SessionArchive.Service)
         if (archive._tag === "None") return false
         return yield* archive.value.getCatalog(SessionSchema.ID.make(sessionID)).pipe(
-          Effect.map((entry) => entry.location === "archived" && entry.directory === input.directory),
+          Effect.flatMap((entry) => entry.location === "archived" ? Effect.promise(() => samePluginScope(entry.directory, input.directory)) : Effect.succeed(false)),
           Effect.catchTag("SessionArchive.NotFoundError", () => Effect.succeed(false)),
         )
       })),
       execution: {
         read: (request) => run(Effect.gen(function* () {
           const session = yield* (yield* SessionV2.Service).get(SessionSchema.ID.make(request.sessionID))
-          if (session.location.directory !== input.directory) return yield* Effect.fail(new Error("Session belongs to another plugin location"))
+          if (!(yield* Effect.promise(() => samePluginScope(session.location.directory, input.directory)))) return yield* Effect.fail(new Error("Session belongs to another plugin location"))
           return yield* SessionExecutionView.read(yield* Database.Service, request)
         })),
+        readMainTask: (request) => {
+          const binding = { ...request }
+          return run(Effect.gen(function* () {
+            const sessions = yield* SessionV2.Service
+            const assertScope = Effect.gen(function* () {
+              for (const id of [binding.parentSessionID, binding.sessionID]) {
+                const session = yield* sessions.get(SessionSchema.ID.make(id))
+                if (!(yield* Effect.promise(() => samePluginScope(session.location.directory, input.directory))))
+                  return yield* Effect.fail(new Error("Session belongs to another plugin location"))
+              }
+            })
+            yield* assertScope
+            const observation = yield* SessionExecutionView.readMainTask(yield* Database.Service, binding)
+            yield* assertScope
+            return observation
+          }))
+        },
       },
       links: {
         get: (sessionID) => run(Effect.gen(function* () {
@@ -97,7 +203,7 @@ export function createPluginHost(input: { pluginID: string; directory: string; b
         start: (request) => run(Effect.gen(function* () {
           const sessions = yield* SessionV2.Service
           const target = yield* sessions.get(SessionSchema.ID.make(request.targetSessionID))
-          if (target.location.directory !== input.directory) return yield* Effect.fail(new Error("Session belongs to another plugin location"))
+          if (!(yield* Effect.promise(() => samePluginScope(target.location.directory, input.directory)))) return yield* Effect.fail(new Error("Session belongs to another plugin location"))
           const links = yield* SessionLinks.Service
           return identity(yield* links.start({
             ...request, pluginID: input.pluginID,
@@ -154,7 +260,10 @@ export function createPluginHost(input: { pluginID: string; directory: string; b
                 signal.addEventListener("abort", abort, { once: true })
                 Promise.resolve().then(() => {
                   if (signal.aborted) throw new Error("Plugin tool execution was cancelled")
-                  return definition.execute(args, { ...context, abort: signal })
+                  return CrashActivity.trackPromise(
+                    { kind: "plugin", pluginID: input.pluginID, sessionID: context.sessionID, name: `tool.${name}` },
+                    async () => definition.execute(args, { ...context, abort: signal }),
+                  )
                 }).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort))
               })
             },

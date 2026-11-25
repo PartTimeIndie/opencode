@@ -8,6 +8,18 @@ import {
   resolveCommitTarget,
   snapshotWorktree,
 } from "./commit-target.js"
+import { computeGraph } from "./history-graph.js"
+import {
+  appendMessageChunk,
+  applyHistoryError,
+  applyHistoryPage,
+  beginHistoryLoad,
+  createHistoryState,
+  parsePersistedFilter,
+  persistedFilterKey,
+  resetToHead,
+  selectHistoryBranch,
+} from "./history-state.js"
 
 const ICON = new URL("./assets/git-workbench-icon.svg", import.meta.url).href
 const TOOLBAR_ICON = new URL("./assets/git-workbench-toolbar.svg", import.meta.url).href
@@ -90,6 +102,8 @@ export default {
       composerToolbarDispose: undefined,
       composerToolbarBusy: undefined,
       syncComposerToolbar: undefined,
+      historyByRepo: new Map(),
+      history: undefined,
     }
 
     const composerCommitDefault = api.settings.get("showToolbarCommit", DEFAULT_SETTINGS.showComposerCommit)
@@ -119,8 +133,8 @@ export default {
             {
               key: "historyLimit",
               type: "number",
-              label: "History limit",
-              description: "Maximum commits loaded into the history tree.",
+              label: "History page size",
+              description: "Commits per history page. \"Mehr laden\" appends further pages until the full history is loaded.",
               min: 25,
               max: 1000,
               default: DEFAULT_SETTINGS.historyLimit,
@@ -497,7 +511,16 @@ export async function refreshSnapshot(api, state, options = {}) {
     }
     if (!state.selectedCommit && state.snapshot.history[0]) state.selectedCommit = state.snapshot.history[0].hash
     if (state.selectedCommit && !state.snapshot.history.some((commit) => commit.hash === state.selectedCommit)) {
-      state.selectedCommit = state.snapshot.history[0]?.hash ?? ""
+      // A selection from the anchored branch history stays valid even when the
+      // capped legacy snapshot window no longer contains it.
+      const branchHistory = supportsHistoryApi(api)
+        ? state.historyByRepo?.get(repositoryKey(directory))
+        : undefined
+      if (branchHistory?.byHash.has(state.selectedCommit)) {
+        // keep the selection
+      } else {
+        state.selectedCommit = state.snapshot.history[0]?.hash ?? ""
+      }
     }
     if (state.selectedFile && !state.snapshot.status.some((file) => file.file === state.selectedFile)) {
       state.selectedFile = state.snapshot.status[0]?.file ?? ""
@@ -1665,18 +1688,463 @@ async function copyPath(state, path) {
   }
 }
 
-function renderHistory(api, state, snapshot) {
+function supportsHistoryApi(api) {
+  return typeof api.host?.git?.history === "function"
+}
+
+function historyFor(api, state) {
+  const directory = selectedDirectory(api, state)
+  const repoKey = directory ? repositoryKey(directory) : ""
+  let history = state.historyByRepo.get(repoKey)
+  if (!history) {
+    history = createHistoryState()
+    const saved = parsePersistedFilter(api.kv.get(persistedFilterKey(repoKey), undefined))
+    if (saved) {
+      history.selector = saved.selector
+      history.ref = saved.ref
+      history.firstParent = saved.firstParent
+    }
+    state.historyByRepo.set(repoKey, history)
+  }
+  return history
+}
+
+function updateHistory(api, state, next) {
+  const directory = selectedDirectory(api, state)
+  const repoKey = directory ? repositoryKey(directory) : ""
+  state.historyByRepo.set(repoKey, next)
+  state.history = next
+}
+
+function currentHistoryFilter(history) {
+  return { selector: history.selector, ref: history.ref, firstParent: history.firstParent }
+}
+
+function persistHistoryFilter(api, state, history) {
+  const directory = selectedDirectory(api, state)
+  if (!directory) return
+  api.kv.set(persistedFilterKey(repositoryKey(directory)), { v: 1, ...currentHistoryFilter(history) })
+}
+
+function historyPageSize(state) {
+  const limit = Number(state.settings.historyLimit)
+  return Number.isFinite(limit) ? Math.max(25, Math.min(1000, Math.floor(limit))) : 200
+}
+
+function changeHistoryFilter(api, state, filter) {
+  const history = historyFor(api, state)
+  const next = selectHistoryBranch(history, filter)
+  persistHistoryFilter(api, state, next)
+  updateHistory(api, state, next)
+  renderAll(state)
+  void loadHistoryPage(api, state, { reset: true })
+}
+
+function refreshHistory(api, state) {
+  const history = historyFor(api, state)
+  const next = selectHistoryBranch(history, currentHistoryFilter(history))
+  updateHistory(api, state, next)
+  renderAll(state)
+  void refreshSnapshot(api, state, { quiet: true })
+  void loadHistoryPage(api, state, { reset: true })
+}
+
+async function loadHistoryPage(api, state, options = {}) {
+  const history = historyFor(api, state)
+  if (history.loading) return
+  if (!options.reset && !history.cursor) return
+  const directory = selectedDirectory(api, state)
+  if (!directory) return
+  const repoKey = repositoryKey(directory)
+  const generation = history.generation
+  const request = options.reset
+    ? {
+        directory,
+        selector: history.selector,
+        ...(history.selector === "branch" ? { ref: history.ref } : {}),
+        firstParent: history.selector === "all" ? false : history.firstParent,
+        limit: historyPageSize(state),
+      }
+    : { directory, cursor: history.cursor }
+  const pending = beginHistoryLoad(history)
+  state.historyByRepo.set(repoKey, pending)
+  if (state.history === history) state.history = pending
+  renderAll(state)
+  const settle = (next) => {
+    const current = state.historyByRepo.get(repoKey)
+    // Replies belong to the requesting repository identity: a switch to
+    // another repo (fresh states share generation numbers) must not inherit
+    // this page, its cursor or its error.
+    if (current !== pending) return false
+    state.historyByRepo.set(repoKey, next)
+    if (repositoryKey(selectedDirectory(api, state) ?? "") === repoKey && (state.history === pending || state.history === current)) {
+      state.history = next
+    }
+    return true
+  }
+  try {
+    const page = await api.host.git.history(request)
+    const current = state.historyByRepo.get(repoKey)
+    if (current !== pending) return
+    const result = applyHistoryPage(current, page, generation)
+    if (!result.applied) return
+    settle(result.state)
+  } catch (error) {
+    if (isCancellation(error)) return
+    const current = state.historyByRepo.get(repoKey)
+    if (current !== pending) return
+    const result = applyHistoryError(current, error, generation)
+    if (!result.applied) return
+    if (result.state.error?.code === "invalid_ref" && current.selector === "branch" && options.reset) {
+      const fallback = resetToHead(result.state, "Saved branch not found — showing the checked-out branch instead")
+      if (settle(fallback) && repositoryKey(selectedDirectory(api, state) ?? "") === repoKey) {
+        persistHistoryFilter(api, state, fallback)
+        state.notice = fallback.notice
+      } else if (state.historyByRepo.get(repoKey) === fallback) {
+        api.kv.set(persistedFilterKey(repoKey), { v: 1, ...currentHistoryFilter(fallback) })
+      }
+    } else {
+      settle(result.state)
+    }
+  } finally {
+    renderAll(state)
+  }
+}
+
+function loadMoreHistory(api, state) {
+  void loadHistoryPage(api, state, {})
+}
+
+function retryHistory(api, state) {
+  const history = historyFor(api, state)
+  void loadHistoryPage(api, state, { reset: !history.cursor })
+}
+
+const pendingMessageChunks = new WeakSet()
+
+async function loadCommitMessage(api, state, commit) {
+  const history = historyFor(api, state)
+  const directory = selectedDirectory(api, state)
+  if (!directory) return
+  const repoKey = repositoryKey(directory)
+  const generation = history.generation
+  const existing = history.messageTexts.get(commit.hash)
+  const cursor = existing?.cursor
+  if (pendingMessageChunks.has(history)) return
+  pendingMessageChunks.add(history)
+  try {
+    const chunk = await api.host.git.commitMessage({
+      directory,
+      ...(cursor ? { cursor } : { hash: commit.hash }),
+    })
+    const current = state.historyByRepo.get(repoKey)
+    // Stale chunks (repository switched, filter/refresh bumped the
+    // generation, or a duplicate click raced) must not append.
+    if (current !== history || current.generation !== generation || !current.byHash.has(commit.hash)) return
+    const next = appendMessageChunk(current, commit.hash, chunk)
+    state.historyByRepo.set(repoKey, next)
+    if (repositoryKey(selectedDirectory(api, state) ?? "") === repoKey) state.history = next
+  } catch (error) {
+    if (!isCancellation(error) && state.historyByRepo.get(repoKey) === history && repositoryKey(selectedDirectory(api, state) ?? "") === repoKey) {
+      state.notice = error instanceof Error ? error.message : String(error)
+    }
+  } finally {
+    pendingMessageChunks.delete(history)
+  }
+  renderAll(state)
+}
+
+function historyBranchLabel(snapshot) {
+  return snapshot?.info?.branch || "HEAD (detached)"
+}
+
+function renderHistoryControls(api, state, snapshot, history) {
+  const controls = node("div", "oc-git-workbench__history-controls")
+  const label = node("label", "oc-git-workbench__history-control", "Branch")
+  const select = document.createElement("select")
+  select.className = "oc-git-workbench__history-select"
+  select.setAttribute("aria-label", "Filter history by branch")
+  const addOption = (value, text, selected) => {
+    const option = document.createElement("option")
+    option.value = value
+    option.textContent = text
+    if (selected) option.selected = true
+    select.append(option)
+  }
+  const addGroup = (name, entries) => {
+    if (!entries.length) return
+    const group = document.createElement("optgroup")
+    group.label = name
+    for (const entry of entries) {
+      const option = document.createElement("option")
+      option.value = entry.value
+      option.textContent = entry.label
+      if (entry.selected) option.selected = true
+      group.append(option)
+    }
+    select.append(group)
+  }
+  const currentFilterValue = history.selector === "all" ? "__all__" : history.selector === "head" ? "__head__" : `ref:${history.ref}`
+  addOption("__all__", "Alle Branches", currentFilterValue === "__all__")
+  addOption("__head__", historyBranchLabel(snapshot), currentFilterValue === "__head__")
+  const branches = Array.isArray(snapshot?.branches) ? snapshot.branches : []
+  const usable = branches.filter((branch) => typeof branch.ref === "string" && branch.ref)
+  addGroup(
+    "Lokale Branches",
+    usable
+      .filter((branch) => !branch.remote)
+      .map((branch) => ({ value: `ref:${branch.ref}`, label: branch.name, selected: currentFilterValue === `ref:${branch.ref}` })),
+  )
+  addGroup(
+    "Remote-Branches",
+    usable
+      .filter((branch) => branch.remote)
+      .map((branch) => ({ value: `ref:${branch.ref}`, label: branch.name, selected: currentFilterValue === `ref:${branch.ref}` })),
+  )
+  select.addEventListener("change", () => {
+    const value = select.value
+    if (value === "__all__") changeHistoryFilter(api, state, { selector: "all", ref: "", firstParent: false })
+    else if (value === "__head__") changeHistoryFilter(api, state, { selector: "head", ref: "", firstParent: history.firstParent })
+    else if (value.startsWith("ref:")) changeHistoryFilter(api, state, { selector: "branch", ref: value.slice(4), firstParent: history.firstParent })
+  })
+  label.append(select)
+  controls.append(label)
+
+  const firstParentLabel = node("label", "oc-git-workbench__history-control oc-git-workbench__history-toggle")
+  const firstParentCheck = document.createElement("input")
+  firstParentCheck.type = "checkbox"
+  firstParentCheck.checked = history.firstParent
+  firstParentCheck.disabled = history.selector === "all"
+  firstParentCheck.title = history.selector === "all" ? "Nur Hauptlinie ist bei „Alle Branches“ nicht verfügbar" : "Zeigt nur die direkte Hauptlinie"
+  firstParentCheck.addEventListener("change", () => {
+    changeHistoryFilter(api, state, { selector: history.selector, ref: history.ref, firstParent: firstParentCheck.checked })
+  })
+  firstParentLabel.append(firstParentCheck, node("span", "", "Nur Hauptlinie"))
+  controls.append(firstParentLabel)
+
+  const refreshButton = textButton("Aktualisieren", () => refreshHistory(api, state), undefined, undefined, Boolean(state.busy))
+  refreshButton.title = "History neu verankern, um neue Commits zu sehen"
+  controls.append(refreshButton)
+  return controls
+}
+
+function renderHistoryErrorBlock(api, state, history) {
+  const block = node("div", "oc-git-workbench__history-error")
+  const error = history.error ?? { message: "History failed to load", recovery: "retry" }
+  block.append(node("span", "oc-git-workbench__history-error-text", error.message))
+  if (error.recovery === "retry" || error.recovery === "none") {
+    block.append(textButton("Erneut versuchen", () => retryHistory(api, state), undefined, undefined, false))
+  }
+  if (error.recovery === "refresh" || error.recovery === "retry") {
+    block.append(textButton("Aktualisieren", () => refreshHistory(api, state), undefined, undefined, false))
+  }
+  return block
+}
+
+function renderHistoryFootnote(state, history) {
+  const footnotes = []
+  if (!history.loaded) footnotes.push("History wird geladen …")
+  if (history.loaded && !history.hasMore) {
+    const shallow = history.commits.some((commit) => commit.boundary === "shallow")
+    footnotes.push(
+      shallow
+        ? "Ende der lokal verfügbaren History (flache Kopie)"
+        : `Anfang der Historie erreicht (${history.commits.length} Commits)`,
+    )
+  }
+  if (history.loaded) footnotes.push("Neue Commits erscheinen nach „Aktualisieren“.")
+  if (!footnotes.length) return undefined
+  return node("p", "oc-git-workbench__history-footnote", footnotes.join(" · "))
+}
+
+function renderHistoryWindow(api, state, history) {
+  const list = node("div", "oc-git-workbench__history-list oc-git-workbench__history-window")
+  if (!history.commits.length) {
+    if (history.loading) list.append(emptyBlock("Loading history", "Branch-filtered history is loading."))
+    else if (!history.error) list.append(emptyBlock("No commits", "This repository has no commit history yet."))
+    return list
+  }
+  const data = history.commits
+  const graph = computeGraph(data, { firstParent: history.firstParent })
+  const refsByHash = new Map()
+  for (const entry of history.refLabels ?? []) {
+    if (!entry || typeof entry.hash !== "string") continue
+    const existing = refsByHash.get(entry.hash) ?? []
+    existing.push(entry.label)
+    refsByHash.set(entry.hash, existing)
+  }
+  const spacerTop = node("div", "oc-git-workbench__history-spacer")
+  const rows = node("div", "oc-git-workbench__history-rows")
+  const spacerBottom = node("div", "oc-git-workbench__history-spacer")
+  list.append(spacerTop, rows, spacerBottom)
+  // Exact virtual pitch: 34px row + 4px gap. The rows container has no
+  // vertical padding so spacers and scroll offsets share one coordinate space.
+  const rowHeight = 38
+  const overscan = 24
+  let frame = 0
+  const renderWindow = () => {
+    const viewport = list.clientHeight || 480
+    const start = Math.max(0, Math.floor(list.scrollTop / rowHeight) - overscan)
+    const end = Math.min(data.length, Math.ceil((list.scrollTop + viewport) / rowHeight) + overscan)
+    spacerTop.style.height = `${start * rowHeight}px`
+    spacerBottom.style.height = `${Math.max(0, data.length - end) * rowHeight}px`
+    const slice = []
+    for (let i = start; i < end; i++) {
+      const row = graph.rows[i]
+      if (row) slice.push(renderHistoryCommitRow(api, state, data[i], row, refsByHash, graph, history))
+    }
+    rows.replaceChildren(...slice)
+  }
+  const repoKey = repositoryKey(selectedDirectory(api, state) ?? "")
+  const onScroll = () => {
+    if (repositoryKey(selectedDirectory(api, state) ?? "") !== repoKey) return
+    const current = historyFor(api, state)
+    if (current.generation === history.generation) current.scrollTop = list.scrollTop
+    if (frame) return
+    frame = requestAnimationFrame(() => {
+      frame = 0
+      renderWindow()
+    })
+  }
+  list.addEventListener("scroll", onScroll)
+  renderWindow()
+  if (history.scrollTop) requestAnimationFrame(() => {
+    if (!list.isConnected || repositoryKey(selectedDirectory(api, state) ?? "") !== repoKey) return
+    list.scrollTop = historyFor(api, state).scrollTop ?? 0
+    renderWindow()
+  })
+  return list
+}
+
+function historyGraphSvg(row, rowNode, rowHeight = 34, laneWidth = 13) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
+  const laneCount = Math.max(row.before.length, row.after.length, row.lane + 1)
+  svg.setAttribute("width", String(laneCount * laneWidth))
+  svg.setAttribute("height", String(rowHeight))
+  svg.setAttribute("aria-hidden", "true")
+  svg.classList.add("oc-git-workbench__graph-svg")
+  const x = (lane) => lane * laneWidth + 7
+  const mid = rowHeight / 2
+  const laneClass = (lane) => `oc-git-workbench__lane-${((lane % 8) + 8) % 8}`
+  const addLine = (x1, y1, x2, y2, lane) => {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", "line")
+    el.setAttribute("x1", String(x1))
+    el.setAttribute("y1", String(y1))
+    el.setAttribute("x2", String(x2))
+    el.setAttribute("y2", String(y2))
+    el.setAttribute("class", `oc-git-workbench__edge ${laneClass(lane)}`)
+    svg.append(el)
+  }
+  const addCurve = (x1, y1, x2, y2, lane) => {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", "path")
+    const bend = (y2 - y1) / 2
+    el.setAttribute("d", `M ${x1} ${y1} C ${x1} ${y1 + bend}, ${x2} ${y2 - bend}, ${x2} ${y2}`)
+    el.setAttribute("class", `oc-git-workbench__edge ${laneClass(lane)}`)
+    svg.append(el)
+  }
+  const laneTotal = Math.max(row.before.length, row.after.length)
+  for (let c = 0; c < laneTotal; c++) {
+    const bh = row.before[c]
+    const ah = row.after[c]
+    if (bh && bh === row.hash) {
+      if (c === row.lane) addLine(x(c), 0, x(c), mid, c)
+      else addCurve(x(c), 0, x(row.lane), mid, c)
+    } else if (bh && ah === bh) {
+      addLine(x(c), 0, x(c), rowHeight, c)
+    }
+    if (ah && ah !== bh && ah !== row.hash) {
+      if (c === row.lane) addLine(x(c), mid, x(c), rowHeight, c)
+      else addCurve(x(row.lane), mid, x(c), rowHeight, c)
+    }
+  }
+  // Outgoing edges recorded by the layout must be drawn explicitly: an edge
+  // to a parent lane that already existed changes no column and would be
+  // invisible in the before/after diff above (ordinary fork/merge joins).
+  for (const edge of rowNode.out) {
+    if (edge.curve) addCurve(x(row.lane), mid, x(edge.to), rowHeight, row.lane)
+  }
+  const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle")
+  dot.setAttribute("cx", String(x(row.lane)))
+  dot.setAttribute("cy", String(mid))
+  dot.setAttribute("r", row.parents > 1 ? "5" : "4")
+  dot.setAttribute("class", `oc-git-workbench__node ${laneClass(row.lane)}${row.parents > 1 ? " oc-git-workbench__node--merge" : ""}`)
+  svg.append(dot)
+  return svg
+}
+
+function renderHistoryCommitRow(api, state, commit, row, refsByHash, graph, history) {
+  const rowNode = graph.nodes.get(commit.hash) ?? { out: [] }
+  const rowElement = node("button", "oc-git-workbench__commit-row oc-git-workbench__history-row")
+  rowElement.type = "button"
+  rowElement.setAttribute("aria-selected", String(state.selectedCommit === commit.hash))
+  rowElement.addEventListener("click", () => {
+    const list = rowElement.closest(".oc-git-workbench__history-window")
+    const scrollTop = list ? list.scrollTop : 0
+    updateHistory(api, state, { ...historyFor(api, state), scrollTop })
+    state.selectedCommit = commit.hash
+    api.kv.set("selectedCommit", commit.hash)
+    renderAll(state)
+  })
+  const graphCell = node("span", "oc-git-workbench__graph oc-git-workbench__graph-cell")
+  graphCell.append(historyGraphSvg(row, rowNode))
+  const body = node("span", "oc-git-workbench__commit-body")
+  const subject = node("span", "oc-git-workbench__commit-subject", commit.subject || commit.short)
+  const meta = node(
+    "span",
+    "oc-git-workbench__commit-meta",
+    `${commit.short} ${commit.author || ""} ${relativeDate(commit.date)}`.trim(),
+  )
+  body.append(subject, meta)
+  const refs = node("span", "oc-git-workbench__refs")
+  for (const ref of refsByHash.get(commit.hash) ?? []) refs.append(pill(ref))
+  if (commit.hash === history.headOid) refs.append(pill("HEAD"))
+  if (commit.boundary === "shallow") {
+    const marker = pill("lokale Grenze")
+    marker.title = "Flache Kopie: Historie oberhalb ist lokal nicht verfügbar"
+    refs.append(marker)
+  }
+  rowElement.append(graphCell, body, refs)
+  return rowElement
+}
+
+function renderBranchHistory(api, state, snapshot) {
   const section = node("div", "oc-git-workbench__history")
-  const list = node("div", "oc-git-workbench__history-list")
-  if (!snapshot.history.length) {
-    list.append(emptyBlock("No commits", "This repository has no commit history yet."))
+  const history = historyFor(api, state)
+  state.history = history
+  section.append(renderHistoryControls(api, state, snapshot, history))
+  if (history.error) section.append(renderHistoryErrorBlock(api, state, history))
+  const footnote = renderHistoryFootnote(state, history)
+  if (footnote) section.append(footnote)
+  if (!history.loaded && !history.loading && !history.error) {
+    void loadHistoryPage(api, state, { reset: true })
+  } else if (history.loaded && history.hasMore && !history.loading && !history.error && history.cursor) {
+    const more = node("div", "oc-git-workbench__history-more")
+    more.append(textButton(`Mehr laden (${history.commits.length})`, () => loadMoreHistory(api, state), undefined, undefined, false))
+    section.append(more)
+  } else if (history.loading && history.commits.length) {
+    section.append(node("p", "oc-git-workbench__history-loading", "Lade weitere Commits …"))
   }
-  for (const [index, commit] of snapshot.history.entries()) {
-    list.append(renderCommitRow(api, state, commit, index))
-  }
-  section.append(list)
+  section.append(renderHistoryWindow(api, state, history))
   section.append(renderCommitDetails(api, state, snapshot))
   return section
+}
+
+function renderHistory(api, state, snapshot) {
+  if (!supportsHistoryApi(api)) {
+    // Older host without history(): keep the previous flat snapshot list.
+    const section = node("div", "oc-git-workbench__history")
+    const list = node("div", "oc-git-workbench__history-list")
+    if (!snapshot.history.length) {
+      list.append(emptyBlock("No commits", "This repository has no commit history yet."))
+    }
+    for (const [index, commit] of snapshot.history.entries()) {
+      list.append(renderCommitRow(api, state, commit, index))
+    }
+    section.append(list)
+    section.append(renderCommitDetails(api, state, snapshot))
+    return section
+  }
+  return renderBranchHistory(api, state, snapshot)
 }
 
 function renderCommitRow(api, state, commit, index) {
@@ -1711,7 +2179,21 @@ function renderCommitRow(api, state, commit, index) {
 }
 
 function renderCommitDetails(api, state, snapshot) {
-  const commit = snapshot.history.find((item) => item.hash === state.selectedCommit) ?? snapshot.history[0]
+  const history = supportsHistoryApi(api) ? historyFor(api, state) : undefined
+  const historyLoaded = Boolean(history?.loaded)
+  const historyCommit = history?.byHash.get(state.selectedCommit)
+  // With the filtered history loaded, details/actions may only target commits
+  // of that history; the legacy snapshot fallback stays reserved for old hosts
+  // without the history API.
+  // A selected commit outside the active filter must never expose actions for
+  // a stale legacy snapshot row. Move selection before resolving details.
+  if (historyLoaded && !historyCommit && history.commits.length) {
+    state.selectedCommit = history.commits[0].hash
+    api.kv.set("selectedCommit", state.selectedCommit)
+  }
+  const commit = historyLoaded
+    ? history.byHash.get(state.selectedCommit)
+    : snapshot.history.find((item) => item.hash === state.selectedCommit) ?? snapshot.history[0]
   const panel = node("div", "oc-git-workbench__details")
   if (!commit) {
     panel.append(emptyBlock("Select a commit", "Commit details and history actions appear here."))
@@ -1721,7 +2203,18 @@ function renderCommitDetails(api, state, snapshot) {
   panel.append(
     node("p", "oc-git-workbench__muted", `${commit.hash}\n${commit.author} <${commit.email}> ${commit.date}`),
   )
-  if (commit.body) panel.append(node("pre", "oc-git-workbench__commit-message", commit.body))
+  const extended = history?.messageTexts.get(commit.hash)
+  const extendedText = extended?.text
+  const extendedBody =
+    typeof extendedText === "string" && extendedText.includes("\n\n")
+      ? extendedText.slice(extendedText.indexOf("\n\n") + 2)
+      : extendedText
+  const bodyText = extendedBody ?? commit.body
+  if (bodyText) panel.append(node("pre", "oc-git-workbench__commit-message", bodyText))
+  const needsMoreText = commit.bodyTruncated === true && !(extended && !extended.truncated)
+  if (needsMoreText) {
+    panel.append(textButton("Mehr Committext laden", () => void loadCommitMessage(api, state, commit), undefined, undefined, false))
+  }
   const parents = node("div", "oc-git-workbench__parents")
   parents.append(node("span", "oc-git-workbench__muted", "Parents"))
   for (const parent of commit.parents || []) parents.append(pill(parent.slice(0, 12)))
@@ -2496,6 +2989,7 @@ function styleNode() {
     .oc-git-workbench {
       height: 100%;
       min-height: 0;
+      container-type: inline-size;
       --oc-git-accent: #3b82f6;
       --oc-git-success: #22c55e;
       --oc-git-warning: #f59e0b;
@@ -3038,6 +3532,142 @@ function styleNode() {
       grid-template-columns: minmax(220px, 1fr) minmax(220px, .8fr);
       gap: 10px;
     }
+    .oc-git-workbench__history-controls,
+    .oc-git-workbench__history-footnote,
+    .oc-git-workbench__history-more,
+    .oc-git-workbench__history-error {
+      grid-column: 1 / -1;
+    }
+    .oc-git-workbench__history-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .oc-git-workbench__history-control {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .oc-git-workbench__history-select {
+      min-width: 0;
+      max-width: 240px;
+      height: 26px;
+      border: 1px solid var(--border-weak-base);
+      border-radius: 5px;
+      background: var(--surface-panel, var(--background-stronger));
+      color: var(--text-base);
+      color-scheme: inherit;
+      font: 12px/1.3 var(--font-sans, ui-sans-serif, system-ui);
+      padding: 0 7px;
+    }
+    .oc-git-workbench__history-select:focus-visible {
+      outline: 2px solid rgba(59, 130, 246, .55);
+      outline-offset: 1px;
+    }
+    .oc-git-workbench__history-toggle input {
+      accent-color: var(--oc-git-accent, #22d3ee);
+    }
+    .oc-git-workbench__history-window {
+      grid-column: 1;
+      min-height: 0;
+      height: min(480px, 55vh);
+      max-height: 100%;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      display: block;
+      border: 1px solid var(--border-weak-base);
+      border-radius: 6px;
+      background: var(--background-stronger);
+    }
+    .oc-git-workbench__history-rows {
+      display: grid;
+      align-content: start;
+      gap: 4px;
+      padding: 0 4px;
+    }
+    .oc-git-workbench__history-row {
+      height: 34px;
+      min-height: 34px;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      padding: 2px 6px 2px 0;
+    }
+    /* Placed after the legacy commit-row rules so the history pitch wins. */
+    .oc-git-workbench__history-list .oc-git-workbench__history-row {
+      height: 34px;
+      min-height: 34px;
+    }
+    .oc-git-workbench__history-list .oc-git-workbench__graph-cell {
+      width: auto;
+    }
+    .oc-git-workbench__history-spacer {
+      width: 100%;
+      pointer-events: none;
+    }
+    .oc-git-workbench__graph-cell {
+      min-height: 0;
+      overflow: hidden;
+    }
+    .oc-git-workbench__graph-svg {
+      display: block;
+    }
+    .oc-git-workbench__edge {
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+    }
+    .oc-git-workbench__node {
+      stroke: #06111c;
+      stroke-width: 2;
+    }
+    .oc-git-workbench__lane-0 { stroke: #22d3ee; }
+    .oc-git-workbench__lane-1 { stroke: #a78bfa; }
+    .oc-git-workbench__lane-2 { stroke: #4ade80; }
+    .oc-git-workbench__lane-3 { stroke: #fbbf24; }
+    .oc-git-workbench__lane-4 { stroke: #f472b6; }
+    .oc-git-workbench__lane-5 { stroke: #60a5fa; }
+    .oc-git-workbench__lane-6 { stroke: #fb923c; }
+    .oc-git-workbench__lane-7 { stroke: #34d399; }
+    .oc-git-workbench__node {
+      fill: #22d3ee;
+    }
+    .oc-git-workbench__node.oc-git-workbench__lane-1 { fill: #a78bfa; }
+    .oc-git-workbench__node.oc-git-workbench__lane-2 { fill: #4ade80; }
+    .oc-git-workbench__node.oc-git-workbench__lane-3 { fill: #fbbf24; }
+    .oc-git-workbench__node.oc-git-workbench__lane-4 { fill: #f472b6; }
+    .oc-git-workbench__node.oc-git-workbench__lane-5 { fill: #60a5fa; }
+    .oc-git-workbench__node.oc-git-workbench__lane-6 { fill: #fb923c; }
+    .oc-git-workbench__node.oc-git-workbench__lane-7 { fill: #34d399; }
+    .oc-git-workbench__history-error {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid rgba(239, 68, 68, .5);
+      border-radius: 6px;
+      padding: 6px 8px;
+      background: rgba(239, 68, 68, .1);
+    }
+    .oc-git-workbench__history-error-text {
+      min-width: 0;
+      flex: 1;
+      font-size: 12px;
+    }
+    .oc-git-workbench__history-footnote {
+      margin: 0;
+      font-size: 12px;
+      opacity: .75;
+    }
+    .oc-git-workbench__history-loading {
+      grid-column: 1 / -1;
+      margin: 0;
+      font-size: 12px;
+      opacity: .75;
+    }
+    .oc-git-workbench__history-more {
+      display: flex;
+    }
     .oc-git-workbench__history-list {
       min-height: 0;
       display: grid;
@@ -3331,6 +3961,19 @@ function styleNode() {
       justify-content: flex-end;
       gap: 8px;
       flex-wrap: wrap;
+    }
+    @container (max-width: 540px) {
+      .oc-git-workbench__history {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .oc-git-workbench__history-window,
+      .oc-git-workbench__details {
+        grid-column: 1;
+        min-width: 0;
+      }
+      .oc-git-workbench__details {
+        position: static;
+      }
     }
     @media (max-width: 760px) {
       .oc-git-workbench__worktree,

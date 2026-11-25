@@ -7,6 +7,7 @@ import {
   isDeployableSourceFile,
   nativeWindowsCliOutput,
   requiredDesktopPackageFiles,
+  sourceFingerprintGitEnvironment,
 } from "../script/desktop-prod-deploy"
 
 describe("desktop prod deploy CLI packaging", () => {
@@ -75,6 +76,20 @@ describe("desktop prod deploy CLI packaging", () => {
 })
 
 describe("desktop prod deploy source fingerprint filter", () => {
+  test("removes inherited git config injection variables before source enumeration", () => {
+    expect(
+      sourceFingerprintGitEnvironment({
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "safe.directory",
+        GIT_CONFIG_VALUE_0: "*",
+        GIT_CONFIG_KEY_1: "core.autocrlf",
+        GIT_CONFIG_VALUE_1: "true",
+        GIT_DIR: "C:/repo/.git",
+        PATH: "C:/tools",
+      }),
+    ).toEqual({ GIT_DIR: "C:/repo/.git", PATH: "C:/tools" })
+  })
+
   test("excludes runtime caches that refresh while the app runs", () => {
     expect(isDeployableSourceFile("packages/opencode/.opencode/cache/cursor/cursor-models.json")).toBe(false)
     expect(isDeployableSourceFile("packages/app/.opencode/cache/example.json")).toBe(false)

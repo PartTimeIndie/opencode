@@ -12,15 +12,15 @@ export default {
     api.settings.register({ id: "spokenSummarySettings", title: "Kurz anhören", searchTerms: ["voice", "summary", "TTS", "vorlesen", "Sprachausgabe"], sections: [
       { title: "Zusammenfassung", fields: [
         { key: "summaryTarget", type: "model-target", label: "Zusammenfassungsmodell oder Kette", default: DEFAULTS.summaryTarget, required: true, autoSelectDefault: true, description: "Nur der nötige Chatausschnitt geht an dieses Modell. Kein neuer Agentenchat." },
-        { key: "language", type: "text", label: "Sprache", default: "de" },
-        { key: "targetWords", type: "number", label: "Zielwortzahl", min: 30, max: 100, default: 60, description: "Meist zwei bis drei Sätze; die tatsächliche Audiodauer hängt von Stimme und Tempo ab." },
+        { key: "language", type: "text", label: "Sprache der Zusammenfassung", default: DEFAULTS.language, description: "Steuert den Text, nicht den Akzent. Die passende Stimme wählst du unter Sprachausgabe." },
+        { key: "targetWords", type: "number", label: "Maximale Wortzahl", min: 30, max: 60, default: DEFAULTS.targetWords, description: "Ergebnis, wichtige Blockade mit Grund und höchstens zwei konkrete nächste Schritte. Darf kürzer sein; keine Testlisten." },
         { key: "cacheEnabled", type: "boolean", label: "Letzte Ansage im Arbeitsspeicher wiederverwenden", default: true, description: "Abschaltbar. Der aktuelle Chatstand wird trotzdem geprüft; keine Audio-/Chatdateien werden gespeichert." },
       ] },
       { title: "Sprachausgabe", fields: [
         { key: "speechTarget", type: "model-target", label: "Sprachmodell oder Kette", default: "", required: true, autoSelectSingle: true, filter: { purpose: "speech" }, description: "Nur die kurze Zusammenfassung geht an diesen Dienst. Je nach Anbieter externe Verarbeitung und Kosten." },
-        { key: "voice", type: "text", label: "Stimme", default: "", description: "Leere Auswahl nutzt eine unterstützte Anbieter-Stimme." },
-        { key: "speed", type: "number", label: "Sprechtempo", min: 0.5, max: 2, default: 1 },
-        { key: "voiceOverrides", type: "list", label: "Stimmen pro Modell", default: [], fields: [
+        { key: "voice", type: "voice", label: "Stimme", targetKey: "speechTarget", languageKey: "language", allowCustom: true, default: "", description: "Stimmen aus dem Modellkatalog mit Sprachhinweis. Einträge unter Stimmen pro Modell haben Vorrang. Leere oder unpassende Auswahl kann den Anbieterstandard nutzen." },
+        { key: "speed", type: "number", label: "Sprechtempo", min: 0.5, max: 2, default: DEFAULTS.speed },
+        { key: "voiceOverrides", type: "list", label: "Stimmen pro Modell", description: "Diese Einträge überschreiben die Hauptstimme für das jeweilige Modell. Nicht unterstützte IDs können auf eine Anbieter-Stimme zurückfallen.", default: [], fields: [
           { key: "model", type: "text", label: "Provider/Modell", default: "" },
           { key: "voice", type: "text", label: "Stimmen-ID", default: "" },
         ] },

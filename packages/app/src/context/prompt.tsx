@@ -52,6 +52,8 @@ export interface PromptAttachmentPart {
   sourcePath?: string
   mime: string
   dataUrl?: string
+  unpack?: boolean
+  annotation?: import("@/components/image-annotation/model").AnnotationRef
 }
 
 /** @deprecated Use PromptAttachmentPart. The discriminator remains stable for persisted drafts. */

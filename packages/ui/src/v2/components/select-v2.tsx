@@ -69,6 +69,10 @@ export type SelectV2Props<T> = Omit<
   numeric?: boolean
   children?: (item: T) => JSX.Element
   valueClass?: string
+  /** Keep a nested select within its owning modal's accessible subtree. */
+  portalMount?: HTMLElement
+  /** Scoped menu styling without changing other selects. */
+  contentClass?: string
 }
 
 export function SelectV2<T>(props: SelectV2Props<T>) {
@@ -92,6 +96,8 @@ export function SelectV2<T>(props: SelectV2Props<T>) {
     "numeric",
     "disabled",
     "valueClass",
+    "portalMount",
+    "contentClass",
     "placement",
     "gutter",
     "sameWidth",
@@ -222,8 +228,8 @@ export function SelectV2<T>(props: SelectV2Props<T>) {
           <ChevronDown />
         </span>
       </Kobalte.Trigger>
-      <Kobalte.Portal>
-        <Kobalte.Content data-component="menu-v2-content" data-slot="select-v2-content">
+      <Kobalte.Portal mount={local.portalMount}>
+        <Kobalte.Content class={local.contentClass} data-component="menu-v2-content" data-slot="select-v2-content">
           <Kobalte.Listbox data-slot="select-v2-listbox" />
         </Kobalte.Content>
       </Kobalte.Portal>

@@ -14,6 +14,7 @@ export class FileAttachment extends Schema.Class<FileAttachment>("Prompt.FileAtt
   mime: Schema.String,
   name: Schema.String.pipe(Schema.optional),
   description: Schema.String.pipe(Schema.optional),
+  unpack: Schema.Boolean.pipe(Schema.optional),
   source: Source.pipe(Schema.optional),
 }) {
   static create(input: FileAttachment) {
@@ -22,6 +23,7 @@ export class FileAttachment extends Schema.Class<FileAttachment>("Prompt.FileAtt
       mime: input.mime,
       name: input.name,
       description: input.description,
+      unpack: input.unpack,
       source: input.source,
     })
   }
@@ -58,6 +60,15 @@ export class Prompt extends Schema.Class<Prompt>("Prompt")({
   model: ModelV2.Ref.pipe(Schema.optional),
   system: Schema.String.pipe(Schema.optional),
   format: OutputFormat.pipe(Schema.optional),
+  subtask: Schema.Struct({
+    command: Schema.String,
+    description: Schema.String,
+    agent: AgentV2.ID,
+    // Omitted model inherits the target project's configured agent/session chain.
+    model: ModelV2.Ref.pipe(Schema.optional),
+    // "main" keeps the native single-use task_main_write consent mandatory.
+    workspace: Schema.Literals(["mirror", "main", "readonly"]).pipe(Schema.optional),
+  }).pipe(Schema.optional),
 }) {
   static readonly equivalence = Schema.toEquivalence(Prompt)
 

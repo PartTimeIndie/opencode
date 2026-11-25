@@ -1,4 +1,5 @@
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Effect, Schema } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -31,17 +32,21 @@ export const MessageHandler = HttpApiBuilder.group(Api, "server.message", (handl
     return handlers.handle(
       "session.messages",
       Effect.fn(function* (ctx) {
-        if (ctx.query.cursor && ctx.query.order !== undefined)
+        const trace = { kind: "session-stage", sessionID: ctx.params.sessionID } as const
+        const encodedCursor = ctx.query.cursor
+        if (encodedCursor && ctx.query.order !== undefined)
           return yield* new InvalidCursorError({ message: "Cursor cannot be combined with order" })
-        if (ctx.query.cursor && ctx.query.anchor)
+        if (encodedCursor && ctx.query.anchor)
           return yield* new InvalidCursorError({ message: "Cursor cannot be combined with anchor" })
         const decoded = yield* Effect.try({
-          try: () => (ctx.query.cursor ? cursor.decode(ctx.query.cursor) : undefined),
+          try: () => encodedCursor
+            ? CrashActivity.trackSync({ ...trace, name: "http.cursor-decode" }, () => cursor.decode(encodedCursor))
+            : undefined,
           catch: () => new InvalidCursorError({ message: "Invalid cursor" }),
         })
         const order = decoded?.order ?? ctx.query.order ?? "desc"
         const limit = ctx.query.limit ?? DefaultMessagesLimit
-        const page = yield* Effect.gen(function* () {
+        const page = yield* CrashActivity.track({ ...trace, name: "http.message-page" }, Effect.gen(function* () {
           if (!ctx.query.anchor)
             return directionalPage(
               yield* session.messages({
@@ -93,7 +98,7 @@ export const MessageHandler = HttpApiBuilder.group(Api, "server.message", (handl
             hasPrevious: previous.length > previousCount,
             hasNext: next.length > nextTarget,
           }
-        }).pipe(
+        })).pipe(
           Effect.catchTag("Session.NotFoundError", (error) =>
             Effect.fail(
               new SessionNotFoundError({
@@ -121,8 +126,8 @@ export const MessageHandler = HttpApiBuilder.group(Api, "server.message", (handl
         const last = page.messages.at(-1)
         const contextAnchor = order === "asc" ? first : last
         const context = contextAnchor
-          ? yield* session
-              .messageContext({ sessionID: ctx.params.sessionID, before: contextAnchor.id })
+          ? yield* CrashActivity.track({ ...trace, name: "http.message-context" },
+              session.messageContext({ sessionID: ctx.params.sessionID, before: contextAnchor.id }))
               .pipe(
                 Effect.catchTag("Session.MessageDecodeError", (error) => {
                   const ref = `err_${crypto.randomUUID().slice(0, 8)}`
@@ -140,7 +145,7 @@ export const MessageHandler = HttpApiBuilder.group(Api, "server.message", (handl
                 }),
               )
           : []
-        return {
+        return CrashActivity.trackSync({ ...trace, name: "http.public-projection" }, () => ({
           data: page.messages.map(SessionMessage.projectForPublicRead),
           context: (isUserLike(contextAnchor) ? context.filter((message) => !isUserLike(message)) : context).map(
             SessionMessage.projectForPublicRead,
@@ -149,7 +154,7 @@ export const MessageHandler = HttpApiBuilder.group(Api, "server.message", (handl
             previous: first && page.hasPrevious ? cursor.encode(first, order, "previous") : undefined,
             next: last && page.hasNext ? cursor.encode(last, order, "next") : undefined,
           },
-        }
+        }))
       }),
     )
   }),

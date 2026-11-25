@@ -170,7 +170,7 @@ function withContext<A, E>(
                   openedSeq: 0,
                   ...(input.leaseDurationMs === undefined ? {} : { leaseDurationMs: input.leaseDurationMs }),
                 }),
-              ).pipe(Effect.provide(sessionActivity)),
+              ).pipe(Effect.provide(sessionActivity), Effect.orDie),
             ),
           question: (input) =>
             run(

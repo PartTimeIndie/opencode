@@ -26,6 +26,10 @@ export default defineConfig({
   testDir: "./e2e",
   outputDir: "./e2e/test-results",
   timeout: 60_000,
+  // The writing-task acceptance spec is a strict opt-in: exclude it from
+  // ordinary discovery so an un-gated default run stays green, while the
+  // dedicated acceptance command still fails loudly without its environment.
+  testIgnore: process.env.OPENCODE_TASK_WRITE_QA === "1" ? [] : ["**/native-task-write.spec.ts"],
   expect: {
     timeout: 10_000,
   },

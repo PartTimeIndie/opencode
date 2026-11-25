@@ -4,7 +4,7 @@ import type { MessageDecodeError } from "@opencode-ai/core/session/error"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionPlanDocument } from "@opencode-ai/core/session/plan-document"
-import { Cause, Clock, DateTime, Effect, Schema } from "effect"
+import { Cause, Clock, DateTime, Effect, Option, Schema } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
 import { SessionsCursor } from "../groups/session"
@@ -21,16 +21,17 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionEvent } from "@opencode-ai/core/session/event"
-import { SessionFailure } from "@opencode-ai/core/session/failure"
 import { SessionActivity } from "@opencode-ai/core/session/activity"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { BashTool } from "@opencode-ai/core/tool/bash"
-import { TaskTool } from "@opencode-ai/core/tool/task"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SkillV2 } from "@opencode-ai/core/skill"
+import { SkillPolicy } from "@opencode-ai/core/skill/policy"
+import { Config } from "@opencode-ai/core/config"
+import { PermissionV2 } from "@opencode-ai/core/permission"
 import { SkillTool } from "@opencode-ai/core/tool/skill"
 import { CommandV2 } from "@opencode-ai/core/command"
 import { PluginBoot } from "@opencode-ai/core/plugin/boot"
@@ -38,6 +39,8 @@ import { parseSessionGoalControl, sessionGoalMetadataPatch } from "../session-go
 import { CommandPlugin } from "../command-plugin"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { AgentSwitchTool } from "@opencode-ai/core/tool/agent-switch"
+import { SessionSkillSelection } from "@opencode-ai/core/session/skill-selection"
+import { ConfigSkillInvocation } from "@opencode-ai/core/config/skill-invocation"
 import { exec } from "child_process"
 
 const DefaultSessionsLimit = 50
@@ -54,12 +57,6 @@ function shellSettlementText(settlement: ToolRegistry.Settlement) {
   return JSON.stringify(settlement.result.value) ?? String(settlement.result.value)
 }
 
-function record(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : { value }
-}
-
 function message(value: unknown) {
   if (typeof value === "string") return value
   try {
@@ -67,23 +64,6 @@ function message(value: unknown) {
   } catch {
     return String(value)
   }
-}
-
-function toolOutputFromResultValue(result: ToolRegistry.Settlement["result"]) {
-  switch (result.type) {
-    case "json":
-      return { structured: result.value, content: [] }
-    case "text":
-      return { structured: {}, content: [{ type: "text" as const, text: message(result.value) }] }
-    case "content":
-      return { structured: {}, content: result.value }
-    case "error":
-      return undefined
-  }
-}
-
-function modelString(model: ModelV2.Ref) {
-  return `${model.providerID}/${model.id}`
 }
 
 function contentStoreFailure(error: {
@@ -103,12 +83,32 @@ function contentStoreFailure(error: {
   )
 }
 
-function zeroUsage() {
-  return {
-    cost: 0,
-    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-  }
-}
+/** A chat-send click admits interactive text, not a renewal receipt. Selection
+ * becomes effective only after normal promotion and the consuming gate fence. */
+export const admitQuestionChatSend = Effect.fn("SessionHandler.admitQuestionChatSend")(function* (input: {
+  readonly session: Pick<SessionV2.Interface, "prompt">
+  readonly questions: Pick<QuestionV2.Interface, "get" | "reply">
+  readonly sessionID: SessionV2.ID
+  readonly requestID: string
+  readonly text: string
+  readonly id: string
+}) {
+  const request = yield* input.questions.get(QuestionV2.ID.make(input.requestID), input.sessionID)
+  if (!request || request.id !== input.requestID || request.sessionID !== input.sessionID || request.mode !== "blocking" || request.questions.length !== 1)
+    return yield* new InvalidRequestError({ field: "requestID", kind: "question_not_found",
+      message: "No single pending blocking question matches this chat-send request." })
+  const stored = request.questions[0]?.chatSend?.text
+  if (!stored?.trim() || stored !== input.text)
+    return yield* new InvalidRequestError({ field: "text", kind: "chat_send_mismatch",
+      message: "The chat-send text does not match the stored question approval." })
+  const admitted = yield* input.session.prompt({ sessionID: input.sessionID, id: SessionMessage.ID.make(input.id),
+    prompt: { text: input.text }, delivery: "queue", origin: "interactive", resume: false })
+  yield* input.questions.reply({ requestID: request.id, sessionID: input.sessionID, answers: [[input.text]] }).pipe(
+    Effect.mapError((error) => new InvalidRequestError({ field: "requestID", kind: "question_settlement_failed",
+      message: `Unable to settle the question: ${message(error)}` })),
+  )
+  return { admitted, selections: [] as string[] }
+})
 
 /** Model-switch preflight can compact too; both endpoints need the same errors. */
 export function sessionCompactionFailure(
@@ -176,6 +176,78 @@ export const loadSessionCommand = Effect.fn("SessionHandler.loadSessionCommand")
   }).pipe(Effect.provide(locations.get(input.location)))
 })
 
+// Command templates (including skill bodies) replace the original slash text,
+// so declared explicit-tool commands and skill commands keep a leading slash
+// marker in the durable prompt. Downstream durable checks recognize the user's
+// explicit selection from it (skill consent, capability activation, compaction
+// command carry); the marker itself is never authority — host activation still
+// requires single-use consent and admission gates still run.
+export const explicitCommandPrompt = Effect.fn("SessionHandler.explicitCommandPrompt")(function* (
+  command: string,
+  text: string,
+  source?: "command" | "mcp" | "skill",
+) {
+  const registry = yield* ToolRegistry.Service
+  const marked = (yield* registry.hasExplicitCommand(command)) || source === "skill"
+  return marked && !text.trimStart().startsWith(`/${command}`) ? `/${command}\n\n${text}` : text
+})
+
+/**
+ * Skill commands are an executing entry point: resolving one would otherwise
+ * inject skill content into the prompt without any policy check. Command
+ * selection is authentic explicit user intent, so it satisfies `manual` and
+ * `ask` invocation consent — but never `deny` or configured permission deny
+ * rules, and never unreadable skill policy configuration (fail closed).
+ */
+export const admitSkillCommand = Effect.fn("SessionHandler.admitSkillCommand")(function* (input: {
+  readonly skill: string
+  readonly sessionID: SessionV2.ID
+  readonly location: SessionV2.Info["location"]
+  readonly agent: string | undefined
+}) {
+  const locations = yield* LocationServiceMap
+  return yield* Effect.gen(function* () {
+    const skills = yield* SkillV2.Service.use((service) => service.list())
+    const skill = skills.find((item) => item.name === input.skill)
+    // A stale registration must not bypass policy before a command is expanded.
+    if (!skill) return yield* new InvalidRequestError({
+      message: `Skill not found: ${input.skill}`, field: "skill", kind: "skill_not_found",
+    })
+    const config = Option.getOrUndefined(yield* Effect.serviceOption(Config.Service))
+    const entries = config ? yield* config.entries() : []
+    const invocation = Config.globalLatest(entries, "skill_invocation")
+    const issues = config?.issues ? yield* config.issues() : []
+    if (issues.length > 0)
+      return yield* Effect.fail(
+        new InvalidRequestError({
+          message: `Skill "${input.skill}" is blocked: skill policy configuration is unreadable (${issues[0]!.path}: ${issues[0]!.message})`,
+          field: "command",
+          kind: "skill_policy_unreadable",
+        }),
+      )
+    const agentID = input.agent ? AgentV2.ID.make(input.agent) : undefined
+    const agent = agentID ? yield* AgentV2.Service.use((agents) => agents.get(agentID)) : undefined
+    const policy = SkillPolicy.resolveForSkill({ skill, global: invocation, agentSkills: agent?.skills })
+    const gate = SkillPolicy.admissionGate(policy, { explicitlySelected: true })
+    if (gate === "deny")
+      return yield* Effect.fail(
+        new InvalidRequestError({
+          message: `Skill "${input.skill}" is blocked by configuration (invocation: deny)`,
+          field: "command",
+          kind: "skill_denied",
+        }),
+      )
+    yield* PermissionV2.Service.use((permission) => permission.assert({
+      action: "skill", resources: [input.skill], save: [input.skill], sessionID: input.sessionID, agent: agentID,
+    })).pipe(Effect.mapError(() => new InvalidRequestError({
+      message: `Skill "${input.skill}" is denied by permission rules`, field: "command", kind: "skill_denied",
+    })))
+    // This is preflight, not input admission. The marked interactive command
+    // prompt establishes selection only after durable admission and promotion;
+    // never mint an unbound receipt before that input exists.
+  }).pipe(Effect.provide(locations.get(input.location)))
+})
+
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* SessionV2.Service
@@ -184,7 +256,8 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
     const events = yield* EventV2.Service
     const commandPlugin = yield* CommandPlugin.Service
     const locations = yield* LocationServiceMap
-    const db = (yield* Database.Service).db
+    const database = yield* Database.Service
+    const db = database.db
 
     const runSubtaskCommand = Effect.fn("SessionHandler.runSubtaskCommand")(function* (input: {
       readonly sessionID: SessionV2.ID
@@ -209,7 +282,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
 
       const taskAgent = AgentV2.ID.make(input.command.agent ?? input.agent ?? "build")
       const taskModel = input.command.model ?? input.model
-      if (input.resume !== false && !taskModel) {
+      if (!taskModel) {
         return yield* new InvalidRequestError({
           field: "model",
           kind: "model_required",
@@ -221,10 +294,22 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         .prompt({
           sessionID: input.sessionID,
           id: input.messageID,
-          prompt: { text: input.prompt, ...(input.files === undefined ? {} : { files: input.files }) },
+          prompt: {
+            text: input.prompt,
+            ...(input.files === undefined ? {} : { files: input.files }),
+            ...(taskModel === undefined ? {} : {
+              subtask: {
+                command: input.commandName,
+                description: input.command.description ?? input.commandName,
+                agent: taskAgent,
+                model: taskModel,
+              },
+            }),
+          },
           agent: input.agent,
           model: input.model,
           delivery: input.delivery,
+          origin: "interactive",
           resume: false,
         })
         .pipe(
@@ -269,114 +354,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         })
       }
 
-      yield* SessionInput.promoteSteers(db, events, input.sessionID, admitted.admittedSeq)
-      const assistantMessageID = SessionMessage.ID.create()
-      const callID = crypto.randomUUID()
-      const taskInput = {
-        description: input.command.description ?? input.commandName,
-        prompt: input.prompt,
-        subagent_type: taskAgent,
-        model: modelString(taskModel),
-        ...(taskModel.variant === undefined ? {} : { variant: taskModel.variant }),
-        command: input.commandName,
-      }
-      yield* events.publish(SessionEvent.Step.Started, {
-        sessionID: input.sessionID,
-        assistantMessageID,
-        timestamp: yield* DateTime.now,
-        agent: taskAgent,
-        model: taskModel,
-      })
-      yield* events.publish(SessionEvent.Tool.Input.Started, {
-        sessionID: input.sessionID,
-        assistantMessageID,
-        callID,
-        name: TaskTool.name,
-        timestamp: yield* DateTime.now,
-      })
-      yield* events.publish(SessionEvent.Tool.Input.Ended, {
-        sessionID: input.sessionID,
-        assistantMessageID,
-        callID,
-        text: JSON.stringify(taskInput),
-        timestamp: yield* DateTime.now,
-      })
-      yield* events.publish(SessionEvent.Tool.Called, {
-        sessionID: input.sessionID,
-        assistantMessageID,
-        callID,
-        tool: TaskTool.name,
-        input: taskInput,
-        provider: { executed: false },
-        timestamp: yield* DateTime.now,
-      })
-      const exit = yield* ToolRegistry.Service.use((registry) =>
-        registry.materialize().pipe(
-          Effect.flatMap((materialization) =>
-            materialization.settle({
-              sessionID: input.sessionID,
-              agent: taskAgent,
-              assistantMessageID,
-              call: {
-                type: "tool-call",
-                id: callID,
-                name: TaskTool.name,
-                input: taskInput,
-              },
-            }),
-          ),
-        ),
-      ).pipe(Effect.provide(locations.get(input.location)), Effect.exit)
-      if (exit._tag === "Success" && exit.value.result.type !== "error") {
-        const output = exit.value.output ?? toolOutputFromResultValue(exit.value.result)
-        yield* events.publish(SessionEvent.Tool.Success, {
-          sessionID: input.sessionID,
-          assistantMessageID,
-          callID,
-          structured: record(output?.structured),
-          content: output?.content ?? [],
-          outputPaths: exit.value.outputPaths ? [...exit.value.outputPaths] : [],
-          result: exit.value.result,
-          provider: { executed: false },
-          timestamp: yield* DateTime.now,
-        })
-      } else if (exit._tag === "Success") {
-        const result = exit._tag === "Success" ? exit.value.result : undefined
-        yield* events.publish(SessionEvent.Tool.Failed, {
-          sessionID: input.sessionID,
-          assistantMessageID,
-          callID,
-          error: {
-            type: "unknown",
-            message: result?.type === "error" ? message(result.value) : message(result),
-          },
-          failure: SessionFailure.make("tool.defect", {
-            cause: { raw: result?.type === "error" ? message(result.value) : message(result) },
-          }),
-          ...(result === undefined ? {} : { result }),
-          provider: { executed: false },
-          timestamp: yield* DateTime.now,
-        })
-      } else {
-        yield* events.publish(SessionEvent.Tool.Failed, {
-          sessionID: input.sessionID,
-          assistantMessageID,
-          callID,
-          error: { type: "unknown", message: Cause.pretty(exit.cause) },
-          failure: SessionFailure.make("tool.defect", {
-            cause: { raw: Cause.pretty(exit.cause) },
-          }),
-          provider: { executed: false },
-          timestamp: yield* DateTime.now,
-        })
-      }
-      yield* events.publish(SessionEvent.Step.Ended, {
-        sessionID: input.sessionID,
-        assistantMessageID,
-        finish: "tool-calls",
-        ...zeroUsage(),
-        timestamp: yield* DateTime.now,
-      })
+      // The coordinator owns command execution, its activity lease and cancellation.
+      // HTTP only admits durable work; it must never borrow or fabricate a runner owner.
+      yield* execution.wake(input.sessionID, admitted.admittedSeq).pipe(Effect.ignore)
       return admitted
     })
 
@@ -462,6 +442,8 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               sessionID: ctx.params.sessionID,
               id: ctx.payload.id,
               prompt: ctx.payload.prompt,
+              // The HTTP prompt endpoint is the human composer's admission path.
+              origin: "interactive",
               agent: ctx.payload.agent,
               model: ctx.payload.model,
               system: ctx.payload.system,
@@ -553,31 +535,38 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
           const goalControl =
             command.action === "session-goal" ? parseSessionGoalControl(ctx.payload.arguments ?? "") : undefined
           const goalPatch = goalControl ? sessionGoalMetadataPatch(goalControl) : undefined
-          if (goalPatch) {
-            yield* session.patchMetadata({ sessionID: ctx.params.sessionID, patch: goalPatch }).pipe(
-              Effect.catchTag(
-                "Session.NotFoundError",
-                (error) =>
-                  new SessionNotFoundError({
-                    sessionID: error.sessionID,
-                    message: `Session not found: ${error.sessionID}`,
-                  }),
-              ),
-            )
+          if (command.source === "skill") {
+            yield* admitSkillCommand({
+              skill: ctx.payload.command, sessionID: ctx.params.sessionID, location: info.location,
+              agent: command.agent ?? ctx.payload.agent ?? info.agent,
+            })
           }
           const resolved = yield* CommandV2.Service.use((commands) =>
             commands.resolve({ name: ctx.payload.command, arguments: ctx.payload.arguments ?? "" }),
           ).pipe(Effect.provide(locations.get(info.location)))
+          if (command.source === "skill") {
+            const commands = Array.from((resolved ?? "").matchAll(shellRegex), (match) => match[1]).filter((value): value is string => !!value)
+            if (commands.length) yield* PermissionV2.Service.use((permission) => permission.assert({
+              action: "bash", resources: commands, sessionID: ctx.params.sessionID,
+              agent: command.agent ? AgentV2.ID.make(command.agent) : ctx.payload.agent ? AgentV2.ID.make(ctx.payload.agent) : info.agent ? AgentV2.ID.make(info.agent) : undefined,
+            })).pipe(
+              Effect.provide(locations.get(info.location)),
+              Effect.mapError(() => new InvalidRequestError({ message: "Skill shell expansion denied", field: "command", kind: "skill_denied" })),
+            )
+          }
           const expanded = yield* expandCommandShell({
             template: resolved ?? "",
             directory: info.location.directory,
           }).pipe(Effect.provide(locations.get(info.location)))
-          const prompt = yield* commandPlugin.transform({
+          const transformed = yield* commandPlugin.transform({
             command: ctx.payload.command,
             sessionID: ctx.params.sessionID,
             arguments: ctx.payload.arguments ?? "",
             text: expanded,
           })
+          const prompt = yield* explicitCommandPrompt(ctx.payload.command, transformed, command.source).pipe(
+            Effect.provide(locations.get(info.location)),
+          )
           const commandAgentName = command.agent
           const commandAgent = commandAgentName ? AgentV2.ID.make(commandAgentName) : ctx.payload.agent
           const commandModel =
@@ -591,6 +580,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               : undefined) ??
             info.model
           if (command.subtask === true) {
+            if (goalPatch) return yield* new InvalidRequestError({ field: "command", kind: "invalid_command", message: "Goal controls require ordinary command admission" })
             const admitted = yield* runSubtaskCommand({
               sessionID: ctx.params.sessionID,
               messageID: ctx.payload.id,
@@ -614,7 +604,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               agent: commandAgent,
               model: commandModel,
               delivery: ctx.payload.delivery,
+              origin: "interactive",
               resume: ctx.payload.resume,
+              ...(goalPatch ? { metadataPatchOnAdmission: goalPatch } : {}),
             })
             .pipe(
               Effect.catchTag("Session.NotFoundError", (error) =>
@@ -1039,6 +1031,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               ),
             ),
           )
+          yield* admitSkillCommand({
+            skill: ctx.payload.skill, sessionID: ctx.params.sessionID, location: info.location, agent: info.agent,
+          })
           const text = yield* SkillV2.Service.use((skill) => skill.list()).pipe(
             Effect.provide(locations.get(info.location)),
             Effect.flatMap((skills) => skillContent({ name: ctx.payload.skill, skills })),
@@ -1050,6 +1045,100 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             timestamp: yield* DateTime.now,
           })
           return HttpApiSchema.NoContent.make()
+        }),
+      )
+      .handle(
+        "session.skillSelections",
+        Effect.fn(function* (ctx) {
+          const info = yield* session.get(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          const scoped = Effect.gen(function* () {
+            const skills = yield* SkillV2.Service.use((service) => service.list())
+            const config = Option.getOrUndefined(yield* Effect.serviceOption(Config.Service))
+            const invocation = config ? yield* config.entries() : []
+            const memory = ConfigSkillInvocation.resolveSelectionMemory(Config.globalLatest(invocation, "skill_invocation"))
+            return yield* SessionSkillSelection.inspect(database.db, { sessionID: ctx.params.sessionID,
+              limits: { minutes: memory.minutes, messages: memory.messages }, now: Date.now(),
+              names: skills.map((skill) => skill.name), enabled: memory.enabled })
+          }).pipe(Effect.provide(locations.get(info.location)))
+          return { data: yield* scoped }
+        }),
+      )
+      .handle(
+        "session.skillSelectionForget",
+        Effect.fn(function* (ctx) {
+          const info = yield* session.get(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          const forgetAll = ctx.payload.all === true && ctx.payload.name === undefined
+          if ((ctx.payload.all === true) === (ctx.payload.name !== undefined) || ctx.payload.name?.trim() === "")
+            return yield* new InvalidRequestError({
+              field: "name",
+              kind: "invalid_forget_target",
+              message: "Provide exactly one skill name or all: true.",
+            })
+          const scoped = Effect.gen(function* () {
+            const result = yield* SessionSkillSelection.forget(database.db, events, {
+              sessionID: ctx.params.sessionID,
+              ...(forgetAll ? {} : { name: ctx.payload.name }),
+              expectedRevision: ctx.payload.expectedRevision,
+              operationID: ctx.payload.operationID,
+            })
+            return {
+              revision: result.revision,
+              outcome: result._tag === "Forgotten" ? ("forgotten" as const) : (result._tag === "RevisionConflict" ? "revision_conflict" as const : "duplicate_operation" as const),
+            }
+          }).pipe(Effect.provide(locations.get(info.location)))
+          return { data: yield* scoped }
+        }),
+      )
+      .handle(
+        "session.chatSend",
+        Effect.fn(function* (ctx) {
+          const info = yield* session.get(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          const scoped = Effect.gen(function* () {
+            const questions = yield* QuestionV2.Service
+            return yield* admitQuestionChatSend({ session, questions, sessionID: ctx.params.sessionID, ...ctx.payload })
+          }).pipe(Effect.provide(locations.get(info.location)))
+          const outcome = yield* scoped.pipe(
+            Effect.catchTag("Session.PromptConflictError", (error) =>
+              Effect.fail(
+                new ConflictError({
+                  message: `Prompt message ID conflicts with an existing durable record: ${error.messageID}`,
+                  resource: error.messageID,
+                }),
+              ),
+            ),
+            Effect.catchTag("Session.NotFoundError", (error) => Effect.fail(new SessionNotFoundError({ sessionID: error.sessionID, message: error.message }))),
+            Effect.catchTag("SessionBusyError", (error) => Effect.fail(new ConflictError({ message: `Session is busy: ${error.sessionID}`, resource: error.sessionID }))),
+            Effect.catchTag("Session.RollbackBlockedError", (error) => Effect.fail(new ConflictError({ message: "Rollback is blocked; resolve the file conflict before sending.", resource: error.sessionID }))),
+            Effect.catchTag("ContentStore.StorageError", (error) => Effect.fail(new InvalidRequestError({ field: "prompt", kind: "storage_unavailable", message: `Unable to admit chat-send prompt: ${error.operation}` }))),
+          )
+          return { data: outcome }
         }),
       )
       .handle(
@@ -1086,6 +1175,11 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
           const now = yield* Clock.currentTimeMillis
           const activities = yield* activity.listForSession(ctx.params.sessionID)
           const latest = activities.toSorted((a, b) => a.timeCreated - b.timeCreated || a.id.localeCompare(b.id)).at(-1)
+          const input = ctx.query.messageID ? yield* SessionInput.find(db, ctx.query.messageID) : undefined
+          const boundCompletion = latest?.turnCompletionResult && input?.sessionID === ctx.params.sessionID &&
+            input.promotedSeq !== undefined && latest.openedSeq !== undefined && latest.closedSeq !== undefined &&
+            input.promotedSeq >= latest.openedSeq && input.promotedSeq <= latest.closedSeq
+            ? latest.turnCompletionResult : undefined
           const active = activities.findLast(
             (activity) =>
               (activity.status === "running" || activity.status === "recovering") &&
@@ -1120,6 +1214,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                   ? {
                       activityID: latest.id,
                       activityStatus: latest.status,
+                      ...(boundCompletion ? { turnCompletionResult: boundCompletion } : {}),
                       ...(latest.lastError ? { lastError: latest.lastError } : {}),
                     }
                   : {}),

@@ -139,18 +139,28 @@ import type {
   PluginServicesCallResponses,
   PluginServicesSessionContextErrors,
   PluginServicesSessionContextResponses,
+  PluginServicesSessionGoalErrors,
+  PluginServicesSessionGoalResponses,
   PluginServicesSessionPolicyErrors,
   PluginServicesSessionPolicyResponses,
   ProjectCurrentErrors,
   ProjectCurrentResponses,
   ProjectDirectoriesErrors,
   ProjectDirectoriesResponses,
+  ProjectDirectoryIconErrors,
+  ProjectDirectoryIconInput,
+  ProjectDirectoryIconResponses,
+  ProjectDirectoryIconsErrors,
+  ProjectDirectoryIconsResponses,
   ProjectGenerateIconErrors,
   ProjectGenerateIconResponses,
   ProjectInitGitErrors,
   ProjectInitGitResponses,
   ProjectListErrors,
   ProjectListResponses,
+  ProjectResolveDirectoriesInput,
+  ProjectResolveErrors,
+  ProjectResolveResponses,
   ProjectRetryIconErrors,
   ProjectRetryIconResponses,
   ProjectUpdateErrors,
@@ -182,10 +192,14 @@ import type {
   PtyUpdateErrors,
   PtyUpdateResponses,
   QuestionV2Reply,
+  SessionAttentionStateErrors,
+  SessionAttentionStateResponses,
   SessionChildrenErrors,
   SessionChildrenResponses,
   SessionCreateErrors,
   SessionCreateResponses,
+  SessionDelegationPreferencesErrors,
+  SessionDelegationPreferencesResponses,
   SessionDeleteErrors,
   SessionDeleteMessageErrors,
   SessionDeleteMessageResponses,
@@ -205,6 +219,8 @@ import type {
   SessionMessagesErrors,
   SessionMessagesResponses,
   SessionMetadataPatch,
+  SessionPatchDelegationPreferencesErrors,
+  SessionPatchDelegationPreferencesResponses,
   SessionProtectionErrors,
   SessionProtectionResponses,
   SessionRevertErrors,
@@ -339,6 +355,8 @@ import type {
   V2SessionActivityResponses,
   V2SessionCancelToolErrors,
   V2SessionCancelToolResponses,
+  V2SessionChatSendErrors,
+  V2SessionChatSendResponses,
   V2SessionCommandErrors,
   V2SessionCommandResponses,
   V2SessionCompactErrors,
@@ -375,6 +393,10 @@ import type {
   V2SessionShellResponses,
   V2SessionSkillErrors,
   V2SessionSkillResponses,
+  V2SessionSkillSelectionForgetErrors,
+  V2SessionSkillSelectionForgetResponses,
+  V2SessionSkillSelectionsErrors,
+  V2SessionSkillSelectionsResponses,
   V2SessionSurfaceDismissErrors,
   V2SessionSurfaceDismissResponses,
   V2SessionSurfaceListErrors,
@@ -393,6 +415,8 @@ import type {
   V2SessionSyntheticResponses,
   V2SessionWaitErrors,
   V2SessionWaitResponses,
+  V2SkillDiagnosticsErrors,
+  V2SkillDiagnosticsResponses,
   V2SkillListErrors,
   V2SkillListResponses,
   V2SkillResolveErrors,
@@ -418,9 +442,15 @@ import type {
   VcsGitActionErrors,
   VcsGitActionInput,
   VcsGitActionResponses,
+  VcsGitCommitMessageErrors,
+  VcsGitCommitMessageRequest,
+  VcsGitCommitMessageResponses,
   VcsGitDiscoverErrors,
   VcsGitDiscoverResponses,
   VcsGitErrors,
+  VcsGitHistoryErrors,
+  VcsGitHistoryRequest,
+  VcsGitHistoryResponses,
   VcsGitResponses,
   VcsStatusErrors,
   VcsStatusResponses,
@@ -1640,7 +1670,7 @@ export class Tool extends HeyApiClient {
   /**
    * List tools
    *
-   * Get a list of available tools with their JSON schema parameters for the current workspace.
+   * Get the current workspace's configurable tool catalog with JSON schema parameters, including inactive tools. Listing does not grant execution access. Provider and model query parameters are accepted for compatibility but do not filter this catalog.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -1674,7 +1704,7 @@ export class Tool extends HeyApiClient {
   /**
    * List tool IDs
    *
-   * Get a list of all available tool IDs, including both built-in tools and dynamically registered tools.
+   * Get configurable tool IDs for the current workspace, including inactive built-in and dynamically registered tools. Listing does not grant execution access.
    */
   public ids<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -2142,6 +2172,82 @@ export class Diff extends HeyApiClient {
 }
 
 export class Git extends HeyApiClient {
+  /**
+   * Get a filtered Git history page
+   *
+   * Retrieve one page of a branch-filtered, anchored commit history. Initial requests pass a selector; continuations pass the opaque cursor only.
+   */
+  public history<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      vcsGitHistoryRequest?: VcsGitHistoryRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "vcsGitHistoryRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<VcsGitHistoryResponses, VcsGitHistoryErrors, ThrowOnError>({
+      url: "/vcs/git/history",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get a chunk of a full commit message
+   *
+   * Retrieve the next char-safe chunk of a commit message for commits whose body was truncated in the history page.
+   */
+  public commitMessage<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      vcsGitCommitMessageRequest?: VcsGitCommitMessageRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "vcsGitCommitMessageRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<VcsGitCommitMessageResponses, VcsGitCommitMessageErrors, ThrowOnError>(
+      {
+        url: "/vcs/git/commit-message",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
   /**
    * Discover nested Git repositories
    *
@@ -3047,6 +3153,118 @@ export class Project extends HeyApiClient {
       ...params,
     })
   }
+
+  /**
+   * List directory icons
+   *
+   * List the icons stored for directories that have no project row of their own.
+   */
+  public directoryIcons<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      ProjectDirectoryIconsResponses,
+      ProjectDirectoryIconsErrors,
+      ThrowOnError
+    >({
+      url: "/project/directory-icons",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Set or clear a directory icon
+   *
+   * Store a 128px thumbnail of an uploaded image for a directory. An omitted or empty url clears the icon.
+   */
+  public directoryIcon<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      projectDirectoryIconInput?: ProjectDirectoryIconInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "projectDirectoryIconInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<
+      ProjectDirectoryIconResponses,
+      ProjectDirectoryIconErrors,
+      ThrowOnError
+    >({
+      url: "/project/directory-icon",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Resolve directories
+   *
+   * Resolve junctions, symlinks and alias spellings to the real directory on the server host and report whether it exists.
+   */
+  public resolve<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      projectResolveDirectoriesInput?: ProjectResolveDirectoriesInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "projectResolveDirectoriesInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ProjectResolveResponses, ProjectResolveErrors, ThrowOnError>({
+      url: "/project/resolve",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
 }
 
 export class Pty extends HeyApiClient {
@@ -3711,6 +3929,53 @@ export class PluginServices extends HeyApiClient {
   }
 
   /**
+   * Built-in user control for the session goal plugin lifecycle (pause/resume)
+   */
+  public sessionGoal<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      sessionID?: string
+      action?: "pause" | "resume"
+      runID?: string
+      operationID?: string
+      expectedRevision?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "action" },
+            { in: "body", key: "runID" },
+            { in: "body", key: "operationID" },
+            { in: "body", key: "expectedRevision" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      PluginServicesSessionGoalResponses,
+      PluginServicesSessionGoalErrors,
+      ThrowOnError
+    >({
+      url: "/app/host/session-goal",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * Call a registered plugin service
    */
   public call<ThrowOnError extends boolean = false>(
@@ -4048,6 +4313,42 @@ export class Session2 extends HeyApiClient {
   }
 
   /**
+   * Read terminal session activities
+   */
+  public attentionState<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      afterSeq: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "afterSeq" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionAttentionStateResponses,
+      SessionAttentionStateErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/attention-state",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Get session children
    *
    * Retrieve all child sessions that were forked from the specified parent session.
@@ -4282,6 +4583,117 @@ export class Session2 extends HeyApiClient {
     )
     return (options?.client ?? this.client).patch<SessionProtectionResponses, SessionProtectionErrors, ThrowOnError>({
       url: "/session/{sessionID}/protection",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Read scoped delegation settings
+   *
+   * Read the Session default or an explicit owned task, project or global scope, including its revision or file version.
+   */
+  public delegationPreferences<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      scope?: "global" | "project" | "session" | "task"
+      taskID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "scope" },
+            { in: "query", key: "taskID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionDelegationPreferencesResponses,
+      SessionDelegationPreferencesErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/delegation-preferences",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Patch scoped delegation settings
+   *
+   * Use the same scoped owner as the native language tool. Omitted scope means this Session; stale revisions or file versions fail without retry.
+   */
+  public patchDelegationPreferences<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      scope?: "global" | "project" | "session" | "task"
+      taskID?: string
+      expectedRevision?: number
+      expectedVersion?: string
+      patch: {
+        ordinaryQuestions?: boolean | null
+        preferences?: Array<{
+          topic: string
+          selections: Array<{
+            agent?: string
+            model?: string
+            variant?: string
+            chain?: string
+          }>
+        }> | null
+        rules?: Array<{
+          topic?: string
+          allowed: Array<{
+            agent?: string
+            model?: string
+            variant?: string
+            chain?: string
+          }>
+        }> | null
+      }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "scope" },
+            { in: "body", key: "taskID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "expectedVersion" },
+            { in: "body", key: "patch" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      SessionPatchDelegationPreferencesResponses,
+      SessionPatchDelegationPreferencesErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/delegation-preferences",
       ...options,
       ...params,
       headers: {
@@ -6247,6 +6659,113 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
+   * List remembered skill selections
+   *
+   * Read the durable same-chat skill selection ledger for one session with derived remaining validity.
+   */
+  public skillSelections<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<
+      V2SessionSkillSelectionsResponses,
+      V2SessionSkillSelectionsErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/skill-selections",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Forget remembered skill selections
+   *
+   * Forget one skill selection or all selections of this session. Never touches durable allow/deny policy.
+   */
+  public skillSelectionForget<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      name?: string
+      all?: boolean
+      expectedRevision: number
+      operationID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "name" },
+            { in: "body", key: "all" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "operationID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      V2SessionSkillSelectionForgetResponses,
+      V2SessionSkillSelectionForgetErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/skill-selections/forget",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Send the one-click chat approval
+   *
+   * Host-bound chat-send adapter for a pending blocking question: verifies the stored chatSend text, admits the exact interactive prompt with a stable input id, and settles the question. Skill selection is established only by normal input promotion and the consuming gate, never by the click itself.
+   */
+  public chatSend<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      requestID: string
+      text: string
+      id: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "requestID" },
+            { in: "body", key: "text" },
+            { in: "body", key: "id" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2SessionChatSendResponses, V2SessionChatSendErrors, ThrowOnError>({
+      url: "/api/session/{sessionID}/chat-send",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * Compact session
    *
    * Compact a session conversation.
@@ -6273,10 +6792,21 @@ export class Session3 extends HeyApiClient {
   public activity<ThrowOnError extends boolean = false>(
     parameters: {
       sessionID: string
+      messageID?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
-    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "messageID" },
+          ],
+        },
+      ],
+    )
     return (options?.client ?? this.client).get<V2SessionActivityResponses, V2SessionActivityErrors, ThrowOnError>({
       url: "/api/session/{sessionID}/activity",
       ...options,
@@ -7056,7 +7586,7 @@ export class Skill extends HeyApiClient {
   /**
    * List skills
    *
-   * Retrieve currently registered skills.
+   * Retrieve currently registered skills. With an agent query, each skill carries its effective visibility and invocation policy for that agent.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -7064,10 +7594,21 @@ export class Skill extends HeyApiClient {
         directory?: string
         workspace?: string
       }
+      agent?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
-    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "location" }] }])
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "location" },
+            { in: "query", key: "agent" },
+          ],
+        },
+      ],
+    )
     return (options?.client ?? this.client).get<V2SkillListResponses, V2SkillListErrors, ThrowOnError>({
       url: "/api/skill",
       ...options,
@@ -7110,6 +7651,39 @@ export class Skill extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Explain skill constraints
+   *
+   * Read-only hints from the existing skill catalog and selected agent policy. Grants no invocation authority.
+   */
+  public diagnostics<ThrowOnError extends boolean = false>(
+    parameters?: {
+      location?: {
+        directory?: string
+        workspace?: string
+      }
+      agent?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "location" },
+            { in: "query", key: "agent" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<V2SkillDiagnosticsResponses, V2SkillDiagnosticsErrors, ThrowOnError>({
+      url: "/api/skill/diagnostics",
+      ...options,
+      ...params,
     })
   }
 }

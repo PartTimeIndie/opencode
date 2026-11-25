@@ -566,14 +566,22 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       description: language.t("command.model.choose.description"),
       keybind: "mod+'",
       slash: "model",
-      onSelect: chooseModel,
+      disabled: local.session.handoff.busy(),
+      onSelect: () => {
+        if (local.session.handoff.busy()) return
+        chooseModel()
+      },
     }),
     modelCommand({
       id: "model.variant.cycle",
       title: language.t("command.model.variant.cycle"),
       description: language.t("command.model.variant.cycle.description"),
       keybind: "shift+mod+d",
-      onSelect: () => local.model.variant.cycle(),
+      disabled: local.session.handoff.busy(),
+      onSelect: () => {
+        if (local.session.handoff.busy()) return
+        local.model.variant.cycle()
+      },
     }),
   ]
 
@@ -595,16 +603,22 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       description: language.t("command.agent.cycle.description"),
       keybind: "mod+.",
       slash: "agent",
-      disabled: !settings.visibility.customAgents(),
-      onSelect: () => local.agent.move(1),
+      disabled: !settings.visibility.customAgents() || local.session.handoff.busy(),
+      onSelect: () => {
+        if (local.session.handoff.busy()) return
+        local.agent.move(1)
+      },
     }),
     agentCommand({
       id: "agent.cycle.reverse",
       title: language.t("command.agent.cycle.reverse"),
       description: language.t("command.agent.cycle.reverse.description"),
       keybind: "shift+mod+.",
-      disabled: !settings.visibility.customAgents(),
-      onSelect: () => local.agent.move(-1),
+      disabled: !settings.visibility.customAgents() || local.session.handoff.busy(),
+      onSelect: () => {
+        if (local.session.handoff.busy()) return
+        local.agent.move(-1)
+      },
     }),
   ]
 

@@ -32,8 +32,10 @@ import { FormatError, FormatUnknownError } from "../error"
 import {
   createTurnCompletionTracker,
   settleEventStream,
+  turnCompletionError,
   waitForCompletedAssistant,
   waitForRunCompletion,
+  waitForTerminalAssistant,
   waitForTurnCompletion,
 } from "./run/event-stream"
 import { serializeErrorEvent } from "./run/error-event"
@@ -986,9 +988,28 @@ export const RunCommand = effectCmd({
           previousAssistantMarker: string,
           interrupted: () => boolean,
         ) {
-          const waited = await client.v2.session.wait({ sessionID })
-          if (waited.error && !interrupted()) throw waited.error
-          finalAssistant = await waitForCompletedAssistant({
+          const waited = client.v2.session.wait({ sessionID }).then((result) => {
+            if (result.error && !interrupted()) throw result.error
+          })
+          // The durable activity and completed assistant can settle before the
+          // session-wide wait endpoint returns. Observe that exact terminal
+          // boundary so a stale wait cannot strand an otherwise finished CLI.
+          const observed = await waitForTerminalAssistant({
+            wait: waited,
+            interrupted,
+            observe: async () => {
+              const result = await client.v2.session.activity({ sessionID })
+              if (result.error && !interrupted()) throw result.error
+              const activity = result.data?.data
+              if (activity?.type !== "idle" || !["completed", "failed", "interrupted"].includes(activity.activityStatus ?? ""))
+                return { terminal: false }
+              const assistant = await readFinalAssistant(client)
+              if (assistant?.error !== undefined) throw assistant.error
+              const fresh = JSON.stringify(assistant ?? null) !== previousAssistantMarker
+              return { terminal: true, assistant: fresh && assistant?.time.completed ? assistant : undefined }
+            },
+          })
+          finalAssistant = observed ?? await waitForCompletedAssistant({
             previousMarker: previousAssistantMarker,
             read: () => readFinalAssistant(client),
             interrupted,
@@ -1093,6 +1114,7 @@ export const RunCommand = effectCmd({
             })
           async function finish(wait: Promise<unknown> | undefined, turnID: string) {
             let waitError: unknown
+            let durableVerdict: "done" | "incomplete" | "unknown" | undefined
             if (wait) {
               await waitForRunCompletion({ completed, wait }).catch((error) => {
                 waitError = error
@@ -1113,6 +1135,24 @@ export const RunCommand = effectCmd({
                 done: () => completedDone,
                 interrupted: () => interruptRequested,
                 wait: () => waitForIdle(client, previousAssistantMarker, () => interruptRequested),
+                readDurable: async () => {
+                  const result = await client.v2.session.activity({ sessionID, messageID: turnID })
+                  if (result.error) throw result.error
+                  const activity = result.data?.data
+                  if (activity?.type !== "idle") return
+                  const verdict = activity.turnCompletionResult
+                  if (verdict !== "done" && verdict !== "incomplete" && verdict !== "unknown") return
+                  durableVerdict = verdict
+                  return verdict
+                },
+                // A busy server can decide the bound verdict later than the
+                // plain deadline: deferred continuations and evaluation claims
+                // with exponential retry backoff (5s up to 5min) publish the
+                // verdict on this still-open stream. One bounded extension
+                // turns those slow decisions into real verdicts instead of a
+                // missing-verdict run failure; a closed stream never extends.
+                extensionMs: 300_000,
+                maxExtensions: 1,
               }).catch((error) => {
                 waitError = error
               })
@@ -1129,15 +1169,9 @@ export const RunCommand = effectCmd({
             if (completedError || observedError) process.exitCode = 1
             // The terminal verdict is emitted after bounded continuations. Bind
             // it to the promoted input so old Session verdicts cannot fail a new run.
-            const verdict = turnCompletions.get(turnID)
-            const missingVerdict = runConfig?.session?.turn_completion?.enabled === true && verdict === undefined
-            if (!waitError && !observedError && !interruptRequested && (verdict === "incomplete" || missingVerdict)) {
-              const error = new Error(
-                missingVerdict
-                  ? "Turn completion verdict unavailable: no bound final verdict arrived before the completion wait ended"
-                  : "Turn remained incomplete after automatic continuations",
-              )
-              error.name = missingVerdict ? "TurnCompletionVerdictUnavailableError" : "TurnCompletionIncompleteError"
+            const verdict = turnCompletions.get(turnID) ?? durableVerdict
+            const error = turnCompletionError(verdict, runConfig?.session?.turn_completion?.enabled === true)
+            if (!waitError && !observedError && !interruptRequested && error) {
               if (!emit("error", { error: serializeErrorEvent(error) })) UI.error(error.message)
               process.exitCode = 1
             }

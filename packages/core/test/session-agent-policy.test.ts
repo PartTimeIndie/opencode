@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Schema } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
+import { PermissionV2 } from "@opencode-ai/core/permission"
 import { SessionAgentPolicy } from "@opencode-ai/core/session/agent-policy"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
@@ -15,6 +16,50 @@ const parent = new AgentV2.Info({
 })
 
 describe("SessionAgentPolicy", () => {
+  test("decodes retired source identity without delegating historical provider schemas", () => {
+    const historical = Schema.decodeUnknownSync(SessionAgentPolicy.Info)({
+      tools: { mode: "explicit", entries: { read: { visible: true, permission: "allow" } } },
+      permissionLayers: [],
+      source: { type: "orchestrator", sessionID: "ses_historical", agent: parent.id },
+      cacheTools: [],
+    })
+    expect(historical.source.type).toBe("orchestrator")
+    expect(historical.cacheTools).toEqual([])
+    const native = SessionAgentPolicy.derive({
+      parent: historical,
+      parentSessionID: "ses_parent",
+      parentAgent: parent,
+      parentDelegableTools: ["read"],
+      childTools: ["read"],
+      type: "task",
+    })
+    expect(native.source.type).toBe("task")
+    expect(native.cacheTools).toBeUndefined()
+  })
+
+  test("readonly requires both a tool ceiling and a separate deny layer, bound to its input", () => {
+    const original = SessionAgentPolicy.derive({
+      parent: undefined, parentSessionID: "ses_parent", parentAgent: parent,
+      parentDelegableTools: ["read", "grep", "glob", "bash", "write", "plugin_write"],
+      childTools: ["read", "grep", "glob", "bash", "write", "plugin_write"], type: "task",
+    })
+    const policy = SessionAgentPolicy.restrictReadOnly(original, "msg_readonly")
+    expect(SessionAgentPolicy.isReadOnly(policy)).toBe(true)
+    expect(policy.readOnlyInputID).toBe("msg_readonly")
+    expect(Object.keys(policy.tools.entries)).toEqual(["read", "grep", "glob"])
+    expect(Object.keys(original.tools.entries)).toContain("bash")
+    const ceiling = policy.permissionLayers.at(-1) ?? []
+    for (const action of ["bash", "write", "edit", "apply_patch", "plugin_write", "task", "unknown"]) {
+      expect(PermissionV2.evaluate(action, "anything", ceiling).effect).toBe("deny")
+    }
+    expect(PermissionV2.evaluate("read", "anything", ceiling).effect).toBe("allow")
+    expect(policy.permissionLayers[0]).toEqual(parent.permissions)
+    expect(SessionAgentPolicy.isReadOnly({ ...original, readOnly: true })).toBe(false)
+    expect(SessionAgentPolicy.isReadOnly({ ...policy, readOnlyInputID: undefined })).toBe(false)
+    expect(SessionAgentPolicy.isReadOnly({ ...policy, tools: original.tools })).toBe(false)
+    expect(SessionAgentPolicy.isReadOnly({ ...policy, permissionLayers: original.permissionLayers })).toBe(false)
+  })
+
   test("keeps only tools available to both parent and child", () => {
     const policy = SessionAgentPolicy.derive({
       parent: undefined,
@@ -36,6 +81,26 @@ describe("SessionAgentPolicy", () => {
     expect(policy.permissionLayers[0]).not.toBe(parent.permissions)
     expect(policy.permissionLayers[0]?.[0]).not.toBe(parent.permissions[0])
     expect(policy.source).toEqual({ type: "task", sessionID: "ses_parent", agent: parent.id })
+  })
+
+  test("does not inherit a parent's physical execution placement", () => {
+    const inherited = SessionAgentPolicy.derive({
+      parent: undefined, parentSessionID: "ses_root", parentAgent: parent,
+      parentDelegableTools: ["read"], childTools: ["read"], type: "task",
+    })
+    const bound = Schema.decodeUnknownSync(SessionAgentPolicy.Info)({ ...inherited,
+      executionPlacement: { version: 1, directory: "/parent", checkout: "/parent", identity: "parent-only" },
+      mainWriteConsent: { version: 1, permissionID: "per_parent", inputID: "msg_parent", dispatchDigest: "a".repeat(64), placementIdentity: "parent-only" },
+    })
+    expect(SessionAgentPolicy.derive({
+      parent: bound, parentSessionID: "ses_child", parentAgent: parent,
+      parentDelegableTools: ["read"], childTools: ["read"], type: "task",
+    }).executionPlacement).toBeUndefined()
+    expect(bound.executionPlacement?.identity).toBe("parent-only")
+    expect(SessionAgentPolicy.derive({
+      parent: bound, parentSessionID: "ses_child", parentAgent: parent,
+      parentDelegableTools: ["read"], childTools: ["read"], type: "task",
+    }).mainWriteConsent).toBeUndefined()
   })
 
   test("preserves every inherited permission ceiling for nested subagents", () => {

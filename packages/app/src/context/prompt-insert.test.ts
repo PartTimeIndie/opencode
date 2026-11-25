@@ -1,6 +1,16 @@
 import { expect, test } from "bun:test"
 import type { Prompt } from "./prompt"
-import { insertPromptDraft, promptInsertionIdentity } from "./prompt-insert"
+import { backgroundPromptScope, insertPromptDraft, promptInsertionIdentity } from "./prompt-insert"
+
+test("background draft restoration requires the original open tab, server and directory", () => {
+  const tab = { type: "draft" as const, draftID: "draft-a", server: "server-a" as never, directory: "C:/Voice" }
+  const target = { serverID: "server-a", directory: "C:/Voice", composerID: "draft-a" }
+  expect(backgroundPromptScope(target, [tab])).toEqual({ draftID: "draft-a" })
+  expect(backgroundPromptScope(target, [])).toBeUndefined()
+  expect(backgroundPromptScope({ ...target, serverID: "server-b" }, [tab])).toBeUndefined()
+  expect(backgroundPromptScope({ ...target, directory: "C:/Other" }, [tab])).toBeUndefined()
+  expect(backgroundPromptScope({ ...target, sessionID: "different" }, [tab])).toBeUndefined()
+})
 
 function draft(prompt: Prompt, cursor?: number) {
   return {
@@ -136,6 +146,16 @@ test("identical pre-existing text is not an insertion anchor and unrelated edits
       .join(""),
   ).toBe("same words polished")
   pinned.set([{ type: "text", content: "new intro same words polished", start: 0, end: 28 }], 0)
+  expect(insertPromptDraft(pinned, { text: "again", replace: "polished" }).ok).toBe(false)
+})
+
+test("replacement survives equivalent text-node normalization but not actual edits", () => {
+  const pinned = draft([{ type: "text", content: "intro", start: 0, end: 5 }], 5)
+  expect(insertPromptDraft(pinned, { text: "dictated" }).ok).toBe(true)
+  pinned.set([{ type: "text", content: "intro dictated", start: 0, end: 14 }], 14)
+  expect(insertPromptDraft(pinned, { text: "polished", replace: "dictated" }).ok).toBe(true)
+  expect(pinned.current().map((part) => "content" in part ? part.content : "").join("")).toBe("intro polished")
+  pinned.set([{ type: "text", content: "intro altered", start: 0, end: 13 }], 13)
   expect(insertPromptDraft(pinned, { text: "again", replace: "polished" }).ok).toBe(false)
 })
 

@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron"
 import type { DesktopServiceInvocationEvent, DesktopTestingRequest, ElectronAPI, WslServersEvent } from "./types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
+import type { ServerState } from "./server-state"
+import type { AttentionEntry } from "@opencode-ai/app/session-attention/state"
+import { subscribeServerState } from "./server-state-subscription"
 
 const updaterCallbacks = new Set<(state: UpdaterState) => void>()
 let updaterState: UpdaterState | undefined
@@ -14,6 +17,17 @@ const api: ElectronAPI = {
   killSidecar: () => ipcRenderer.invoke("kill-sidecar"),
   installCli: () => ipcRenderer.invoke("install-cli"),
   awaitInitialization: () => ipcRenderer.invoke("await-initialization"),
+  serverStatus: {
+    subscribe: (callback) => subscribeServerState({
+      snapshot: () => ipcRenderer.invoke("server-state"),
+      listen: (receive) => {
+        const handler = (_: unknown, state: ServerState) => receive(state)
+        ipcRenderer.on("server-state", handler)
+        return () => { ipcRenderer.removeListener("server-state", handler) }
+      },
+    }, callback),
+    retry: () => ipcRenderer.invoke("server-retry"),
+  },
   wslServers: {
     getState: () => ipcRenderer.invoke("wsl-servers-get-state"),
     subscribe: (cb) => {
@@ -65,6 +79,17 @@ const api: ElectronAPI = {
   parseMarkdownCommand: (markdown) => ipcRenderer.invoke("parse-markdown", markdown),
   checkAppExists: (appName) => ipcRenderer.invoke("check-app-exists", appName),
   resolveAppPath: (appName) => ipcRenderer.invoke("resolve-app-path", appName),
+  sessionAttention: {
+    list: () => ipcRenderer.invoke("session-attention-list"),
+    visible: (key) => ipcRenderer.invoke("session-attention-visible", key),
+    isVisible: (key) => ipcRenderer.invoke("session-attention-is-visible", key),
+    update: (command) => ipcRenderer.invoke("session-attention-update", command),
+    subscribe: (callback) => {
+      const handler = (_: unknown, key: string, entry: AttentionEntry) => callback(key, entry)
+      ipcRenderer.on("session-attention-changed", handler)
+      return () => ipcRenderer.removeListener("session-attention-changed", handler)
+    },
+  },
   storeGet: (name, key) => ipcRenderer.invoke("store-get", name, key),
   storeSet: (name, key, value) => ipcRenderer.invoke("store-set", name, key, value),
   storeDelete: (name, key) => ipcRenderer.invoke("store-delete", name, key),
@@ -94,6 +119,7 @@ const api: ElectronAPI = {
   openAppWindow: (route) => ipcRenderer.invoke("open-app-window", route),
   openPath: (path, app) => ipcRenderer.invoke("open-path", path, app),
   readClipboardImage: (options) => ipcRenderer.invoke("read-clipboard-image", options),
+  writeClipboardText: (text) => ipcRenderer.invoke("clipboard-write-text", text),
   showNotification: (title, body) => ipcRenderer.send("show-notification", title, body),
   getWindowFocused: () => ipcRenderer.invoke("get-window-focused"),
   setWindowFocus: () => ipcRenderer.invoke("set-window-focus"),
@@ -103,6 +129,7 @@ const api: ElectronAPI = {
   setZoomFactor: (factor) => ipcRenderer.invoke("set-zoom-factor", factor),
   getPinchZoomEnabled: () => ipcRenderer.invoke("get-pinch-zoom-enabled"),
   setPinchZoomEnabled: (enabled) => ipcRenderer.invoke("set-pinch-zoom-enabled", enabled),
+  browserTransfer: (action, id, ticket) => ipcRenderer.invoke("browser-transfer", action, id, ticket),
   getBrowserAutomationEnabled: () => ipcRenderer.invoke("get-browser-automation-enabled"),
   setBrowserAutomationEnabled: (enabled) => ipcRenderer.invoke("set-browser-automation-enabled", enabled),
   onPinchZoomEnabledChanged: (cb) => {

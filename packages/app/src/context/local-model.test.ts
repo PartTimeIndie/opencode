@@ -71,7 +71,7 @@ describe("resolveLocalModel", () => {
 })
 
 describe("toSessionModelRef", () => {
-  test("builds a direct session model with the selected variant", () => {
+  test("pins a picked model as a direct selection so the session keeps no fallback chain", () => {
     expect(
       toSessionModelRef(
         {
@@ -80,7 +80,22 @@ describe("toSessionModelRef", () => {
         },
         [],
       ),
-    ).toEqual({ providerID: "openrouter", id: "openrouter/free", variant: "default" })
+    ).toEqual({ providerID: "openrouter", id: "openrouter/free", variant: "default", chain: null })
+  })
+
+  test("a picked model that is a chain step is still a direct selection, not that chain", () => {
+    expect(
+      toSessionModelRef({ model: { providerID: "zhipuai-coding-plan", modelID: "glm-5.4" } }, [
+        {
+          id: "standard-coder",
+          name: "Standard Coder",
+          steps: [
+            { providerID: "zhipuai-coding-plan", modelID: "glm-5.4" },
+            { providerID: "openrouter", modelID: "openrouter/free" },
+          ],
+        },
+      ]),
+    ).toEqual({ providerID: "zhipuai-coding-plan", id: "glm-5.4", chain: null })
   })
 
   test("builds the complete persisted chain from the selected chain", () => {

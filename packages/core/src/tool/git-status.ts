@@ -73,18 +73,47 @@ export const layer = Layer.effectDiscard(
 
     const runGit = (args: readonly string[], maxOutputBytes: number) =>
       appProcess.run(
-        ChildProcess.make("git", [...args], {
-          ...(process.platform === "win32" ? { env: { Path: executablePath() }, extendEnv: true as const } : {}),
-          cwd: location.directory,
-          stdin: "ignore",
-          detached: false,
-        }),
+        ChildProcess.make(
+          "git",
+          [
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "color.status=false",
+            ...args,
+            ...(args.includes("diff") ? ["--no-ext-diff", "--no-textconv", "--no-color"] : []),
+          ],
+          {
+            // An inherited GIT_DIR/WORK_TREE or config override must not redirect
+            // reviewers or turn read-only inspection into repository callbacks.
+            env: {
+              ...Object.fromEntries(
+                Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_")),
+              ),
+              ...(process.platform === "win32" ? { Path: executablePath() } : {}),
+              GIT_OPTIONAL_LOCKS: "0",
+              GIT_TERMINAL_PROMPT: "0",
+              GIT_NO_LAZY_FETCH: "1",
+            },
+            extendEnv: false,
+            cwd: location.directory,
+            stdin: "ignore",
+            detached: false,
+          },
+        ),
         { timeout: Duration.millis(DEFAULT_TIMEOUT_MS), maxOutputBytes, maxErrorBytes: 8 * 1024 },
       )
 
     const runSection = (args: readonly string[], maxOutputBytes: number) =>
       Effect.gen(function* () {
-        const result = yield* Effect.mapError(runGit(args, maxOutputBytes), (error) => new Error(describeSpawnFailure(error)))
+        const result = yield* Effect.mapError(
+          runGit(args, maxOutputBytes),
+          (error) => new Error(describeSpawnFailure(error)),
+        )
         if (result.exitCode !== 0) return yield* Effect.fail(new Error(describeGitFailure(args, result)))
         return { text: result.stdout.toString("utf8"), truncated: result.stdoutTruncated }
       })
@@ -93,7 +122,7 @@ export const layer = Layer.effectDiscard(
       .register({
         [name]: Tool.make({
           description:
-            'Inspect the git working tree of the active Location with a bounded, read-only view: short status with branch header and untracked files, plus diff --stat summaries. Use scope "patch" to include the full staged and unstaged diffs. This tool never mutates the repository.',
+            'Inspect Git status and diffs for a code review without shell access. The default scope "summary" returns branch, untracked file names and staged/unstaged diff statistics. Use scope "patch" to read the actual staged and unstaged changes. Patches are byte-capped; truncated output is not a complete diff. Untracked file contents require read. This read-only tool disables repository callbacks and optional index writes.',
           input: Input,
           output: Output,
           toModelOutput: ({ output }) => [{ type: "text", text: toModelOutput(output) }],
@@ -118,8 +147,11 @@ export const layer = Layer.effectDiscard(
               }
               return { scope, output: parts.join("\n\n"), truncated }
             }).pipe(
-              Effect.mapError((error) =>
-                new ToolFailure({ message: error instanceof Error ? error.message : "Unable to inspect the git working tree state" }),
+              Effect.mapError(
+                (error) =>
+                  new ToolFailure({
+                    message: error instanceof Error ? error.message : "Unable to inspect the git working tree state",
+                  }),
               ),
             ),
         }),

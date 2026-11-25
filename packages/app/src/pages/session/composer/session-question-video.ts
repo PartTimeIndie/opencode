@@ -1,5 +1,9 @@
 const windowsCaptionControlsWidth = 138
 
+export function videoPreviewRatio(width: number, height: number) {
+  return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0 ? width / height : 16 / 9
+}
+
 export function shouldCloseVideoFullscreenOnEscape(input: {
   key: string
   defaultPrevented: boolean

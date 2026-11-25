@@ -24,6 +24,7 @@ export type Settings = ConfigMaintenance.ResolvedWatchdog
 export type Deps = {
   readonly activity: SessionActivity.Interface
   readonly db: Database.Interface["db"]
+  readonly excludeIDs?: () => ReadonlySet<string>
 }
 
 const DEFAULTS = ConfigMaintenance.defaultWatchdog
@@ -91,7 +92,7 @@ export type CycleResult = {
 export const settleOnce = (deps: Deps, settings: Settings) =>
   Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis
-    const stale = yield* deps.activity.listStale(50)
+    const stale = yield* deps.activity.listStale(50, deps.excludeIDs?.())
     const due = stale.filter((info) => isSettleDue(info, now, settings.leaseGraceMs))
     let activities = 0
     for (const info of due) {

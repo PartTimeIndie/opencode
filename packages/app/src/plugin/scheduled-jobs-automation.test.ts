@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { pluginServiceResponse } from "./service-response"
 
 type HttpRequest = {
   path: string
@@ -38,6 +39,87 @@ const source = "scheduled-jobs-app-verification"
 const slug = `${source}-scheduler-verification-${fixtureId}`
 
 describe("scheduled jobs verification automation", () => {
+  for (const status of [401, 403, 503]) {
+    test(`preserves an outer service HTTP ${status} for scheduler recovery`, async () => {
+      await expect(
+        scheduler.runSchedulerVerificationFixture(
+          { services: { call: async () => ({ ok: false, status, error: "Service unavailable" }) } },
+          common("get"),
+        ),
+      ).rejects.toMatchObject({ status })
+    })
+  }
+
+  for (const status of [401, 403, 503]) {
+    test(`startup recovery handles a real service HTTP ${status} without replay`, async () => {
+      const controller = new AbortController()
+      const requests: HttpRequest[] = []
+      const navigation: unknown[] = []
+      const unexpected: unknown[] = []
+      const job = fixtureJob({
+        lastRunStatus: "running", lastRunRunId: runId,
+        lastRunSessionID: "ses_saved", lastRunMessageID: "msg_saved",
+        lastRunResultContract: "opencode.scheduled-job-result/v1",
+      })
+      let lists = 0
+      let settled = false
+      scheduler.default.app({
+        settings: { get: (_key: string, fallback: unknown) => fallback, register() {}, subscribe() {} },
+        commands: { register() {} }, automation: { register() {} },
+        dock: { state: { item: () => ({ area: "left" }) }, register() {}, open: { item() {} } },
+        kv: { get: (_key: string, fallback: unknown) => fallback },
+        lifecycle: { signal: controller.signal, onDispose() {} },
+        ui: { models: { resolve: (input: unknown) => unexpected.push(input) } },
+        host: {
+          navigation: { registerHandoffHandler() {}, openSession: (input: unknown) => navigation.push(input) },
+          projects: { open() {} },
+          http: { request: (input: unknown) => unexpected.push(input) },
+          sessions: { accessControl: { set: (input: unknown) => unexpected.push(input) } },
+        },
+        services: {
+          call: async ({ input }: { input: HttpRequest }) => {
+            requests.push(input)
+            if (input.path === "/scheduler/jobs" && ++lists === 1)
+              return pluginServiceResponse(Response.json({ message: "Temporarily unavailable" }, { status }))
+            const data = input.path === "/scheduler/jobs" ? { jobs: [job] }
+              : input.path.endsWith("/outcome") ? { status: "failed", error: "Interrupted before settlement" }
+              : input.path.endsWith("/state") ? { job: { ...job, lastRunStatus: "failed" } }
+              : { job }
+            if (input.path.endsWith("/state")) settled = true
+            return pluginServiceResponse(Response.json({ ok: true, data: { status: 200, body: { success: true, data } } }))
+          },
+        },
+      })
+      try {
+        const deadline = Date.now() + 2200
+        while (!settled && Date.now() < deadline) await Bun.sleep(10)
+        expect(lists).toBe(status === 503 ? 2 : 1)
+        expect(settled).toBe(status === 503)
+        expect(unexpected).toEqual([])
+        expect(navigation).toEqual(status === 503 ? [{ directory: workdir, sessionID: "ses_saved" }] : [])
+        if (status === 503) expect(requests.at(-1)?.body).toMatchObject({ status: "failed", messageID: "msg_saved" })
+      } finally { controller.abort() }
+    })
+  }
+
+  test("disposal cancels a pending service recovery retry", async () => {
+    const controller = new AbortController()
+    let calls = 0
+    scheduler.default.app({
+      settings: { get: (_key: string, fallback: unknown) => fallback, register() {}, subscribe() {} },
+      commands: { register() {} }, automation: { register() {} },
+      dock: { state: { item: () => ({ area: "left" }) }, register() {}, open: { item() {} } },
+      kv: { get: (_key: string, fallback: unknown) => fallback },
+      lifecycle: { signal: controller.signal, onDispose() {} },
+      host: { navigation: { registerHandoffHandler() {} } },
+      services: { call: async () => { calls++; return pluginServiceResponse(new Response("Unavailable", { status: 503 })) } },
+    })
+    await Bun.sleep(30)
+    controller.abort()
+    await Bun.sleep(1100)
+    expect(calls).toBe(1)
+  })
+
   test("registers the fixture through the app automation API", () => {
     const actions: Array<Record<string, unknown>> = []
     scheduler.default.app({
@@ -86,6 +168,7 @@ describe("scheduled jobs verification automation", () => {
         schedule,
         prompt,
         model,
+        variant: "high",
         preflightToken,
         timeoutSeconds: 600,
       },
@@ -125,7 +208,7 @@ describe("scheduled jobs verification automation", () => {
         modelPolicyException: {
           model,
           variant: "high",
-          reason: "Isolated scheduler verification explicitly requested this model.",
+          reason: "Isolated scheduler verification explicitly requested this direct model.",
         },
         preflight: {
           command: "powershell.exe",
@@ -156,6 +239,7 @@ describe("scheduled jobs verification automation", () => {
           schedule,
           prompt: "test",
           model,
+          variant: "high",
           preflightToken,
         },
       ),

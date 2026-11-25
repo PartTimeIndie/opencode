@@ -115,6 +115,12 @@ export function limited(readLimits: ReadLimits) {
   )
 }
 
+/** Reviewer tool use is unlimited unless a real agent or task budget was configured. */
+export function forSession(input: { reviewer: boolean; enabled: boolean; limits?: ReadLimits }): Budget {
+  if (input.limits) return limited(input.limits)
+  return make(input.reviewer ? false : input.enabled)
+}
+
 // Produce a stable signature for a polling-tool call so identical repeated calls
 // (same command / same job lookup) can be detected as an observation-unchanged loop.
 function pollSignature(toolName: string, args: unknown): string {

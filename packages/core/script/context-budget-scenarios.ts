@@ -13,9 +13,9 @@ export function evaluate(id: string, actions: Action[], text: string[]) {
   const names = skillCalls.filter((action) => typeof action.input.name === "string").map((action) => action.input.name)
   if (!validSkills) return false
   return id === "rules"
-    ? text.join(" ").includes("pu-gameplay-presentation.md") &&
+    ? text.join(" ").includes("gameplay-presentation.md") &&
         !actions.some(
-          (action) => action.name === "read" && JSON.stringify(action.input).includes("pu-release-and-mirrors.md"),
+          (action) => action.name === "read" && JSON.stringify(action.input).includes("release-and-mirrors.md"),
         )
     : id === "test-boundary"
       ? /unit.?test|verhaltenstest/i.test(text.join(" ")) &&

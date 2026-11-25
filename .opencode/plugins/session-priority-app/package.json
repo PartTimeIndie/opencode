@@ -1,0 +1,11 @@
+{
+  "name": "session-priority-app",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": { "./app": "./index.js" },
+  "opencode": {
+    "app": {
+      "capabilities": ["ui:slots", "host:session-attention"]
+    }
+  }
+}

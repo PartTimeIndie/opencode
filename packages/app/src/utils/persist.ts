@@ -2,7 +2,7 @@ import { Platform, usePlatform } from "@/context/platform"
 import { makePersisted, type AsyncStorage, type SyncStorage } from "@solid-primitives/storage"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { createResource, type Accessor } from "solid-js"
-import type { SetStoreFunction, Store } from "solid-js/store"
+import { unwrap, type SetStoreFunction, type Store } from "solid-js/store"
 import { pathKey } from "@/utils/path-key"
 import { ScopedKey, ServerScope, type ServerScope as ServerScopeValue } from "@/utils/server-scope"
 
@@ -21,6 +21,8 @@ export type PersistTarget = {
   legacy?: string[]
   migrate?: (value: unknown) => unknown
   serialize?: (value: unknown) => unknown
+  /** Decode a versioned envelope without normalizing or rewriting its raw storage. */
+  hydrate?: (raw: string) => unknown
 }
 
 const LEGACY_STORAGE = "default.dat"
@@ -229,7 +231,13 @@ function write(storage: Storage, key: string, value: string) {
 }
 
 function snapshot(value: unknown) {
-  return JSON.parse(JSON.stringify(value)) as unknown
+  return JSON.parse(serializeStore(value)) as unknown
+}
+
+function serializeStore(value: unknown) {
+  // Solid exposes its raw store through unwrap. Serializing the reactive proxy
+  // can fail when a nested proxy reports an invalid property descriptor.
+  return JSON.stringify(unwrap(value))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -542,6 +550,7 @@ export const PersistTesting = {
   migrateLegacy,
   normalize,
   serializeValue,
+  serializeStore,
   workspaceStorage,
 }
 
@@ -644,6 +653,10 @@ export function persisted<T>(
 
       const api: SyncStorage = {
         getItem: (key) => {
+          if (config.hydrate) {
+            const raw = current.getItem(key)
+            return raw === null ? null : JSON.stringify(config.hydrate(raw))
+          }
           const value = readCurrent({ storage: current, key, defaults, migrate: config.migrate })
           if (value !== undefined) return value
           return migrateLegacy({
@@ -676,6 +689,10 @@ export function persisted<T>(
 
     const api: AsyncStorage = {
       getItem: async (key) => {
+        if (config.hydrate) {
+          const raw = await current.getItem(key)
+          return raw === null ? null : JSON.stringify(config.hydrate(raw))
+        }
         const value = await readCurrentAsync({ storage: current, key, defaults, migrate: config.migrate })
         if (value !== undefined) return value
         return migrateLegacyAsync({
@@ -700,7 +717,7 @@ export function persisted<T>(
     return api
   })()
 
-  const [state, setState, init] = makePersisted(store, { name: config.key, storage })
+  const [state, setState, init] = makePersisted(store, { name: config.key, storage, serialize: serializeStore })
 
   const isAsync = init instanceof Promise
   const [ready] = createResource(

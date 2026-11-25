@@ -166,12 +166,12 @@ test("group navigation is not counted as a full skill load and unsuccessful call
   expect(
     evaluate("multi-topic", [...loads, { name: "skill", input: {}, result: "Fixture only; no external action." }], []),
   ).toBe(false)
-  expect(evaluate("rules", [], ["Read pu-gameplay-presentation.md; pu-release-and-mirrors.md is excluded."])).toBe(true)
+  expect(evaluate("rules", [], ["Read gameplay-presentation.md; release-and-mirrors.md is excluded."])).toBe(true)
   expect(
     evaluate(
       "rules",
-      [{ name: "read", input: { path: "pu-release-and-mirrors.md" }, result: "Fixture" }],
-      ["pu-gameplay-presentation.md"],
+      [{ name: "read", input: { path: "release-and-mirrors.md" }, result: "Fixture" }],
+      ["gameplay-presentation.md"],
     ),
   ).toBe(false)
 })

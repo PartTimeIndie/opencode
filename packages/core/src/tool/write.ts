@@ -1,8 +1,6 @@
 /**
- * Model-facing V2 file-write leaf. Relative paths resolve within the active
- * Location. Absolute paths inside that Location are accepted, while explicit
- * absolute external paths retain mutation capability through a separate
- * external_directory approval before edit approval.
+ * Model-facing V2 file-write leaf. External targets require separate
+ * external_directory approval before edit approval, regardless of path form.
  * Named project references
  * are read-oriented and deliberately are not accepted by mutation tools.
  */
@@ -12,6 +10,8 @@ import { ToolFailure } from "@opencode-ai/llm"
 import { Effect, Layer, Option, Schema } from "effect"
 import { FileMutation } from "../file-mutation"
 import { LocationMutation } from "../location-mutation"
+import { WorkspaceCheckout } from "../session/workspace/checkout"
+import { LegacyDelegationGuard } from "../session/legacy-delegation/guard"
 import { PermissionV2 } from "../permission"
 import { SessionFileMutation } from "../session/file-mutation"
 import { Database } from "../database/database"
@@ -25,7 +25,7 @@ export const name = "write"
 export const Input = Schema.Struct({
   path: Schema.String.pipe(Schema.optional).annotate({
     description:
-      "File path to write. Relative paths resolve within the active Location. Absolute paths inside that Location are accepted; external absolute paths require external_directory approval.",
+      "File path to write. Relative paths resolve from the active Location. External targets, including those reached via links, require external_directory approval.",
   }),
   filePath: Schema.String.pipe(Schema.optional).annotate({
     description: "Legacy provider alias for path",
@@ -81,6 +81,7 @@ export const layer = Layer.effectDiscard(
     const permission = yield* PermissionV2.Service
     const journal = Option.getOrUndefined(yield* Effect.serviceOption(SessionFileMutation.Service))
     const database = Option.getOrUndefined(yield* Effect.serviceOption(Database.Service))
+    const checkouts = Option.getOrUndefined(yield* Effect.serviceOption(WorkspaceCheckout.Service))
     const fs =
       Option.getOrUndefined(yield* Effect.serviceOption(FSUtil.Service)) ??
       (yield* FSUtil.Service.pipe(Effect.provide(FSUtil.defaultLayer)))
@@ -90,7 +91,7 @@ export const layer = Layer.effectDiscard(
         [name]: Tool.withPermission(
           Tool.make({
             description:
-              "Write one file. Existing files require a prior complete read delivered to this session; stale versions are rejected. Confirmed own writes need no extra read. New files use exclusive creation. User claims or permission approval are not read evidence. Never bypass a conflict using shell, generators or plugins. External absolute paths require external_directory approval before edit approval.",
+              "Write one file. Existing files require a prior complete read delivered to this session; stale versions are rejected. Confirmed own writes need no extra read. New files use exclusive creation. User claims or permission approval are not read evidence. Never bypass a conflict using shell, generators or plugins. External targets require external_directory approval before edit approval.",
             input: Input,
             output: Output,
             validateInput,
@@ -107,7 +108,12 @@ export const layer = Layer.effectDiscard(
                   return yield* new ToolFailure({
                     message: "Choose either expectedSha256 or expectedAbsent, not both.",
                   })
-                const target = yield* mutation.resolve({ path: resource, kind: "file" })
+                const target = yield* mutation.resolve({ path: resource, kind: "file" }, LocationMutation.guardedPaths)
+                yield* LegacyDelegationGuard.assertFileWrite(
+                  { db: database?.db, checkouts },
+                  context.sessionID,
+                  target.canonical,
+                ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
                 const external = target.externalDirectory
                 if (external)
                   yield* permission.assert({
@@ -137,6 +143,7 @@ export const layer = Layer.effectDiscard(
                   files,
                   resolution: mutation,
                   journal,
+                  checkouts,
                   operations: [
                     {
                       type: "write",

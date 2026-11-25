@@ -2,7 +2,7 @@ import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
 import { mkdir, stat, writeFile } from "node:fs/promises"
 import { basename, join } from "node:path"
-import { app, BrowserWindow, Notification, clipboard, dialog, ipcMain, shell } from "electron"
+import { app, BrowserWindow, Notification, clipboard, dialog, ipcMain, nativeImage, shell } from "electron"
 import type { IpcMainEvent, IpcMainInvokeEvent } from "electron"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 
@@ -14,16 +14,22 @@ import type {
   TitlebarTheme,
 } from "../preload/types"
 import { getBrowserAutomationEnabled, setBrowserAutomationEnabled } from "./browser-automation"
+import { registerBrowserTransferIpc } from "./browser-transfer-ipc"
 import { installCli } from "./cli-install"
 import { runDesktopMenuAction } from "./desktop-menu-actions"
 import { assertAttachmentBudget, createPickedFileAuthorizations } from "./attachment-picker"
 import { parseFrameStallReport, reportFrameStallFromRenderer } from "./paint-recovery"
 import { getStore } from "./store"
+import { attentionBroker } from "./session-attention"
+import type { AttentionCommand } from "@opencode-ai/app/session-attention/broker"
 import { createMainWindow, getPinchZoomEnabled, setPinchZoomEnabled, setTitlebar, updateTitlebar } from "./windows"
 import type { UpdaterController } from "./updater-controller"
 import { createUpdaterSubscriptions } from "./updater-subscriptions"
 import { openDesktopLink } from "./open-link"
 import type { PluginDesktopServices } from "./plugin-desktop-services"
+import type { ServerState } from "../preload/server-state"
+import { readClipboardPng } from "./clipboard-image"
+import { isOwningWindowSender, writeClipboardText } from "./clipboard-text"
 
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
@@ -34,6 +40,8 @@ const pickedFiles = createPickedFileAuthorizations()
 
 type Deps = {
   killSidecar: () => Promise<void> | void
+  serverState: () => ServerState
+  retryServer: () => void
   relaunch: (reason: string) => void
   awaitInitialization: () => Promise<ServerReadyData>
   consumeInitialDeepLinks: () => Promise<string[]> | string[]
@@ -53,10 +61,13 @@ type Deps = {
 }
 
 export function registerIpcHandlers(deps: Deps) {
+  registerBrowserTransferIpc()
   const updaterSubscriptions = createUpdaterSubscriptions()
   app.once("will-quit", updaterSubscriptions.clear)
 
   ipcMain.handle("kill-sidecar", () => deps.killSidecar())
+  ipcMain.handle("server-state", () => deps.serverState())
+  ipcMain.handle("server-retry", () => deps.retryServer())
   ipcMain.handle("await-initialization", () => deps.awaitInitialization())
   ipcMain.handle("consume-initial-deep-links", () => deps.consumeInitialDeepLinks())
   ipcMain.handle("get-default-server-url", () => deps.getDefaultServerUrl())
@@ -93,6 +104,31 @@ export function registerIpcHandlers(deps: Deps) {
   ipcMain.on("report-frame-stall", (event: IpcMainEvent, value: unknown) => {
     const report = parseFrameStallReport(value)
     if (report) reportFrameStallFromRenderer(event, report)
+  })
+  const attentionViews = new Map<number, string>()
+  const attentionObserved = new WeakSet<object>()
+  const attentionVisible = (key: string) => BrowserWindow.getAllWindows().some((win) =>
+    !win.isDestroyed() && win.isFocused() && attentionViews.get(win.webContents.id) === key)
+  const attention = attentionBroker({
+    get: (name, key) => getStore(name).get(key),
+    set: (name, key, value) => getStore(name).set(key, value),
+  }, attentionVisible)
+  ipcMain.handle("session-attention-visible", (event: IpcMainInvokeEvent, key: string | null) => {
+    if (key && key.length <= 4096) attentionViews.set(event.sender.id, key)
+    else attentionViews.delete(event.sender.id)
+    if (!attentionObserved.has(event.sender)) {
+      attentionObserved.add(event.sender)
+      event.sender.once("destroyed", () => attentionViews.delete(event.sender.id))
+    }
+  })
+  ipcMain.handle("session-attention-is-visible", (_event: IpcMainInvokeEvent, key: string) => attentionVisible(key))
+  ipcMain.handle("session-attention-list", () => attention.list())
+  ipcMain.handle("session-attention-update", (_event: IpcMainInvokeEvent, command: AttentionCommand) => {
+    const result = attention.update(command)
+    if (result.changed) BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send("session-attention-changed", command.key, result.entry)
+    })
+    return result
   })
   ipcMain.handle("store-get", (_event: IpcMainInvokeEvent, name: string, key: string) => {
     try {
@@ -213,24 +249,28 @@ export function registerIpcHandlers(deps: Deps) {
   })
 
   ipcMain.handle("read-clipboard-image", async (_event: IpcMainInvokeEvent, options?: { includeBuffer?: boolean }) => {
-    const formats = clipboard.availableFormats()
-    if (formats.length > 0 && !formats.some((format) => clipboardFormatCanContainImage(format))) return null
-    const image = clipboard.readImage()
-    if (image.isEmpty()) return null
-    const buffer = image.toPNG()
+    const image = await readClipboardPng(() => clipboard.read(), (buffer) => nativeImage.createFromBuffer(buffer))
+    if (!image) return null
+    const buffer = image.buffer
     const directory = join(app.getPath("userData"), "clipboard-attachments")
     await mkdir(directory, { recursive: true })
     const path = join(directory, `clipboard-${createHash("sha256").update(buffer).digest("hex")}.png`)
     await writeFile(path, buffer)
-    const size = image.getSize()
     return {
       ...(options?.includeBuffer === false
         ? {}
         : { buffer: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) }),
       path,
-      width: size.width,
-      height: size.height,
+      width: image.width,
+      height: image.height,
     }
+  })
+
+  // The web Clipboard API rejects writes while the renderer is unfocused; plugins
+  // dictating into other windows still need their transcript copy.
+  ipcMain.handle("clipboard-write-text", (event: IpcMainInvokeEvent, text: unknown) => {
+    if (!isOwningWindowSender(event.sender)) throw new Error("Clipboard writes require the owning window")
+    return writeClipboardText(text, (value) => clipboard.writeText(value))
   })
 
   ipcMain.on("show-notification", (_event: IpcMainEvent, title: string, body?: string) => {
@@ -306,11 +346,6 @@ export function registerIpcHandlers(deps: Deps) {
     (event: IpcMainInvokeEvent, registrationID: string, invocationID: string, text: string) =>
       deps.desktopServices.insertText(event.sender, registrationID, invocationID, text),
   )
-}
-
-function clipboardFormatCanContainImage(format: string) {
-  const value = format.toLowerCase()
-  return value.includes("image") || value.includes("png") || value.includes("bitmap") || value.includes("dib")
 }
 
 export function sendMenuCommand(win: BrowserWindow, id: string) {

@@ -6,6 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./desktop-menu": "./src/desktop-menu.ts",
+    "./session-attention/broker": "./src/session-attention/broker.ts",
+    "./session-attention/state": "./src/session-attention/state.ts",
     "./updater": "./src/updater.ts",
     "./wsl/types": "./src/wsl/types.ts",
     "./vite": "./vite.js",
@@ -24,6 +26,7 @@
     "test:virtualizer": "bun test --conditions=browser --preload ./happydom.ts ./test-browser/solid-virtual.test.ts",
     "test:unit:watch": "bun test --watch --preload ./happydom.ts ./src",
     "test:e2e": "playwright test",
+    "test:e2e:task-write": "bun ./e2e/task-write-gate.ts",
     "test:e2e:controlled": "bun ./e2e/run-with-vite-server.ts",
     "test:e2e:local": "playwright test",
     "test:e2e:ui": "playwright test --ui",

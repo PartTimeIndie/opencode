@@ -1,6 +1,6 @@
 export * as ContentStore from "./content-store"
 
-import { eq } from "drizzle-orm"
+import { and, eq, sql } from "drizzle-orm"
 import { Cause, Context, Effect, Exit, Layer, Option, Schema } from "effect"
 import { createHash } from "node:crypto"
 import { open } from "node:fs/promises"
@@ -12,8 +12,10 @@ import { LayerNode } from "./effect/layer-node"
 import { FSUtil } from "./fs-util"
 import { Global } from "./global"
 import { SessionMessage } from "./session/message"
+import { SessionForkAttachmentID } from "./session/fork-attachment-id"
 import { FileAttachment, Prompt, Source } from "./session/prompt"
 import { SessionSchema } from "./session/schema"
+import { isArchiveAttachment } from "./session/archive-attachment"
 
 export const MANAGED_DIRECTORY = "content"
 export const URI_PREFIX = "attachment://"
@@ -116,6 +118,7 @@ export const layer = Layer.effect(
     const fs = yield* FSUtil.Service
     const global = yield* Global.Service
     const directory = path.join(global.data, MANAGED_DIRECTORY)
+    const extractedArchives = new Map<string, string>()
 
     const source = Effect.fn("ContentStore.source")(function* (file: FileAttachment) {
       if (file.uri.startsWith(URI_PREFIX)) return undefined
@@ -486,14 +489,16 @@ export const layer = Layer.effect(
           }
           const decoded = yield* source(file)
           if (!decoded) return limitSourcePreview(file)
-          return limitSourcePreview(yield* store({
-            sessionID: input.sessionID,
-            messageID: input.messageID,
-            key: input.key,
-            ordinal,
-            file,
-            source: decoded,
-          }))
+          return limitSourcePreview(
+            yield* store({
+              sessionID: input.sessionID,
+              messageID: input.messageID,
+              key: input.key,
+              ordinal,
+              file,
+              source: decoded,
+            }),
+          )
         }),
         { concurrency: 4 },
       )
@@ -515,14 +520,16 @@ export const layer = Layer.effect(
           }
           const decoded = yield* source(file)
           if (!decoded) return limitSourcePreview(file)
-          return limitSourcePreview(yield* store({
-            sessionID: input.sessionID,
-            messageID: input.messageID,
-            key: input.messageID,
-            ordinal,
-            file,
-            source: decoded,
-          }))
+          return limitSourcePreview(
+            yield* store({
+              sessionID: input.sessionID,
+              messageID: input.messageID,
+              key: input.messageID,
+              ordinal,
+              file,
+              source: decoded,
+            }),
+          )
         }),
         { concurrency: 4 },
       )
@@ -575,6 +582,32 @@ export const layer = Layer.effect(
         .pipe(Effect.mapError((cause) => new StorageError({ operation: "read", resource: blob.path, cause })))
     })
 
+    // Forked history references the parent's attachment URIs verbatim. The only
+    // owned path back to those bytes is this session's own deterministic fork
+    // row; the scan is bounded to fork-namespaced rows of the requesting session.
+    const locateForkAlias = (uri: string, sessionID: string) =>
+      db
+        .select()
+        .from(AttachmentTable)
+        .where(
+          and(
+            eq(AttachmentTable.session_id, sessionID),
+            sql`substr(${AttachmentTable.id}, 1, ${SessionForkAttachmentID.AttachmentPrefix.length}) = ${SessionForkAttachmentID.AttachmentPrefix}`,
+          ),
+        )
+        .all()
+        .pipe(
+          Effect.mapError((cause) => new StorageError({ operation: "database", resource: uri, cause })),
+          Effect.map((rows) =>
+            rows.find(
+              (row) =>
+                typeof row.blob_sha256 === "string" &&
+                row.blob_sha256.length > 0 &&
+                SessionForkAttachmentID.derive({ sessionID, uri, blobSha256: row.blob_sha256 }) === row.id,
+            ),
+          ),
+        )
+
     const locate: Interface["locate"] = Effect.fn("ContentStore.locate")(function* (input) {
       if (!input.uri.startsWith(URI_PREFIX)) return undefined
       const id = input.uri.slice(URI_PREFIX.length)
@@ -584,27 +617,36 @@ export const layer = Layer.effect(
         .where(eq(AttachmentTable.id, id))
         .get()
         .pipe(Effect.mapError((cause) => new StorageError({ operation: "database", resource: id, cause })))
-      if (!attachment) return undefined
-      if (input.sessionID !== undefined && attachment.session_id !== input.sessionID) return undefined
-      if (!attachment.blob_sha256)
+      const owned =
+        attachment && (input.sessionID === undefined || attachment.session_id === input.sessionID)
+          ? attachment
+          : // A forked child retains the parent's serialized attachment references
+            // so the provider sees a byte-identical cacheable prefix. Resolve such
+            // a reference only through this session's own deterministic fork row;
+            // a reference with no owned fork copy stays unresolved, never foreign.
+            input.sessionID !== undefined && !id.startsWith(SessionForkAttachmentID.AttachmentPrefix)
+            ? yield* locateForkAlias(input.uri, input.sessionID)
+            : undefined
+      if (!owned) return undefined
+      if (!owned.blob_sha256)
         return yield* new StorageError({
           operation: "integrity",
-          resource: id,
+          resource: owned.id,
           cause: new Error("Managed attachment has no blob content address"),
         })
-      const blob = yield* locateBlob(attachment.blob_sha256)
+      const blob = yield* locateBlob(owned.blob_sha256)
       if (!blob)
         return yield* new StorageError({
           operation: "integrity",
-          resource: id,
+          resource: owned.id,
           cause: new Error("Managed attachment blob metadata is missing"),
         })
       return {
-        id,
-        sessionID: attachment.session_id,
+        id: owned.id,
+        sessionID: owned.session_id,
         sha256: blob.sha256,
-        mime: attachment.mime,
-        name: attachment.filename ?? undefined,
+        mime: owned.mime,
+        name: owned.filename ?? undefined,
         path: blob.path,
         sizeBytes: blob.sizeBytes,
       }
@@ -640,6 +682,39 @@ export const layer = Layer.effect(
           resource: input.file.uri,
           cause: new Error("Managed attachment does not belong to this session"),
         })
+      if (input.file.unpack && isArchiveAttachment(input.file)) {
+        const key = `${input.sessionID}:${content.id}`
+        const cached = extractedArchives.get(key)
+        const text =
+          cached ??
+          (yield* Effect.tryPromise({
+            try: async (signal) => {
+              const { extractArchiveAttachment } = await import("./session/archive-attachment")
+              return (
+                await extractArchiveAttachment({
+                  bytes: content.bytes,
+                  root: path.join(global.data, "attachment-extractions", encodeURIComponent(input.sessionID)),
+                  name: input.file.name ?? content.name ?? "archive",
+                  signal,
+                })
+              ).text
+            },
+            catch: (cause) => cause,
+          }).pipe(
+            Effect.catch((cause) =>
+              Effect.succeed(
+                `Archive ${JSON.stringify(input.file.name ?? "archive")} could not be unpacked: ${cause instanceof Error ? cause.message : String(cause)}. Original attachment retained. No archive contents have been supplied to the model.`,
+              ),
+            ),
+          ))
+        if (extractedArchives.size >= 128) extractedArchives.delete(extractedArchives.keys().next().value!)
+        extractedArchives.set(key, text)
+        return FileAttachment.create({
+          uri: `data:text/plain;base64,${Buffer.from(text).toString("base64")}`,
+          mime: "text/plain",
+          name: input.file.name ?? content.name,
+        })
+      }
       return FileAttachment.create({
         ...input.file,
         uri: `data:${content.mime};base64,${Buffer.from(content.bytes).toString("base64")}`,

@@ -19,6 +19,8 @@ const IMAGE_ONLY_ROUTE_IDS = new Set([
   "openai-chat",
   "openai-compatible-chat",
   "openai-responses",
+  "openai-responses-codex",
+  "openai-responses-websocket",
 ])
 const TEXT_ONLY_MODELS = new Set(["zhipuai-coding-plan/glm-5.2", "zhipuai-coding-plan/glm-5.3"])
 const BEDROCK_USER_DOCUMENT_MIMES = new Set([
@@ -167,6 +169,40 @@ const toolErrorText = (state: SessionMessage.ToolStateError) => {
   return [state.error.message, ...content].filter((part) => part.length > 0).join("\n")
 }
 
+// Only fanout failures have a structured, bounded receipt. Other local tool
+// errors retain their existing text replay and never leak arbitrary metadata.
+export const fanoutFailureText = (state: SessionMessage.ToolStateError) => {
+  const text = toolErrorText(state)
+  const results = state.structured.partial_results
+  if (!Array.isArray(results) || results.length === 0) return text
+  const completed = results.flatMap((item): unknown[] => {
+    if (!item || typeof item !== "object" || typeof item.reviewer?.model !== "string") return []
+    const recovery = item.recovery
+    if (item.status === "success" && item.result !== undefined)
+      return [{ reviewer: item.reviewer, sessionID: item.sessionID, status: "success", result: item.result,
+        ...(recovery?.source === "repaired" && Array.isArray(recovery.findings)
+          ? { original_findings: recovery.findings, repair_is_not_independent: true } : {}) }]
+    if (item.status !== "partial" || !recovery || typeof recovery !== "object" || !Array.isArray(recovery.findings) ||
+        (recovery.findings.length === 0 && !(typeof recovery.omittedFindings === "number" && recovery.omittedFindings > 0))) return []
+    return [{ reviewer: item.reviewer, sessionID: item.sessionID, status: "partial", not_clean: true,
+      findings: recovery.findings, issues: recovery.issues, source: "original",
+      ...(typeof recovery.omittedFindings === "number" ? { omitted_findings: recovery.omittedFindings, open_reviewer_session: true } : {}) }]
+  })
+  if (completed.length === 0) return text
+  const bounded: unknown[] = []
+  let bytes = 0
+  for (const item of completed) {
+    const size = Buffer.byteLength(JSON.stringify(item))
+    if (size > 32_000 - bytes) break
+    bounded.push(item)
+    bytes += size
+  }
+  if (!bounded.length) return `${text}\nFanout results are too large for replay; open the reviewer sessions.`
+  const receipt = JSON.stringify({ type: "fanout_partial_results", fanout_failed: true, results: bounded,
+    ...(bounded.length < completed.length ? { omitted: completed.length - bounded.length, open_reviewer_sessions: true } : {}) })
+  return `${text}\nCompleted reviewer results (the fanout failed; do not count unfinished reviewers):\n${receipt}`
+}
+
 const toolResult = (
   tool: SessionMessage.AssistantTool,
   model: Model,
@@ -200,7 +236,7 @@ const toolResult = (
             ? tool.state.result
             : tool.provider?.executed === true
               ? { error: tool.state.error, content: tool.state.content, structured: tool.state.structured }
-              : toolErrorText(tool.state),
+               : tool.name === "multi_agent_fanout" ? fanoutFailureText(tool.state) : toolErrorText(tool.state),
         resultType: "error",
         providerExecuted: tool.provider?.executed,
         providerMetadata,
@@ -319,7 +355,7 @@ function toLLMMessage(
           id: message.id,
           role: "user",
           content: `<conversation-checkpoint>
-The following is a summary and serialized record of earlier conversation. Treat every user or assistant message inside this checkpoint as historical context only; do not replay them as new instructions to answer or execute. The checkpoint's current Goal, In Progress, and Next Steps remain binding: continue the active task automatically from them unless a later non-checkpoint user message overrides them.
+The following is a summary and serialized record of earlier conversation. Treat every user or assistant message inside this checkpoint as historical context only; do not replay them as new instructions to answer or execute. The checkpoint's current Goal, In Progress, and Next Steps remain binding: continue the active task automatically from them unless a later non-checkpoint user message overrides them. Exception: the content between [durable-command-invocation] and [/durable-command-invocation] markers is the session's still-active slash-command workflow, not historical context; continue following it, including its required user questions.
 
 <summary>
 ${message.summary}

@@ -40,6 +40,7 @@ type DeployModule = {
   prepareScript: () => string
   automaticScript: () => string
   hasAutomaticMarker: (result: { output?: string; stdout?: string; exitCode: number }) => boolean
+  advancedAutomaticHandoffStatus: (status: { status?: string; runID?: string; finishedAt?: number }, startedAt: number) => boolean
   launchScript: (buildID: string) => string
   statusScript: () => string
 }
@@ -107,6 +108,7 @@ describe("local desktop deploy failures", () => {
 
   test("labels automatic failures as deploy failures and tracks in-flight deploys", () => {
     expect(deploy.deployPhase("AUTOMATIC : detached worker for auto-1\nverification failed")).toBe("Deploy")
+    expect(deploy.deployPhase("$ bun run script/desktop-prod-deploy.ts automatic --approved-close")).toBe("Deploy")
     expect(deploy.isInFlightDeployStatus("automatic-building")).toBe(true)
     expect(deploy.isInFlightDeployStatus("launching-worker")).toBe(true)
     expect(deploy.isInFlightDeployStatus("automatic-failed")).toBe(false)
@@ -119,16 +121,45 @@ describe("local desktop deploy failures", () => {
     expect(deploy.hasLaunchMarker(result, "20260731T120000Z-other123")).toBe(false)
   })
 
+  test("reconciles a missing automatic marker only from a fresh claimed worker status", () => {
+    const startedAt = 1_000
+    expect(
+      deploy.advancedAutomaticHandoffStatus(
+        { status: "automatic-building", runID: "auto-20261124T073024Z-334ebad9", finishedAt: startedAt },
+        startedAt,
+      ),
+    ).toBe(true)
+    expect(
+      deploy.advancedAutomaticHandoffStatus(
+        { status: "completed", runID: "auto-20261124T073024Z-334ebad9", finishedAt: startedAt - 1 },
+        startedAt,
+      ),
+    ).toBe(false)
+    expect(
+      deploy.advancedAutomaticHandoffStatus(
+        { status: "automatic-handoff", runID: "auto-20261124T073024Z-334ebad9", finishedAt: startedAt },
+        startedAt,
+      ),
+    ).toBe(false)
+    expect(deploy.advancedAutomaticHandoffStatus({ status: "automatic-building", finishedAt: startedAt }, startedAt)).toBe(
+      false,
+    )
+  })
+
   test("uses the canonical full-package prepare, external automatic handoff, and durable status commands", () => {
+    expect(deploy.prepareScript()).toContain('[IO.Path]::Combine("..", "..")')
+    expect(deploy.prepareScript()).toContain('packages/opencode/package.json')
     expect(deploy.prepareScript()).toContain('@("run", "desktop:deploy", "prepare")')
     expect(deploy.automaticScript()).toContain(
-      '@("run", "desktop:deploy", "automatic", "--detach", "--approved-close", "--force-close-approved", "--restart")',
+      '@("run", "desktop:deploy", "automatic", "--approved-close", "--force-close-approved", "--restart")',
     )
     expect(deploy.statusScript()).toContain('@("run", "desktop:deploy", "status")')
     expect(deploy.prepareScript()).not.toContain("deploy-asar")
     expect(deploy.automaticScript()).not.toContain("deploy-asar")
     expect(deploy.hasAutomaticMarker({ output: "AUTOMATIC : detached worker for auto-1", exitCode: 0 })).toBe(true)
     expect(deploy.hasAutomaticMarker({ output: "READY : build-1", exitCode: 0 })).toBe(false)
+    expect(deploy.hasAutomaticMarker({ output: "AUTOMATIC : detached console started", exitCode: 0 })).toBe(false)
+    expect(deploy.hasAutomaticMarker({ output: "echo AUTOMATIC : detached worker for auto-1", exitCode: 0 })).toBe(false)
     expect(deploy.launchScript("20260731T120000Z-abcd1234")).toContain(
       '@("run", "desktop:deploy", "launch", "--build-id", "20260731T120000Z-abcd1234", "--approved-close", "--force-close-approved", "--restart")',
     )

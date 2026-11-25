@@ -130,6 +130,14 @@ function textBytes(bytes: Uint8Array) {
 
 export async function attachmentMime(file: File) {
   const type = kind(file.type)
+  // Archives must never be mistaken for text just because their header is
+  // short or printable. Extraction is a separate, explicit user choice.
+  if (/\.7z$/i.test(file.name)) return "application/x-7z-compressed"
+  if (/\.zip$/i.test(file.name)) return "application/zip"
+  if (/\.tar$/i.test(file.name)) return "application/x-tar"
+  if (/\.(tgz|tar\.gz)$/i.test(file.name)) return "application/gzip"
+  if (/\.tar\.bz2$/i.test(file.name)) return "application/x-bzip2"
+  if (/\.tar\.xz$/i.test(file.name)) return "application/x-xz"
   if (IMAGE_MIMES.has(type)) return type
   if (type === "application/pdf") return type
 

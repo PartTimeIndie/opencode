@@ -41,6 +41,7 @@ import { ServerConnection, useServer } from "@/context/server"
 import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync, type ServerSync } from "@/context/server-sync"
 import { useNotification } from "@/context/notification"
+import { useSessionAttention } from "@/context/session-attention"
 import { useGlobal } from "@/context/global"
 import { sessionFavoriteFromSession, useSessionFavorites, type SessionFavorite } from "@/context/session-favorites"
 import { loadSessionTabInfo, notifySessionTabsRemoved } from "@/components/titlebar-session-events"
@@ -55,14 +56,17 @@ import { UI_SLOT_IDS } from "@/plugin/ui-slots"
 import { ExtensionManagerDockPane } from "@/components/extension-manager"
 import { createSizing } from "@/pages/session/helpers"
 import { useSessionLayout } from "@/pages/session/session-layout"
-import { SessionBrowserDock } from "@/pages/session/composer/session-browser-dock"
+import { SessionBrowserDock, SessionWebDock, dockBrowserTab, navigateBrowserDock, reloadBrowserDock, removeBrowserDock, returnBrowserDock } from "@/pages/session/composer/session-browser-dock"
+import { useWebDocks } from "@/context/web-docks"
+import { usePlatform } from "@/context/platform"
+import { DialogWebDock } from "@/components/dialog-web-dock"
 import { SessionControlPanelPane, type ControlPanelPaneInfo } from "@/pages/session/composer/session-control-panel-pane"
 import { SessionControlPanelPopup } from "@/pages/session/composer/session-control-panel-popup"
 import { SessionQuestionDock } from "@/pages/session/composer/session-question-dock"
 import { SessionSurfaceProviders } from "@/pages/session/composer/session-surface-providers"
 import { shouldDockControlPanel } from "@/utils/control-panel-presentation"
 import { surfaceContainsAgentHandoff } from "@/components/control-surface-runtime"
-import { controlPanelPaneId, questionDockPaneId, sessionTreeIDs } from "@/pages/session/composer/session-request-tree"
+import { controlPanelPaneId, questionDockPaneId, sessionTreeIDs, sessionSurfaceRequest, sessionPermissionRequest } from "@/pages/session/composer/session-request-tree"
 import { useDockContent } from "@/pages/session/dock-content-registry"
 import { UsageDashboard } from "@/pages/session/usage-dashboard"
 import {
@@ -78,6 +82,7 @@ import { decode64 } from "@/utils/base64"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { canDockInArea, filterDockAddItems, type DockAddMenuItemBase } from "./dock-add-filter"
+import { inactiveDockPaneIds, sessionTabIsInactive } from "./dock-tab-bulk-close"
 import { sanitizeCustomPart, type CustomPart } from "@/plugin/custom-part"
 import type { Part, SurfaceBlockingRequest, SurfaceControlRequest, SurfacePersistentTool } from "@opencode-ai/sdk/v2/client"
 import { produce } from "solid-js/store"
@@ -106,6 +111,7 @@ type DockPane = DockAddMenuItemBase & {
   defaultArea: DockArea
   source: "host" | "plugin"
   sessionId?: string
+  inactive?: () => boolean
   favorite?: SessionFavorite
   mount: (ctx: { area: DockArea; visible: boolean }) => JSX.Element
   // Keep the pane mounted across tab switches (hidden via CSS instead of
@@ -113,6 +119,7 @@ type DockPane = DockAddMenuItemBase & {
   keepAlive?: boolean | (() => boolean)
   onActivate?: () => void
   onClose?: () => void | Promise<void>
+  webActions?: { label: string; run: () => void }[]
 }
 
 type DockAddMenuItem = DockAddMenuItemBase & {
@@ -183,6 +190,8 @@ function sourcePartFromPart(part: Part): CustomPart | undefined {
 
 export function SessionDockShell(props: { middle: JSX.Element }) {
   const layout = useLayout()
+  const webDocks = useWebDocks()
+  const platform = usePlatform()
   const language = useLanguage()
   const server = useServer()
   const serverSDK = useServerSDK()
@@ -525,8 +534,8 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
 
     sessionInfoVersion()
     const directory = decode64(tab.dirBase64)
-    const ctx = serverCtxFor(tab.server)
-    const session = directory && ctx ? ctx.sync.existing(directory)?.[0].session.find((item) => item.id === tab.sessionId) : undefined
+    const ctx = () => serverCtxFor(tab.server)
+    const session = directory ? ctx()?.sync.existing(directory)?.[0].session.find((item) => item.id === tab.sessionId) : undefined
     const title = sessionTitle(session?.title) ?? language.t("command.session.new")
     return {
       id: dockPaneIdForTab(tab),
@@ -536,21 +545,21 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
         <SessionDockAvatar
           project={() => {
             const current =
-              directory && ctx ? ctx.sync.existing(directory)?.[0].session.find((item) => item.id === tab.sessionId) : undefined
-            const projects = tab.server === server.key ? layout.projects.list() : ctx?.projects.list() ?? []
+              directory ? ctx()?.sync.existing(directory)?.[0].session.find((item) => item.id === tab.sessionId) : undefined
+            const projects = tab.server === server.key ? layout.projects.list() : ctx()?.projects.list() ?? []
             return current ? projectForSession(current, projects) : undefined
           }}
           directory={directory}
           sessionId={tab.sessionId}
           active={tab.server === server.key}
           visible={() => !!routeMatchesTab(tab)}
-          sync={() => ctx?.sync}
+          sync={() => ctx()?.sync}
           loading={() =>
             !directory
               ? false
               : tab.server === server.key && currentDirectory() === directory
                 ? !!currentDirectoryStore()?.session_working(tab.sessionId)
-                : !!ctx?.sync.existing(directory)?.[0].session_working(tab.sessionId)
+                 : !!ctx()?.sync.existing(directory)?.[0].session_working(tab.sessionId)
           }
         />
       ),
@@ -559,6 +568,16 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
       source: "host",
       keepAlive: true,
       sessionId: tab.sessionId,
+      inactive: () => {
+        const store = directory ? ctx()?.sync.existing(directory)?.[0] : undefined
+        if (!store) return false
+        return sessionTabIsInactive({
+          status: store.session_status[tab.sessionId]?.type,
+          working: !!store.session_working(tab.sessionId),
+          question: !!sessionSurfaceRequest(store.session, store.question, tab.sessionId),
+          permission: !!sessionPermissionRequest(store.session, store.permission, tab.sessionId),
+        })
+      },
       favorite:
         directory
           ? session
@@ -1010,7 +1029,7 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
     category: "Built-in",
     source: "host",
     keepAlive: true,
-    mount: () => content()?.review ?? null,
+    mount: () => content()?.review() ?? null,
     onActivate: () => view().reviewPanel.open(),
   }
   const gitChangesPane: DockPane = {
@@ -1021,7 +1040,7 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
     category: "Built-in",
     source: "host",
     keepAlive: true,
-    mount: () => content()?.changes ?? null,
+    mount: () => content()?.changes() ?? null,
     onActivate: () => {
       layout.fileTree.open()
       layout.fileTree.setTab("changes")
@@ -1035,7 +1054,7 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
     category: "Built-in",
     source: "host",
     keepAlive: true,
-    mount: () => content()?.files ?? null,
+    mount: () => content()?.files() ?? null,
     onActivate: () => {
       layout.fileTree.open()
       layout.fileTree.setTab("all")
@@ -1067,6 +1086,32 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
     mount: () => <UsageDashboard />,
   }
 
+  const webPaneCache = new Map<string, DockPane>()
+  const browserPane: DockPane = {
+    ...browserDockPane,
+    mount: () => <SessionBrowserDock visible={isDockItemRendered("browser")} onDock={async (tabID, name) => {
+      const id = crypto.randomUUID()
+      const paneID = `web-dock:${id}`
+      await dockBrowserTab(tabID, id, platform, (url) => {
+        webDocks.put({ id, name, startURL: url })
+        const area = layout.dock.itemArea("browser") ?? "right"
+        const rollback = () => {
+          layout.dock.removeItem(paneID)
+          webDocks.remove(id)
+          layout.dock.setActive(area, "browser")
+        }
+        try {
+          layout.dock.openItem(paneID, area)
+          layout.dock.setActive(area, paneID)
+        } catch (error) {
+          rollback()
+          throw error
+        }
+        return rollback
+      })
+    }} />,
+  }
+
   const registry = createMemo<DockPane[]>(() => [
     ...sessionPanes(),
     reviewPane,
@@ -1083,7 +1128,35 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
       mount: () => <ExtensionManagerDockPane />,
     },
     usagePane,
-    browserDockPane,
+    browserPane,
+    ...webDocks.items().map((item): DockPane => {
+      const paneID = `web-dock:${item.id}`
+      const cached = webPaneCache.get(paneID)
+      if (cached) return cached
+      const current = () => webDocks.items().find((definition) => definition.id === item.id) ?? item
+      const report = (error: unknown) => showToast({ variant: "error", title: "Web dock", description: error instanceof Error ? error.message : "Operation failed" })
+      const pane: DockPane = {
+        id: paneID,
+        get title() { return current().name },
+        icon: "window-cursor",
+        defaultArea: "right",
+        category: "Web dock",
+        source: "host",
+        keepAlive: true,
+        mount: () => <SessionWebDock id={item.id} startURL={current().startURL} visible={isDockItemRendered(paneID)} />,
+        get webActions() { return [
+          { label: language.t("common.rename"), run: () => dialog.show(() => <DialogWebDock title={language.t("webDock.rename")} label={language.t("webDock.name")} initial={current().name} onSubmit={(name) => { webDocks.put({ ...current(), name }) }} />) },
+          { label: language.t("webDock.changeAddress"), run: () => dialog.show(() => <DialogWebDock title={language.t("webDock.changeAddress")} label={language.t("webDock.address")} initial={current().startURL} maxLength={8192} onSubmit={(startURL) => { const before = current(); const updated = webDocks.put({ ...before, startURL }); try { navigateBrowserDock(item.id, updated.startURL) } catch (error) { webDocks.put(before); throw error } }} />) },
+          { label: language.t("webDock.reload"), run: () => { try { reloadBrowserDock(item.id) } catch (error) { report(error) } } },
+          { label: language.t("webDock.start"), run: () => { try { navigateBrowserDock(item.id, current().startURL) } catch (error) { report(error) } } },
+          { label: language.t("webDock.external"), run: () => platform.openLink(current().startURL) },
+          { label: language.t("webDock.return"), run: () => { if (!webDocks.writable()) return report(new Error(language.t("webDock.storageUnavailable"))); void returnBrowserDock(item.id, platform).then(() => { webDocks.remove(item.id); layout.dock.removeItem(paneID); layout.dock.openItem("browser", layout.dock.item("browser").area() ?? "right"); }).catch(report) } },
+          { label: language.t("webDock.remove"), run: () => dialog.show(() => <DialogWebDock title={language.t("webDock.remove")} label={language.t("webDock.confirmRemove", { name: current().name })} initial="" onSubmit={async (value) => { if (value !== current().name) throw new Error(language.t("webDock.nameMismatch")); if (!webDocks.writable()) throw new Error(language.t("webDock.storageUnavailable")); await removeBrowserDock(item.id, platform); webDocks.remove(item.id); layout.dock.removeItem(paneID) }} />) },
+        ] },
+      }
+      webPaneCache.set(paneID, pane)
+      return pane
+    }),
     ...dockedControlPanels().map(
       (panel): DockPane => ({
         id: panel.paneID,
@@ -1167,6 +1240,22 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
     ),
     ...pluginPanes(),
   ])
+  createEffect(() => {
+    if (!layout.ready() || !webDocks.ready()) return
+    const ids = DOCK_AREAS.flatMap((area) => layout.dock.area(area).tabs())
+    for (const id of webDocks.orphans(ids)) layout.dock.removeItem(id)
+    const known = new Set(webDocks.items().map((item) => `web-dock:${item.id}`))
+    for (const id of webPaneCache.keys()) if (!known.has(id)) webPaneCache.delete(id)
+  })
+  let reportedStorageProblem = ""
+  createEffect(() => {
+    if (!webDocks.ready()) return
+    const description = !webDocks.writable()
+      ? language.t("webDock.storageUnavailable")
+      : webDocks.invalidCount() ? language.t("webDock.invalidRecords", { count: webDocks.invalidCount() }) : ""
+    if (description && reportedStorageProblem !== description) showToast({ variant: "error", title: language.t("webDock.title"), description })
+    reportedStorageProblem = description
+  })
   const registryByID = createMemo(() => new Map(registry().map((pane) => [pane.id, pane] as const)))
   createEffect(() => layout.dock.setRegisteredPaneIDs(registry().map((pane) => pane.id)))
   onCleanup(() => layout.dock.setRegisteredPaneIDs([]))
@@ -1740,7 +1829,7 @@ export function SessionDockShell(props: { middle: JSX.Element }) {
             class="flex-1 min-h-0 flex flex-col"
           >
             <div class="flex-1 min-h-0">
-              {content()?.mobileChangesOpen() ? (content()?.mobileChanges ?? props.middle) : props.middle}
+              {content()?.mobileChangesOpen() ? (content()?.mobileChanges() ?? props.middle) : props.middle}
             </div>
             <Show when={layout.dock.mobile.opened()}>
               <div
@@ -1836,6 +1925,8 @@ function isDockTabActionTarget(target: EventTarget | null) {
 }
 
 type DockTabMenuProps = {
+  webActions?: { label: string; run: () => void }[]
+  attentionTarget?: { directory: string; sessionID: string }
   favoritePicked: () => boolean
   favoriteLabel: () => string
   favoriteDisabled: () => boolean
@@ -1846,10 +1937,12 @@ type DockTabMenuProps = {
   onDelete: () => void
   sessionID?: string
   bulkClose?: {
+    inactive: () => void
     all: () => void
     left: () => void
     right: () => void
     others: () => void
+    inactiveDisabled: () => boolean
     leftDisabled: () => boolean
     rightDisabled: () => boolean
     othersDisabled: () => boolean
@@ -1873,6 +1966,8 @@ function DockTabMenuContent(props: DockTabMenuProps) {
 
   return (
     <>
+      <For each={props.webActions}>{(action) => <MenuV2.Item onSelect={action.run}>{action.label}</MenuV2.Item>}</For>
+      <Show when={props.webActions?.length}><MenuV2.Separator /></Show>
       <MenuV2.Item disabled={props.actionDisabled()} onSelect={props.onRename}>
         {language.t("common.rename")}
       </MenuV2.Item>
@@ -1887,6 +1982,9 @@ function DockTabMenuContent(props: DockTabMenuProps) {
         {(bulkClose) => (
           <>
             <MenuV2.Item onSelect={bulkClose().all}>{language.t("command.tab.closeAll")}</MenuV2.Item>
+            <MenuV2.Item disabled={bulkClose().inactiveDisabled()} onSelect={bulkClose().inactive}>
+              {language.t("command.tab.closeInactive")}
+            </MenuV2.Item>
             <MenuV2.Item disabled={bulkClose().leftDisabled()} onSelect={bulkClose().left}>
               {language.t("command.tab.closeLeft")}
             </MenuV2.Item>
@@ -1906,7 +2004,7 @@ function DockTabMenuContent(props: DockTabMenuProps) {
       <MenuV2.Item disabled={props.actionDisabled()} onSelect={props.onDelete}>
         {language.t("common.delete")}
       </MenuV2.Item>
-      <PluginSlotOutlet slot={UI_SLOT_IDS.sessionTabMenu} class="contents" />
+      <PluginSlotOutlet slot={UI_SLOT_IDS.sessionTabMenu} class="contents" target={props.attentionTarget} />
     </>
   )
 }
@@ -2003,7 +2101,7 @@ function SessionDockAvatar(props: {
       <ProjectAvatar
         fallback={displayName(project() ?? { worktree: props.directory })}
         src={getProjectAvatarSource(project()?.id, project()?.icon)}
-        monochrome={getProjectAvatarMonochrome(project()?.id)}
+        monochrome={getProjectAvatarMonochrome(project()?.id, project()?.icon)}
         variant={getProjectAvatarVariant(project()?.icon?.color)}
         unread={state.unread()}
         loading={!state.status() && ((props.loading?.() ?? false) || state.loading())}
@@ -2016,8 +2114,12 @@ function SessionDockAvatar(props: {
 // Mounts a keepAlive dock pane exactly once and never recreates it, so
 // stateful content like the Browser webview survives tab switches. The memo
 // only depends on the pane identity and area, never on which tab is active.
-function DockKeepAlivePane(props: { pane: DockPane; area: DockArea }) {
-  const content = createMemo(() => props.pane.mount({ area: props.area, visible: true }))
+function DockKeepAlivePane(props: { pane: DockPane; area: DockArea; active: boolean }) {
+  const [mounted, setMounted] = createSignal(false)
+  createEffect(() => {
+    if (props.active) setMounted(true)
+  })
+  const content = createMemo(() => mounted() ? props.pane.mount({ area: props.area, visible: true }) : null)
   return <>{content()}</>
 }
 
@@ -2053,6 +2155,7 @@ function DockZone(props: {
 }) {
   const language = useLanguage()
   const sessionFavorites = useSessionFavorites()
+  const attention = useSessionAttention()
   let tabListRef: HTMLDivElement | undefined
   let cancelActiveTabScroll: (() => void) | undefined
   const [tabListWidth, setTabListWidth] = createSignal(0)
@@ -2238,6 +2341,7 @@ function DockZone(props: {
               <For each={props.panes}>
                 {(pane, index) => {
                   const menu: DockTabMenuProps = {
+                    webActions: pane.webActions,
                     favoritePicked: () => !!pane.favorite && sessionFavorites.is(pane.favorite),
                     favoriteLabel: () =>
                       pane.favorite && sessionFavorites.is(pane.favorite)
@@ -2253,6 +2357,8 @@ function DockZone(props: {
                     onArchive: () => props.onArchiveSession(pane),
                     onDelete: () => props.onDeleteSession(pane),
                     sessionID: pane.sessionId,
+                    attentionTarget: pane.favorite && pane.sessionId
+                      ? { directory: pane.favorite.directory, sessionID: pane.sessionId } : undefined,
                     bulkClose: props.tabCloseMenu
                       ? {
                           all: () => closeMany(props.panes.map((item) => item.id)),
@@ -2271,9 +2377,11 @@ function DockZone(props: {
                               props.panes.filter((item) => item.id !== pane.id).map((item) => item.id),
                               pane.id,
                             ),
+                          inactive: () => closeMany(inactiveDockPaneIds(props.panes)),
                           leftDisabled: () => index() === 0,
                           rightDisabled: () => index() === props.panes.length - 1,
                           othersDisabled: () => props.panes.length === 1,
+                          inactiveDisabled: () => inactiveDockPaneIds(props.panes).length === 0,
                         }
                       : undefined,
                   }
@@ -2281,6 +2389,7 @@ function DockZone(props: {
                     <Tabs.Trigger
                       value={pane.id}
                       class="max-w-52"
+                      classList={{ "ring-2 ring-border-strong rounded-md": !!menu.attentionTarget && attention.enabled() && !!attention.current(menu.attentionTarget)?.count }}
                       aria-label={pane.title}
                       title={pane.title}
                       onClick={() => {
@@ -2302,6 +2411,11 @@ function DockZone(props: {
                       <div class="flex min-w-0 items-center gap-1.5">
                         {pane.leading?.() ?? <Icon name={pane.icon} size="small" class="text-icon-weak shrink-0" />}
                         <span class="truncate">{pane.title}</span>
+                        <Show when={menu.attentionTarget && attention.enabled() && attention.current(menu.attentionTarget)?.enabled}>
+                          <span aria-label={language.t(attention.current(menu.attentionTarget!)?.count ? "session.attention.unseen" : "session.attention.marked")}
+                             title={language.t(attention.current(menu.attentionTarget!)?.error ? "session.attention.error" : "session.attention.marked")}
+                             classList={{ "text-text-warning-base font-bold": !!attention.current(menu.attentionTarget!)?.count }}>✦</span>
+                        </Show>
                         <Show when={props.attention?.(pane.id)}>
                           <span
                             data-dock-attention={pane.id}
@@ -2413,7 +2527,7 @@ function DockZone(props: {
                     </Show>
                   }
                 >
-                  <DockKeepAlivePane pane={pane()} area={props.paneArea?.(pane()) ?? props.area} />
+                  <DockKeepAlivePane pane={pane()} area={props.paneArea?.(pane()) ?? props.area} active={props.active === pane().id} />
                 </Show>
               </Tabs.Content>
             )}

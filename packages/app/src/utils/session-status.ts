@@ -62,6 +62,23 @@ export function latestAssistantSettled(store: SessionToolActivityStore, sessionI
   return false
 }
 
+// Keep the idle fallback for a missed terminal when a run ends without a new
+// assistant message. This grace period is a heuristic, not proof of lease expiry.
+export const MISSED_TERMINAL_GRACE_MS = 45_000
+
+export function idleSignalSettlesActivity(
+  store: SessionToolActivityStore,
+  sessionID: string,
+  startedAt?: number,
+  now = Date.now(),
+): boolean {
+  if (!latestAssistantSettled(store, sessionID)) return false
+  if (startedAt === undefined || !latestAssistantCompletedBefore(store, sessionID, startedAt)) return true
+  // Right after activity.started, the latest assistant is still from the previous turn.
+  // An idle signal alone must not settle the fresh activity.
+  return now - startedAt >= MISSED_TERMINAL_GRACE_MS
+}
+
 export function resolveLifecycleStatus(input: {
   activity?: string
   activityTracked?: boolean

@@ -101,7 +101,11 @@ export const layerWith = (
 
 export type NativeModels = Readonly<Record<string, NativeModelIntegration>>
 const requestPackages = new WeakMap<Model, string>()
+const requestAdapters = new WeakMap<object, { readonly provider: string; readonly model: string }>()
 export const requestPackage = (model: Model) => requestPackages.get(model)
+// Bind identity to the actual transport closure, not the route label used for
+// provider option routing. Route/default wrappers retain this transport object.
+export const requestAdapter = (model: Model) => requestAdapters.get(model.route.transport)
 function rememberPackage(model: Model, source: ModelV2.Info) {
   if (source.api.type === "aisdk") requestPackages.set(model, source.api.package)
   return model
@@ -177,6 +181,7 @@ export const fromAISDKModel = (model: ModelV2.Info, language: LanguageModelV3, p
   type AISDKEvent = Schema.Schema.Type<typeof LLMEvent>
   const protocol = Protocol.make<unknown, AISDKFrame, AISDKEvent, undefined>({
     id: "aisdk",
+    runtimeContext: SessionRunnerAISDK.supportsRuntimeContext(language) ? "late-system" : undefined,
     body: {
       schema: Schema.Unknown,
       from: (request) => Effect.succeed(request),
@@ -191,7 +196,7 @@ export const fromAISDKModel = (model: ModelV2.Info, language: LanguageModelV3, p
   const route = Route.make<unknown, LLMRequest, AISDKFrame, AISDKEvent, undefined>({
     id: `aisdk:${model.api.type === "aisdk" ? model.api.package : model.api.type}`,
     protocol,
-    endpoint: { baseURL: model.api.url ?? "aisdk://local", path: () => "" },
+    endpoint: { baseURL: model.api.url ?? "aisdk://local", path: "" },
     auth: Auth.none,
     defaults: {},
     transport: {
@@ -200,6 +205,7 @@ export const fromAISDKModel = (model: ModelV2.Info, language: LanguageModelV3, p
       frames: (_prepared: LLMRequest, request: LLMRequest) => SessionRunnerAISDK.stream(language, request),
     },
   })
+  requestAdapters.set(route.transport, Object.freeze({ provider: language.provider, model: language.modelId }))
   return rememberPackage(withDefaults(model, route, profiles).model({ id: model.id }), model)
 }
 

@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { getCACertificates, setDefaultCACertificates } from "node:tls"
 import type { Event } from "electron"
-import { app, BrowserWindow, powerMonitor, screen } from "electron"
+import { app, BrowserWindow, dialog, powerMonitor, screen } from "electron"
 
 import { Deferred, Effect, Fiber } from "effect"
 import contextMenu from "electron-context-menu"
@@ -21,7 +21,7 @@ import { registerIpcHandlers, sendDeepLinks, sendMenuCommand } from "./ipc"
 import { getBrowserAutomationEnabled } from "./browser-automation"
 import { startDesktopTestingServer } from "./desktop-testing"
 import { collectDeepLinkArgs, createDeepLinkDelivery } from "./deep-links"
-import { forwardInitializationFailure } from "./initialization"
+import { completeHealthyInitialization, forwardInitializationFailure } from "./initialization"
 import { exportDebugLogs, initCrashReporter, initLogging, startNetLog, write as writeLog } from "./logging"
 import { parseMarkdown } from "./markdown"
 import { createMenu } from "./menu"
@@ -48,7 +48,12 @@ import { migrate } from "./migrate"
 import { createPluginDesktopServices } from "./plugin-desktop-services"
 import { invalidateAllWindows } from "./paint-recovery"
 import { createShutdownCoordinator } from "./shutdown"
+import { stopWithRecovery } from "./shutdown-recovery"
 import { liveWindow } from "./window-lifecycle"
+import { applyCloseToTray, createTray } from "./tray"
+import { showFromTray } from "./tray-lifecycle"
+import { iconPath } from "./windows"
+import { serverStateLabel, type ServerState } from "../preload/server-state"
 
 const APP_NAMES: Record<string, string> = {
   dev: "OpenCode Dev",
@@ -67,6 +72,16 @@ let logger: ReturnType<typeof initLogging>
 let mainWindow: BrowserWindow | null = null
 let server: SidecarListener | null = null
 let serverReadyData: ServerReadyData | null = null
+let tray: ReturnType<typeof createTray> = null
+let serverState: ServerState = { phase: "starting", attempt: 0 }
+
+function updateServerState(state: ServerState) {
+  serverState = state
+  tray?.setStatus(serverStateLabel(state), state.phase === "exhausted")
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send("server-state", state)
+  }
+}
 
 const deepLinkDelivery = createDeepLinkDelivery(collectDeepLinkArgs(process.argv))
 
@@ -109,13 +124,43 @@ function emitDeepLinks(urls: string[]) {
   })
 }
 
-async function killSidecar() {
+let sidecarStop: Promise<void> | undefined
+function killSidecar() {
+  if (sidecarStop) return sidecarStop
   if (!server) return
   const current = server
-  server = null
-  setPluginAssetServer(undefined)
   writeLog("utility", "sidecar stop requested", { ...quitRequestedRecord("sidecar-stop") })
-  await current.stop()
+  sidecarStop = stopWithRecovery({
+    stop: () => current.stop(),
+    choose: async (error) => {
+      logger.error("local server shutdown blocked", error)
+      const result = await dialog.showMessageBox({
+        type: "warning",
+        title: "Local server is not responding",
+        message: "The local server has not stopped.",
+        detail: "Wait and try again, or force it to stop. Forcing may interrupt active sessions and lose unfinished work or writes.",
+        buttons: ["Try again", "Force quit", "Cancel"],
+        defaultId: 0,
+        cancelId: 2,
+        noLink: true,
+      })
+      return result.response === 1 ? "force" : result.response === 0 ? "retry" : "cancel"
+    },
+    force: async () => {
+      logger.warn("user requested forced local server shutdown")
+      try {
+        await current.forceStop()
+      } catch (error) {
+        await dialog.showMessageBox({ type: "error", title: "Server still running", message: "The server exit could not be confirmed. OpenCode will remain open." })
+        throw error
+      }
+    },
+  }).then(() => {
+    if (server !== current) return
+    server = null
+    setPluginAssetServer(undefined)
+  }).finally(() => { sidecarStop = undefined })
+  return sidecarStop
 }
 
 function ensureLoopbackNoProxy() {
@@ -212,7 +257,10 @@ const main = Effect.gen(function* () {
   let stoppingSidecars: Promise<void> | undefined
   const stopSidecarsOnce = () => {
     if (stoppingSidecars) return stoppingSidecars
-    stoppingSidecars = stopSidecars()
+    stoppingSidecars = stopSidecars().catch((error) => {
+      stoppingSidecars = undefined
+      throw error
+    })
     return stoppingSidecars
   }
   const desktopServices = createPluginDesktopServices({
@@ -224,14 +272,17 @@ const main = Effect.gen(function* () {
   })
   const shutdown = createShutdownCoordinator({
     cleanup: async () => {
-      // app.exit bypasses will-quit, so release hotkeys and overlays here.
-      try {
-        desktopServices.dispose()
-      } finally {
-        await stopSidecarsOnce()
-      }
+      await stopSidecarsOnce()
+      // Keep tray and controls usable if the live writer did not confirm exit.
+      // app.exit bypasses will-quit, so release them after successful cleanup.
+      tray?.destroy()
+      tray = null
+      desktopServices.dispose()
     },
-    onCleanupError: (error) => logger.error("desktop shutdown cleanup failed", error),
+    onCleanupError: (error) => {
+      markAppQuitting(false)
+      logger.error("desktop shutdown cleanup failed; application exit blocked", error)
+    },
   })
   const relaunch = (reason: string) => {
     logger.log("app relaunch requested", relaunchRequestedRecord(reason))
@@ -263,7 +314,9 @@ const main = Effect.gen(function* () {
   app.commandLine.appendSwitch("proxy-bypass-list", "<-loopback>")
   const features = app.commandLine.getSwitchValue("enable-features")
   app.commandLine.appendSwitch("enable-features", features ? `${jsCallStackFeature},${features}` : jsCallStackFeature)
+  logger.log("resolving desktop automation port")
   const cdpPort = yield* Effect.promise(() => desktopCdpPort())
+  logger.log("desktop automation port resolved", { enabled: Boolean(cdpPort) })
   if (cdpPort) {
     app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1")
     app.commandLine.appendSwitch("remote-debugging-port", cdpPort)
@@ -278,11 +331,7 @@ const main = Effect.gen(function* () {
       logger.log("deep link handoff correlation", { links: deepLinkCorrelation(urls) })
       emitDeepLinks(urls)
     }
-    const win = liveWindow(mainWindow)
-    if (win) {
-      win.show()
-      win.focus()
-    }
+    showFromTray(liveWindow(mainWindow))
   })
 
   app.on("open-url", (event: Event, url: string) => {
@@ -293,7 +342,6 @@ const main = Effect.gen(function* () {
 
   app.on("before-quit", (event) => {
     logger.log("app quit requested", quitRequestedRecord("before-quit"))
-    markAppQuitting()
     event.preventDefault()
     void shutdown.request(() => app.exit(0))
   })
@@ -327,24 +375,22 @@ const main = Effect.gen(function* () {
 
   const serverReady = Deferred.makeUnsafe<ServerReadyData, unknown>()
 
+  logger.log("waiting for Electron ready")
   yield* Effect.promise(() => app.whenReady())
+  logger.log("Electron ready")
 
-  // Surfaces can also go stale while the renderer keeps running: after the
-  // system resumes or display metrics change. Invalidate defensively; the
-  // renderer frame-stall watchdog escalates further when needed.
+  // Request a repaint after system or display changes; this does not confirm
+  // that a frame was presented. Renderer stalls are reported separately.
   powerMonitor.on("resume", () => invalidateAllWindows("system-resume"))
   screen.on("display-metrics-changed", (_event, _display, changedMetrics) => {
     if (changedMetrics.length === 0) return
     invalidateAllWindows("display-metrics-changed")
   })
 
-  yield* Effect.promise(() => refreshManagedCli()).pipe(
-    Effect.catch((error) =>
-      Effect.sync(() => {
-        logger.warn("failed to refresh managed CLI", error)
-      }),
-    ),
-  )
+  logger.log("refreshing managed CLI")
+  void refreshManagedCli()
+    .then(() => logger.log("managed CLI refresh finished"))
+    .catch((error) => logger.warn("failed to refresh managed CLI", error))
 
   if (!TEST_ONBOARDING) migrate()
   app.setAsDefaultProtocolClient("opencode")
@@ -354,6 +400,8 @@ const main = Effect.gen(function* () {
   app.once("will-quit", desktopServices.dispose)
   registerIpcHandlers({
     killSidecar: () => killSidecar(),
+    serverState: () => serverState,
+    retryServer: () => server?.retry(),
     relaunch,
     awaitInitialization: Effect.fnUntraced(
       function* () {
@@ -431,7 +479,14 @@ const main = Effect.gen(function* () {
         userDataPath: app.getPath("userData"),
         onStdout: (message) => writeLog("server", "stdout", { message }),
         onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
-        onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
+        onSpawn: (pid) => writeLog("utility", "sidecar spawned", { pid }),
+        onDiagnostic: (sample) => writeLog("utility", "sidecar diagnostic", sample),
+        onExit: (code, detail) => writeLog("utility", "sidecar exited", { code, ...detail }, "warn"),
+        onState: (state) => {
+          writeLog("utility", "sidecar state", state)
+          updateServerState(state)
+          Effect.runSync(completeHealthyInitialization(serverReady, { url, username: "opencode", password }, state))
+        },
       }),
     )
     server = listener
@@ -445,7 +500,6 @@ const main = Effect.gen(function* () {
       username: "opencode",
       password,
     }
-    yield* Deferred.succeed(serverReady, serverReadyData)
 
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
@@ -453,10 +507,8 @@ const main = Effect.gen(function* () {
 
     yield* Effect.promise(() => health.wait).pipe(
       Effect.timeout("30 seconds"),
-      Effect.catch((e) =>
-        Effect.sync(() => {
-          logger.error("sidecar health check failed", e.toString())
-        }),
+      Effect.catchTag("TimeoutError", () =>
+        Effect.sync(() => logger.log("sidecar startup continues; renderer will wait for verified health")),
       ),
     )
 
@@ -468,6 +520,21 @@ const main = Effect.gen(function* () {
   mainWindow = createMainWindow()
   if (mainWindow) {
     const createdWindow = mainWindow
+    if (process.platform === "win32") {
+      try {
+        tray = createTray(iconPath(), [], {
+          onShow: () => showFromTray(liveWindow(mainWindow)),
+          onQuit: () => app.quit(),
+          onRetry: () => server?.retry(),
+        })
+        updateServerState(serverState)
+      } catch (error) {
+        logger.warn("tray unavailable; retaining normal close behavior", error)
+      }
+      applyCloseToTray(createdWindow, () => tray !== null)
+      createdWindow.on("query-session-end", () => markAppQuitting())
+      createdWindow.on("session-end", () => { void shutdown.request(() => app.exit(0)) })
+    }
     createdWindow.once("closed", () => {
       if (mainWindow === createdWindow) mainWindow = null
     })

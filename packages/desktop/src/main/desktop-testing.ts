@@ -8,6 +8,7 @@ import { BrowserWindow, desktopCapturer, ipcMain, nativeImage } from "electron"
 import type { IpcMainInvokeEvent, NativeImage } from "electron"
 import { getBrowserAutomationEnabled } from "./browser-automation"
 import { createBrowserAutomation } from "./browser-control"
+import { browserTransferGuard } from "./browser-transfer-guard"
 import { resolveDesktopTestingCli } from "./desktop-testing-cli"
 import {
   parseDesktopTestingSessionModel,
@@ -79,6 +80,7 @@ export async function startDesktopTestingServer(input: StartInput) {
   if (!getBrowserAutomationEnabled()) return
   registerResponseHandler()
   browserAutomation = createBrowserAutomation({
+    transferGuard: browserTransferGuard,
     status: () =>
       requestRenderer(input, "action", { type: "browser.status" }) as Promise<{ browser?: Record<string, unknown> }>,
   })

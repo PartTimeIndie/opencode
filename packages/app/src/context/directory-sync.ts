@@ -40,6 +40,7 @@ import {
   startSessionActivity,
   updateSessionActivity,
 } from "@/utils/session-activity"
+import { clearSessionQueuedInputs, recordQueuedInput, resolveQueuedInput } from "@/utils/session-queued-inputs"
 import {
   SESSION_MESSAGE_REQUEST_RETRIES,
   SESSION_MESSAGE_REQUEST_TIMEOUT_MS,
@@ -1690,6 +1691,27 @@ export const createDirSyncContext = (
     )
   }
 
+  // Mirror server-held queue inputs so the composer can show a waiting count:
+  // admitted delivery="queue" adds, promoted removes, and a revert discards the
+  // session's pending inputs (the projector drops them there).
+  const applyQueuedInputLifecycle = (type: unknown, data: unknown) => {
+    if (type === "session.next.prompt.admitted") {
+      const payload = data as { sessionID?: string; messageID?: string; delivery?: string }
+      if (payload?.sessionID && payload?.messageID && payload.delivery === "queue")
+        recordQueuedInput(directory, payload.sessionID, payload.messageID)
+      return
+    }
+    if (type === "session.next.prompt.promoted") {
+      const payload = data as { sessionID?: string; messageID?: string }
+      if (payload?.sessionID && payload?.messageID) resolveQueuedInput(directory, payload.sessionID, payload.messageID)
+      return
+    }
+    if (type === "session.next.revert.marked") {
+      const payload = data as { sessionID?: string }
+      if (payload?.sessionID) clearSessionQueuedInputs(directory, payload.sessionID)
+    }
+  }
+
   const applyLifecycle = (
     lifecycle: ReturnType<typeof syncedSessionLifecycleStatus> | ReturnType<typeof streamedSessionLifecycleStatus>,
   ) => {
@@ -1714,6 +1736,7 @@ export const createDirSyncContext = (
   const unsubscribeSync = serverSDK.sync.on(directory, (event) => {
     if (!crossStreamEvents.accept(event.syncEvent.id)) return
     applyLifecycle(syncedSessionLifecycleStatus(event))
+    applyQueuedInputLifecycle(event.syncEvent.type, event.syncEvent.data)
     clearRevertedMessages(syncedSessionRevertCleanup(event))
     if (
       handleV2SessionEvent({
@@ -1729,6 +1752,7 @@ export const createDirSyncContext = (
   const unsubscribeEvent = serverSDK.event.on(directory, (event) => {
     if (!crossStreamEvents.accept("id" in event && typeof event.id === "string" ? event.id : undefined)) return
     applyLifecycle(streamedSessionLifecycleStatus(event))
+    applyQueuedInputLifecycle(event.type, event.properties)
     clearRevertedMessages(streamedSessionRevertCleanup(event))
     if (
       handleV2SessionEvent({

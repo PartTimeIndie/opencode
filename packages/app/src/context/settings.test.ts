@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test"
 import { createStore } from "solid-js/store"
-import { createSettingsApi, defaultSettings, migrateSettings, type Settings } from "./settings"
+import { createSettingsApi, defaultSettings, followupSetting, migrateSettings, type Settings } from "./settings"
 
 const SETTINGS_KEY = "settings.v3"
 
@@ -34,6 +34,31 @@ function deepMerge(base: Record<string, any>, override: unknown): Record<string,
 }
 
 describe("settings context surface", () => {
+  test("defaults followups to the next safe boundary rather than a future activity", () => {
+    expect(defaultSettings.general.followup).toBe("steer")
+    expect(mountedApi().api.general.followup()).toBe("steer")
+    for (const value of [undefined, null, "invalid", 42]) expect(followupSetting(value)).toBe("steer")
+    expect(followupSetting("queue")).toBe("queue")
+  })
+
+  test("preserves stored steer delivery across hydration without rewriting user choices", () => {
+    for (const marker of [undefined, false, true]) {
+      const general = { followup: "steer", followupQueueMigrated: marker, autoSave: false }
+      expect(migrateSettings({ general })).toMatchObject({ general })
+      expect(mountedApi({ general }).api.general.followup()).toBe("steer")
+    }
+  })
+
+  test("keeps an explicit queue choice and persists later delivery changes", () => {
+    const { api, store } = mountedApi({ general: { followup: "queue" } })
+    expect(api.general.followup()).toBe("queue")
+    api.general.setFollowup("steer")
+    expect(store.general.followup).toBe("steer")
+    expect(migrateSettings({ general: { ...store.general } })).toMatchObject({ general: { followup: "steer" } })
+    api.general.setFollowup("queue")
+    expect(store.general.followup).toBe("queue")
+  })
+
   test("exposes the full accessor surface with defaults on empty storage", () => {
     const { api: settings } = mountedApi()
     // sounds block: this is the neighborhood that was damaged by line-index edits;

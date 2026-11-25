@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Message, Model } from "@opencode-ai/llm"
 import { route } from "@opencode-ai/llm/protocols/openai-chat"
+import { codexRoute, webSocketRoute } from "@opencode-ai/llm/protocols/openai-responses"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionMessage } from "@opencode-ai/core/session/message"
@@ -24,6 +25,27 @@ const userWithImage = (files: FileAttachment[]) =>
 // openai-chat route only supports images for user files
 const visionModel = Model.make({ id: "model", provider: "provider", route })
 const textOnlyModel = Model.make({ id: "text-model", provider: "provider", route })
+
+describe("toLLMMessages Codex attachment compatibility", () => {
+  for (const route of [codexRoute, webSocketRoute]) {
+    test(`${route.id} preserves archive references without sending unsupported media`, () => {
+      const model = Model.make({ id: "gpt-6.1-sol", provider: "openai", route })
+      const archive = FileAttachment.create({
+        uri: "data:application/x-compressed;base64,N3o=",
+        mime: "application/x-compressed",
+        name: "C:\\Downloads\\savegame.7z",
+      })
+      const messages = toLLMMessages([userWithImage([archive, pngFile])], model, { input: ["text", "image"] })
+      expect(modelSupportsFile(model, archive)).toBe(false)
+      expect(messages[0]!.content[1]).toEqual({
+        type: "text",
+        text: "[Attached application/x-compressed: C:\\Downloads\\savegame.7z omitted: unsupported attachment type for model input.]",
+      })
+      expect(messages[0]!.content[2]!.type).toBe("media")
+      expect(archive.uri).toBe("data:application/x-compressed;base64,N3o=")
+    })
+  }
+})
 
 describe("toLLMMessages vision delegation", () => {
   test("emits omitted placeholder when no description and model cannot see images", () => {
@@ -127,5 +149,12 @@ describe("toLLMMessages compaction checkpoint", () => {
     expect(text).toContain("Goal, In Progress, and Next Steps remain binding")
     expect(text).toContain("continue the active task automatically")
     expect(text).toContain("unless a later non-checkpoint user message overrides them")
+  })
+
+  test("exempts the durable command workflow block from the historical-context rule", () => {
+    const text = checkpointText()
+    expect(text).toContain("Exception: the content between [durable-command-invocation] and [/durable-command-invocation] markers")
+    expect(text).toContain("still-active slash-command workflow, not historical context")
+    expect(text).toContain("including its required user questions")
   })
 })

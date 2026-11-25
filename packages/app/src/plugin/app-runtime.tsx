@@ -22,6 +22,8 @@ import type {
   AppHostGitSnapshot,
   AppHostGitDiscoverResult,
   AppHostGitActionResult,
+  AppHostGitHistoryPage,
+  AppHostGitCommitMessagePage,
   AppHostHttpRequest,
   AppHostHttpResponse,
   AppHostCommandInput,
@@ -76,7 +78,10 @@ export type {
   AppPluginStatus,
 } from "@opencode-ai/plugin/app"
 import { createSimpleContext } from "@opencode-ai/ui/context"
+import { pluginServiceResponse } from "./service-response"
 import { Spinner } from "@opencode-ai/ui/spinner"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { Dialog } from "@opencode-ai/ui/v2/dialog-v2"
 import {
   createEffect,
   createMemo,
@@ -84,6 +89,7 @@ import {
   createSignal,
   getOwner,
   onCleanup,
+  onMount,
   runWithOwner,
   Show,
   untrack,
@@ -105,6 +111,7 @@ import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { useModels } from "@/context/models"
 import { useSessionFavorites, type SessionFavorite } from "@/context/session-favorites"
+import { useSessionAttention } from "@/context/session-attention"
 import { tabKey, useTabs, type Tab } from "@/context/tabs"
 import { useDirectoryPicker } from "@/components/directory-picker"
 import { SettingsModelPickerV2 } from "@/components/settings-model-picker"
@@ -124,6 +131,7 @@ import { sessionActivity, sessionActivitySettled, sessionActivityStartedAt } fro
 import { createPluginCommandOption, scopePluginCommand, type PluginCommandInput } from "./commands"
 import { resolveHostAIChain } from "./host-ai-chain"
 import { resolveGitCommitTarget } from "./git-commit-chain"
+import { readGitResponse } from "./git-response"
 import { mountPluginElement } from "./mount-lifecycle"
 import { pluginModuleUrl } from "./module-url"
 import {
@@ -151,14 +159,23 @@ import { createPluginScopeDisposer, ownsPluginScope, trackPluginScope, type Plug
 import { navigationHandoffs } from "./navigation-handoff"
 import { createPluginModuleLoader } from "./plugin-module-loader"
 import { captureFocusedTextInput } from "./focused-text-input"
-import { skillReferences } from "./skill-references"
+import { skillReferences, skillReferenceDiagnostics } from "./skill-references"
 import { encodeAudioBase64 } from "./audio-base64"
 import { createAudioCaptureBroker } from "./audio-capture"
 import { createFloatingHost } from "./floating"
 import { acquirePromptSession } from "@/context/prompt"
-import { insertPromptDraft, promptInsertionIdentity } from "@/context/prompt-insert"
+import { backgroundPromptScope, insertPromptDraft, promptInsertionIdentity } from "@/context/prompt-insert"
 import { composerRegistry } from "./composer-registry"
+import { composerSendIntents } from "./composer-send-intent"
 import { createComposerApi } from "./composer-api"
+import {
+  appendOnSubmitKey,
+  appendOnSubmitTarget,
+  createAppendOnSubmitStore,
+  createToolbarFinalAppend,
+  resolveAppendOnSubmitTarget,
+  type AppendOnSubmitTarget,
+} from "./append-on-submit"
 import { createSessionSubscription, sessionMessages } from "./session-events"
 import { normalizeCommandList } from "@/context/global-sync/utils"
 import { decode64 } from "@/utils/base64"
@@ -291,8 +308,11 @@ const capabilities: AppPluginCapability[] = [
   "host:tts",
   "host:audio",
   "host:composer",
+  "host:toolbar",
   "host:session-policy",
   "host:session-context",
+  "host:session-attention",
+  "host:session-attention-read",
   "host:skills",
   "host:skill-content",
   "host:text-input",
@@ -315,6 +335,7 @@ type AppPluginRuntime = {
   toolbarOrderReady: Accessor<boolean>
   toolbarItemOrder: (directory?: string) => string[]
   toolbarItemVisible: (id: string, directory?: string) => boolean
+  toolbarItemArmed: (id: string, context: ToolbarContext) => boolean | undefined
   globalToolbarItemVisible: (id: string) => boolean
   toolbarItemOverride: (id: string, directory: string) => ToolbarVisibilityOverride
   setGlobalToolbarItemVisible: (id: string, visible: boolean) => void
@@ -602,6 +623,7 @@ export function AppPluginLoadingOverlay() {
 
 function createAppPluginRuntime(): AppPluginRuntime {
   const owner = getOwner()
+  const dialog = useDialog()
   const command = useCommand()
   const layout = useLayout()
   const navigate = useNavigate()
@@ -611,6 +633,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
   const serverSync = useServerSync()
   const models = useModels()
   const sessionFavorites = useSessionFavorites()
+  const attention = useSessionAttention()
   const pickDirectory = useDirectoryPicker()
   const tabs = useTabs()
   const [searchParams] = useSearchParams<{ dir?: string }>()
@@ -839,12 +862,92 @@ function createAppPluginRuntime(): AppPluginRuntime {
   }
 
   const toolbarItemOwners = new Map<string, PluginScope>()
-  const registerToolbarItem = (item: ToolbarItem, owner?: PluginScope) => {
+  const appendOnSubmit = createAppendOnSubmitStore()
+  const [appendRevision, setAppendRevision] = createSignal(0)
+  const [composerRevision, setComposerRevision] = createSignal(0)
+  onCleanup(composerRegistry.subscribe(() => setComposerRevision((value) => value + 1)))
+  onCleanup(appendOnSubmit.subscribe(() => setAppendRevision((value) => value + 1)))
+  onCleanup(composerRegistry.registerFinalAppend(createToolbarFinalAppend(appendOnSubmit)))
+  const standardToolbarItems = new Set<string>()
+  const standardToolbarAvailability = new Map<string, (context: ToolbarContext) => boolean>()
+  createEffect(() => {
+    appendRevision()
+    appendOnSubmit.prune(
+      (id, target) =>
+        target.serverID !== server.key ||
+        (standardToolbarAvailability.get(id)?.({ ...target, placement: "composer", align: "right" }) ?? false),
+    )
+  })
+  const toolbarItemArmed = (id: string, context: ToolbarContext) => {
+    appendRevision()
+    if (!standardToolbarItems.has(id)) return undefined
+    const resolved = resolveAppendOnSubmitTarget(server.key, context)
+    return "error" in resolved ? false : appendOnSubmit.armed(id, resolved.target)
+  }
+  const registerToolbarItem = (
+    item: ToolbarItem,
+    owner?: PluginScope,
+    policy?: { serverID: string; active(): boolean },
+  ) => {
+    if (item.appendOnSubmit === true && !item.run && !item.mount) {
+      const target = appendOnSubmitTarget(item)
+      if ("error" in target || !policy || toolbarPlacement(item) !== "composer") {
+        console.warn("[app-plugin] invalid appendOnSubmit item (requires one target and composer placement)", {
+          id: item.id,
+          target,
+        })
+        return () => {}
+      }
+      const original = item
+      standardToolbarAvailability.set(
+        item.id,
+        (context) =>
+          policy.active() &&
+          isToolbarItemVisible(original.id, context.directory) &&
+          original.visible?.(context) !== false &&
+          toolbarItemEnabled(original, context),
+      )
+      const available = (context: ToolbarContext) => {
+        // Toolbar outlets may mount before the editor's registration effect.
+        composerRevision()
+        const resolved = resolveAppendOnSubmitTarget(policy.serverID, context)
+        return (
+          policy.active() &&
+          server.key === policy.serverID &&
+          !("error" in resolved) &&
+          !!composerRegistry.read(resolved.target) &&
+          toolbarItemEnabled(original, context)
+        )
+      }
+      item = {
+        ...original,
+        kind: "icon",
+        tooltip: original.command
+          ? `${original.tooltip ?? original.title}\nCommand reference only; does not dispatch the command template.`
+          : (original.tooltip ?? original.title),
+        enabled: available,
+        run(context) {
+          if (
+            !available(context) ||
+            !isToolbarItemVisible(original.id, context.directory) ||
+            original.visible?.(context) === false
+          )
+            throw new Error("Toolbar toggle is unavailable for this composer")
+          const resolved = resolveAppendOnSubmitTarget(policy.serverID, context)
+          if ("error" in resolved) throw new Error(resolved.error)
+          appendOnSubmit.toggle(original.id, resolved.target, target.token)
+        },
+      }
+      standardToolbarItems.add(item.id)
+    }
     setStore("toolbarItems", item.id, item)
     if (owner) toolbarItemOwners.set(item.id, owner)
     return () => {
       if (owner && toolbarItemOwners.get(item.id) !== owner) return
       toolbarItemOwners.delete(item.id)
+      standardToolbarItems.delete(item.id)
+      standardToolbarAvailability.delete(item.id)
+      appendOnSubmit.remove(item.id)
       setStore(
         "toolbarItems",
         produce((draft) => {
@@ -876,6 +979,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
       directory:
         input?.directory ?? (route.type === "session" || route.type === "dir-new-session" ? route.dir : undefined),
       sessionID: input?.sessionID ?? (route.type === "session" ? route.sessionId : undefined),
+      composerID: input?.composerID,
     } satisfies ToolbarContext
     if (!isToolbarItemVisible(id, context.directory) || item.visible?.(context) === false)
       throw new Error(`Toolbar item is not visible: ${id}`)
@@ -922,6 +1026,44 @@ function createAppPluginRuntime(): AppPluginRuntime {
   const openPluginOverlay = (pluginID: string, scope: PluginScope, input: AppOverlayOptions) => {
     const id = scopedID(pluginID, input.id)
     pluginOverlays.get(id)?.()
+    // Settings actions run inside the host modal. A body-level overlay would
+    // sit behind its backdrop and outside its focus trap. Use the same dialog
+    // stack for this handoff instead of competing z-indices or synthetic clicks.
+    if (dialog.active) {
+      const controller = new AbortController()
+      const content = document.createElement("div")
+      content.dataset.component = "app-plugin-overlay-content"
+      const mounted: { dispose?: () => void; dialogID?: string } = {}
+      const close = trackPluginScope(scope, () => {
+        if (controller.signal.aborted) return
+        abortPluginWork(controller)
+        mounted.dispose?.()
+        pluginOverlays.delete(id)
+        if (mounted.dialogID && dialog.active?.id === mounted.dialogID) dialog.close()
+      })
+      pluginOverlays.set(id, close)
+      void dialog.show(() => {
+        onCleanup(close)
+        onMount(() => queueMicrotask(() => {
+          if (!content.isConnected) return
+          mounted.dialogID = dialog.active?.id
+          if (controller.signal.aborted) { dialog.close(); return }
+          void Promise.resolve(input.mount({ element: content, signal: controller.signal, close }))
+            .then((dispose) => {
+              if (typeof dispose !== "function") return
+              if (controller.signal.aborted) return void dispose()
+              mounted.dispose = dispose
+            })
+            .catch((error) => {
+              if (!controller.signal.aborted) content.textContent = error instanceof Error ? error.message : "Plugin overlay failed to render"
+            })
+        }))
+        return <Dialog title={input.title} size="large"><div data-component="app-plugin-overlay" data-plugin-id={pluginID} data-overlay-id={input.id}
+          style={{ width: "100%", "min-height": "0", flex: "1", overflow: "auto", "overscroll-behavior": "contain", "scrollbar-gutter": "stable" }}
+        >{content}</div></Dialog>
+      }, close)
+      return { close }
+    }
     const controller = new AbortController()
     const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : undefined
     const previousFocus =
@@ -1053,8 +1195,14 @@ function createAppPluginRuntime(): AppPluginRuntime {
   const hostProjects = (): AppHostProject[] =>
     layout.projects.list().map((project) => ({
       id: project.id ?? project.worktree,
+      projectID: project.id === "global" ? undefined : project.id,
       worktree: project.worktree,
-      name: project.name ?? project.worktree.split(/[\\/]/).filter(Boolean).at(-1) ?? project.worktree,
+      sessionDirectories: [...new Set([
+        project.worktree,
+        ...(project.aliases ?? []),
+        ...(project.sessionDirectories ?? []),
+      ])],
+      name: project.name || project.worktree.split(/[\\/]/).filter(Boolean).at(-1) || project.worktree,
       icon: project.icon
         ? {
             url: project.icon.url,
@@ -1071,7 +1219,9 @@ function createAppPluginRuntime(): AppPluginRuntime {
       .map((project) =>
         [
           project.id,
+          project.projectID ?? "",
           project.worktree,
+          JSON.stringify(project.sessionDirectories),
           project.name,
           project.icon?.url ?? "",
           project.icon?.override ?? "",
@@ -1112,7 +1262,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
 
   const openHostProject = (directory?: string) => {
     if (directory) {
-      layout.projects.open(directory)
+      void layout.projects.register(directory)
       return
     }
     const current = server.current
@@ -1121,7 +1271,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
       server: current,
       title: "Open project",
       multiple: true,
-      onSelect: (result) => normalizeDirectorySelection(result).forEach(layout.projects.open),
+      onSelect: (result) => normalizeDirectorySelection(result).forEach((directory) => void layout.projects.register(directory)),
     })
   }
 
@@ -1388,6 +1538,29 @@ function createAppPluginRuntime(): AppPluginRuntime {
   const disposeScope = scopeDisposer.dispose
   const disposeAll = scopeDisposer.disposeAll
 
+  const toggleToolbarItem = async (
+    pluginID: string,
+    pluginServer: string,
+    input: { item: string; directory?: string; sessionID?: string; composerID?: string },
+  ) => {
+    if (server.key !== pluginServer) return { ok: false, error: "Plugin server is no longer active" }
+    const navigation = currentNavigation()
+    const directory = input.directory ?? navigation.directory
+    const sessionID = input.sessionID ?? navigation.sessionID
+    if (!directory || !sessionID) return { ok: false, error: "No composer target is active" }
+    const composerID =
+      input.composerID ?? composerRegistry.uniqueComposerID({ serverID: pluginServer, directory, sessionID })
+    if (!composerID) return { ok: false, error: "No unique composer is available for the shared toggle" }
+    const id = scopedID(pluginID, input.item)
+    if (!standardToolbarItems.has(id)) return { ok: false, error: "Item has no standard appendOnSubmit action" }
+    try {
+      await invokeToolbarItem(id, { placement: "composer", align: "right", directory, sessionID, composerID })
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
   const apiForPlugin = (
     pluginID: string,
     manifest: PluginManifest,
@@ -1408,6 +1581,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
     const gitRequest = async (
       path: string,
       input?: { directory?: string; query?: Record<string, string | number | undefined>; body?: unknown },
+      opts?: { typedError?: boolean },
     ) => {
       const directory = input?.directory ?? currentDirectory()
       if (!directory) throw new Error("No project directory is active")
@@ -1425,11 +1599,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
         body: input?.body ? JSON.stringify(input.body) : undefined,
         signal: scope.controller.signal,
       })
-      const text = await response.text()
-      if (response.status === 499) throw new DOMException("Request cancelled", "AbortError")
-      const body = text ? (JSON.parse(text) as unknown) : {}
-      if (!response.ok) throw new Error(formatServerError(body, undefined, response.statusText))
-      return body
+      return readGitResponse(response, opts?.typedError)
     }
     const hostHttpRequest = async (input: AppHostHttpRequest): Promise<AppHostHttpResponse> => {
       if (!input.path.startsWith("/") || input.path.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(input.path)) {
@@ -1691,6 +1861,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
       text: string
       position?: "cursor" | "end"
       replace?: string
+      operationID?: string
     }): Promise<AppHostComposerInsertResult> => {
       if (!active() || !isPluginServerActive(pluginServer, server.key))
         return { ok: false, error: "The composer server is no longer active" }
@@ -1698,19 +1869,21 @@ function createAppPluginRuntime(): AppPluginRuntime {
         ? composerRegistry.insertText({ ...input, composerID: input.composerID, serverID: pluginServer })
         : undefined
       if (result) return result
-      // Only a stable session composer can be restored without a mounted editor.
-      // Ephemeral/new-session composers must still have an exact mounted target.
-      if (!input.sessionID || input.composerID !== input.sessionID)
-        return { ok: false, error: "The pinned composer is no longer available" }
+      // Restore only the original open draft or a stable session composer.
+      const scope = () => backgroundPromptScope({ ...input, serverID: pluginServer }, tabs.store)
+      const target = scope()
+      if (!target || !input.composerID) return { ok: false, error: "The pinned composer is no longer available" }
       // runWithOwner returns undefined when the owner is gone; a disposed plugin surface has no composer to restore.
-      const prompt = runWithOwner(owner, () =>
-        acquirePromptSession(serverSDK().scope, { dir: base64Encode(input.directory), id: input.sessionID }, platform),
-      )!
+      const prompt = runWithOwner(owner, () => acquirePromptSession(serverSDK().scope, target, platform))
+      if (!prompt) return { ok: false, error: "The pinned composer is no longer available" }
       try {
         await prompt.value.ready.promise
         if (!active() || !isPluginServerActive(pluginServer, server.key))
           return { ok: false, error: "The composer server is no longer active" }
-        return insertPromptDraft(
+        if (!scope()) return { ok: false, error: "The pinned composer is no longer available" }
+        const before = prompt.value.current().map((part) => ({ ...part }))
+        const cursor = prompt.value.cursor() ?? before.reduce((length, part) => length + ("content" in part ? part.content.length : 0), 0)
+        const inserted = insertPromptDraft(
           prompt.value,
           input,
           promptInsertionIdentity({
@@ -1720,6 +1893,9 @@ function createAppPluginRuntime(): AppPluginRuntime {
             composerID: input.composerID,
           }),
         )
+        return { ...inserted, insertionReceiptID: inserted.ok && input.operationID
+          ? composerSendIntents.recordInsertion({ ...input, composerID: input.composerID, serverID: pluginServer }, input.operationID, before, prompt.value.current(), input.text, cursor,
+              input.replace ? { replace: input.replace, cursor: prompt.value.cursor() ?? cursor } : undefined) : undefined }
       } finally {
         prompt.dispose()
       }
@@ -1773,6 +1949,42 @@ function createAppPluginRuntime(): AppPluginRuntime {
       )
       if (!result.data?.data) throw new Error("Skill content resolution returned no data")
       return result.data.data
+    }
+    const diagnoseHostToolbarSkills = async (input?: {
+      agent?: string
+      directory?: string
+      sessionID?: string
+      composerID?: string
+      signal?: AbortSignal
+    }) => {
+      const directory = input?.directory ?? currentDirectory()
+      if (!directory) return []
+      const response = await serverSDK().client.v2.command.list({ location: { directory } }, { signal: input?.signal })
+      const commands = response.data?.data ? normalizeCommandList(response.data.data) : []
+      const toolbar = toolbarItemsForDirectory(directory).filter((item) => {
+        if ((!item.skill && !item.command) || toolbarPlacement(item) !== "composer") return false
+        if (!isToolbarItemVisible(item.id, directory)) return false
+        return (
+          item.visible?.({
+            placement: "composer",
+            align: toolbarAlign(item),
+            directory,
+            sessionID: input?.sessionID,
+            composerID: input?.composerID,
+          }) ?? true
+        )
+      })
+      const sessionID = input?.sessionID ?? currentNavigation().sessionID
+      const composerID =
+        input?.composerID ?? composerRegistry.uniqueComposerID({ serverID: pluginServer, directory, sessionID })
+      const snapshot = composerID
+        ? composerRegistry.read({ serverID: pluginServer, directory, sessionID, composerID })
+        : undefined
+      const constraints = await serverSDK().client.v2.skill.diagnostics(
+        { location: { directory }, agent: input?.agent ?? snapshot?.agent },
+        { signal: input?.signal },
+      )
+      return skillReferenceDiagnostics({ commands, toolbar, constraints: constraints.data?.data })
     }
     const mountModelSelector = (input: {
       element: HTMLElement
@@ -1842,12 +2054,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
               signal: input.signal ? AbortSignal.any([scope.controller.signal, input.signal]) : scope.controller.signal,
             },
           )
-          const body: unknown = await response.json()
-          if (response.ok && isRecord(body) && body.ok === true) return { ok: true, data: body.data }
-          return {
-            ok: false,
-            error: isRecord(body) && typeof body.message === "string" ? body.message : "Plugin service failed",
-          }
+          return pluginServiceResponse(response)
         },
       },
       dock: {
@@ -1915,6 +2122,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
                 pluginID,
               },
               scope,
+              { serverID: pluginServer, active: () => can("host:composer") },
             ),
           )
         },
@@ -2202,6 +2410,29 @@ function createAppPluginRuntime(): AppPluginRuntime {
           },
         },
         sessions: {
+          attention: {
+            register(id) {
+              if (!can("host:session-attention")) return () => {}
+              return trackPluginScope(scope, attention.register(scopedID(pluginID, id)))
+            },
+            get(input) {
+              if ((!can("host:session-attention") && !can("host:session-attention-read")) || !active() || server.key !== pluginServer) return
+              const entry = attention.current(input)
+              return entry ? { enabled: entry.enabled, available: attention.enabled(), pendingCount: attention.enabled() ? entry.count : 0,
+                error: attention.enabled() && entry.error } : undefined
+            },
+            set(input, enabled) {
+              if (!can("host:session-attention") || !active() || server.key !== pluginServer) return Promise.resolve(false)
+              return attention.set(input, enabled)
+            },
+            subscribe(handler) {
+              if ((!can("host:session-attention") && !can("host:session-attention-read")) || !active() || server.key !== pluginServer) return () => {}
+              return trackPluginScope(scope, createRoot((dispose) => {
+                createEffect(() => { attention.revision(); attention.enabled(); if (active() && server.key === pluginServer) handler() })
+                return dispose
+              }))
+            },
+          },
           accessControl: {
             async get(input) {
               return requestSessionPolicy({ ...input, action: "read" })
@@ -2421,6 +2652,34 @@ function createAppPluginRuntime(): AppPluginRuntime {
               query: { limit: input?.limit },
             }) as Promise<AppHostGitSnapshot>
           },
+          history(input) {
+            if (!can("host:git")) return Promise.reject(new Error("Missing host:git capability"))
+            return gitRequest(
+              "/vcs/git/history",
+              {
+                directory: input?.directory,
+                body: {
+                  selector: input?.selector,
+                  ref: input?.ref,
+                  firstParent: input?.firstParent,
+                  limit: input?.limit,
+                  cursor: input?.cursor,
+                },
+              },
+              { typedError: true },
+            ) as Promise<AppHostGitHistoryPage>
+          },
+          commitMessage(input) {
+            if (!can("host:git")) return Promise.reject(new Error("Missing host:git capability"))
+            return gitRequest(
+              "/vcs/git/commit-message",
+              {
+                directory: input?.directory,
+                body: { hash: input?.hash, cursor: input?.cursor },
+              },
+              { typedError: true },
+            ) as Promise<AppHostGitCommitMessagePage>
+          },
           discover(input) {
             if (!can("host:git")) return Promise.resolve({ repositories: [], truncated: false })
             return gitRequest("/vcs/git/discover", {
@@ -2558,6 +2817,16 @@ function createAppPluginRuntime(): AppPluginRuntime {
             if (!can("host:skill-content")) return Promise.reject(new Error("Missing host:skill-content capability"))
             return resolveHostSkills(input)
           },
+          diagnostics(input) {
+            if (!can("host:skills")) return Promise.resolve([])
+            return diagnoseHostToolbarSkills(input)
+          },
+        },
+        toolbar: {
+          async toggle(input) {
+            if (!can("host:toolbar")) return { ok: false, error: "Missing host:toolbar capability" }
+            return toggleToolbarItem(pluginID, pluginServer, input)
+          },
         },
         textInput: {
           capture() {
@@ -2587,6 +2856,11 @@ function createAppPluginRuntime(): AppPluginRuntime {
             if (!registration.ok) return registration
             trackPluginScope(scope, registration.dispose)
             return registration
+          },
+          async writeClipboardText(text) {
+            if (!can("host:desktop-services")) return { ok: false, error: "Missing host:desktop-services capability" }
+            if (!platform.writeClipboardText) return { ok: false, error: "Clipboard writes are only available in OpenCode Desktop" }
+            return platform.writeClipboardText(text)
           },
         },
       },
@@ -2684,7 +2958,10 @@ function createAppPluginRuntime(): AppPluginRuntime {
       const url = new URL(`${conn.http.url.replace(/\/+$/, "")}/app/plugins`)
       if (directory) url.searchParams.set("directory", directory)
       const response = await (platform.fetch ?? fetch)(url, {
-        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+        // Cold project manifests resolve and hash local plugin files while
+        // directory services start. Keep the request bounded without aborting
+        // healthy cold loads after only ten seconds.
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]),
         headers: authHeaders(conn.http),
       })
       if (!response.ok) throw new Error(`Failed to load app plugin manifest: ${response.status}`)
@@ -2796,6 +3073,7 @@ function createAppPluginRuntime(): AppPluginRuntime {
     toolbarOrderReady,
     toolbarItemOrder,
     toolbarItemVisible: isToolbarItemVisible,
+    toolbarItemArmed,
     globalToolbarItemVisible: (id) =>
       toolbarVisibilityReady() && globalToolbarItemVisible(toolbarVisibility, id, toolbarDefaultVisible(id)),
     toolbarItemOverride: (id, directory) => toolbarItemOverride(toolbarVisibility, projectKey(directory), id),

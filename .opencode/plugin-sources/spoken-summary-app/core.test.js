@@ -40,6 +40,46 @@ describe("spoken summary contracts", () => {
     expect(modelRequest("model:provider/model", "missing")).toEqual({ model: "provider/model" })
     expect(() => modelRequest("", "missing")).toThrow("missing")
     expect(settings({ speed: 50, targetWords: 1, cacheEnabled: false })).toMatchObject({ speed: 2, targetWords: 30, cacheEnabled: false })
+    expect(settings()).toMatchObject({ language: "de", targetWords: 40, speed: 0.9 })
+    expect(settings({ targetWords: 100, speed: 1.2, language: "en" })).toMatchObject({ targetWords: 60, speed: 1.2, language: "en" })
+  })
+  test("prompt requires simple result, evidenced stop reason and concrete ownership without invented user work", () => {
+    const prompt = summaryPrompt(context(), settings())
+    for (const rule of ["Höchstens 40 Wörter", "einfache Alltagssprache", "zuerst das grundlegende Ergebnis", "höchstens zwei konkrete nächste Schritte", "der Agent oder der Nutzer", "Erfinde keine Nutzeraufgabe", "warum wurde gestoppt", "Nutze nur belegte Gründe", "ausdrücklich vertagte Prüfungen", "statt ihn zu erraten", "ohne Gegenstand und Zweck", "Testlisten", "nicht als Faktenquelle", "frühere Antwort in eine neue offene Frage"]) {
+      expect(prompt.system).toContain(rule)
+    }
+    expect(prompt.system).toContain("Sprache: de")
+    expect(summaryPrompt(context(), { ...settings(), targetWords: 100 }).system).toContain("Höchstens 60 Wörter")
+  })
+  test("word limit is strict at the configured boundary and never exceeds sixty", () => {
+    const text = (words) => `${"Wort ".repeat(words - 1)}Ende.`
+    expect(validateSummary(text(40), 40).ok).toBe(true)
+    expect(validateSummary(text(41), 40).ok).toBe(false)
+    expect(validateSummary(text(60), 60).ok).toBe(true)
+    expect(validateSummary(text(61), 60).ok).toBe(false)
+    expect(validateSummary(text(61), 100).ok).toBe(false)
+  })
+  test("overlong reports are shortened once before TTS with the same concrete-summary contract", async () => {
+    const f = fixture()
+    const short = "Die Änderungen sind eingebaut. Alte Fehlermeldungen blockieren den Spieltest. Der Agent muss herausfinden, warum sie trotz Leeren bleiben."
+    f.api.host.ai.run = async (input) => {
+      f.calls.ai.push(input)
+      return { ok: true, text: f.calls.ai.length === 1 ? `${"Wort ".repeat(40)}Ende.` : short }
+    }
+    await f.controller.listen(target())
+    expect(f.calls.ai).toHaveLength(2)
+    expect(f.calls.ai[1].prompt).toContain("höchstens 40 Wörter")
+    expect(f.calls.ai[1].system).toBe(f.calls.ai[0].system)
+    expect(f.calls.tts).toHaveLength(1)
+    expect(f.calls.tts[0]).toMatchObject({ text: short, speed: 0.9 })
+    f.owner.abort()
+  })
+  test("a second overlong draft stays an error and never reaches speech", async () => {
+    const f = fixture({ ai: { async run() { return { ok: true, text: `${"Wort ".repeat(60)}Ende.` } } } })
+    await f.controller.listen(target())
+    expect(f.controller.state.error).toBe("Die Zusammenfassung ist zu lang.")
+    expect(f.calls.tts).toHaveLength(0)
+    f.owner.abort()
   })
   test("prompt grounds open questions and unfinished work without tool instructions", () => {
     const prompt = summaryPrompt(context(), settings())

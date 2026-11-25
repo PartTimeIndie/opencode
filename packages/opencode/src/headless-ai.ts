@@ -18,10 +18,9 @@ type TextInput = {
   options?: Record<string, unknown>
   variant?: string
   /**
-   * Ordered model chain snapshot. Each step is tried exactly once in order and
-   * only eligible transient provider/quota/empty-completion failures advance to
-   * the next step; permanent failures fail closed so the configured order is
-   * never silently bypassed.
+   * Ordered model chain snapshot. Transient and empty failures get one fresh
+   * attempt on the same model before advancing; exhausted quota and retired
+   * models advance directly. Permanent failures and cancellation stop the chain.
    */
   chain?: AIChain.AIChainStep[]
   maxOutputTokens?: number

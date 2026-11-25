@@ -111,7 +111,7 @@ function renderPanel(api, state, view) {
   if (state.error) root.append(text("p", state.error, "oc-runtime-services__warning"))
   if (state.notice) root.append(text("p", state.notice, "oc-runtime-services__notice"))
   if (state.operations.size) root.append(renderOperations(api, state))
-  if (!state.services.length && !state.busy) root.append(text("p", "No NSSM-managed services found.", "oc-runtime-services__empty"))
+  if (!state.services.length && !state.busy && !state.error) root.append(text("p", "No NSSM-managed services found.", "oc-runtime-services__empty"))
   const list = element("div", "oc-runtime-services__list")
   for (const service of state.services) list.append(renderService(api, state, service))
   root.append(list)

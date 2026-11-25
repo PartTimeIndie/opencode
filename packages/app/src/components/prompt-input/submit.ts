@@ -5,6 +5,7 @@ import { Binary } from "@opencode-ai/core/util/binary"
 import { produce } from "solid-js/store"
 import { useSearchParams } from "@solidjs/router"
 import { batch, type Accessor } from "solid-js"
+import { visibleGoalFromCommandArguments } from "./prepared-submit-policy"
 import type { FileSelection } from "@/context/file"
 import { useServer } from "@/context/server"
 import { useTabs } from "@/context/tabs"
@@ -19,6 +20,7 @@ import { useSync, type DirectorySync } from "@/context/sync"
 import { Identifier } from "@/utils/id"
 import { Worktree as WorktreeState } from "@/utils/worktree"
 import { buildRequestParts, imageAttachmentPromptFile } from "./build-request-parts"
+import { acquireAnnotationSend, resolveAnnotationPart } from "../image-annotation/resolve"
 import { setCursorPosition } from "./editor-dom"
 import { formatServerError } from "@/utils/server-errors"
 import { ScopedKey } from "@/utils/server-scope"
@@ -71,10 +73,12 @@ type FollowupSendInput = {
   queued?: boolean
   delivery?: "queue" | "steer"
   before?: () => Promise<boolean> | boolean
+  dispatch?: () => void
+  commands?: DirectorySync["data"]["command"]
 }
-const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? part.content : "")).join("")
+export const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? part.content : "")).join("")
 
-const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttachmentPart => part.type === "image")
+export const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttachmentPart => part.type === "image")
 
 const clonePrompt = (prompt: Prompt): Prompt => prompt.map((part) => ({ ...part }))
 
@@ -86,7 +90,7 @@ function isSelectionEqual(a?: FileSelection, b?: FileSelection) {
   )
 }
 
-function isContextItemEqual(a: ContextItem, b: ContextItem) {
+export function isContextItemEqual(a: ContextItem, b: ContextItem) {
   return (
     a.type === b.type &&
     a.path === b.path &&
@@ -193,7 +197,7 @@ function promptSubmitSignature(input: {
   })
 }
 
-const toV2Model = (
+export const toV2Model = (
   model: { providerID: string; modelID: string },
   variant?: string,
   chain?: { id: string; name: string; steps: { providerID: string; modelID: string; variant?: string }[] },
@@ -298,7 +302,19 @@ function promptSubmitOperation(input: {
   }
 }
 
-async function sendSlashCommand(input: {
+export async function sendSlashCommand(input: Parameters<typeof sendResolvedSlashCommand>[0]) {
+  if (!input.images.some((part) => part.annotation)) return sendResolvedSlashCommand(input)
+  const send = await acquireAnnotationSend(input.images)
+  try {
+    await sendResolvedSlashCommand({ ...input, images: draftImages(send.prompt) })
+    await send.release(true).catch(() => showToast({ title: "Local image cleanup failed", description: "The image was sent. Local draft cleanup could not finish." }))
+  } catch (error) {
+    await send.release().catch(() => {})
+    throw error
+  }
+}
+
+async function sendResolvedSlashCommand(input: {
   client: DirectorySDK["client"]
   sessionID: string
   messageID: string
@@ -322,21 +338,9 @@ async function sendSlashCommand(input: {
   })
 }
 
-const GOAL_CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
-const GOAL_STATUS_COMMANDS = new Set(["status", "history", "list", "pause", "resume", "focus"])
+export { visibleGoalFromCommandArguments } from "./prepared-submit-policy"
 
-function visibleGoalFromCommandArguments(value: string) {
-  const args = value.trim()
-  const normalized = args.toLowerCase()
-  // These controls own plugin state; only server metadata can confirm the focused goal.
-  if (!args || GOAL_STATUS_COMMANDS.has(normalized) || /^(?:add|edit|sisyphus|focus)(?:\s|$)/.test(normalized)) {
-    return undefined
-  }
-  if (GOAL_CLEAR_COMMANDS.has(normalized)) return ""
-  return args
-}
-
-function waitForAccessControlSync(sync: Promise<void>) {
+export function waitForAccessControlSync(sync: Promise<void>) {
   let timer: number | undefined
   return Promise.race([
     sync.then(() => true),
@@ -350,6 +354,19 @@ function waitForAccessControlSync(sync: Promise<void>) {
 }
 
 export async function sendFollowupDraft(input: FollowupSendInput) {
+  if (!input.draft.prompt.some((part) => part.type === "image" && part.annotation)) return sendResolvedFollowupDraft(input)
+  const send = await acquireAnnotationSend(input.draft.prompt)
+  try {
+    const admitted = await sendResolvedFollowupDraft({ ...input, draft: { ...input.draft, prompt: send.prompt } })
+    await send.release(!!admitted).catch(() => showToast({ title: "Local image cleanup failed", description: "Local draft data has been retained." }))
+    return admitted
+  } catch (error) {
+    await send.release().catch(() => {})
+    throw error
+  }
+}
+
+async function sendResolvedFollowupDraft(input: FollowupSendInput) {
   const text = draftText(input.draft.prompt)
   const images = draftImages(input.draft.prompt)
   const [, setStore] = input.serverSync.child(input.draft.sessionDirectory)
@@ -373,7 +390,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
   const messageID = input.messageID ?? input.draft.messageID ?? Identifier.ascending("message")
   const [head, ...tail] = text.split(" ")
   const cmd = head?.startsWith("/") ? head.slice(1) : undefined
-  const command = cmd ? input.sync.data.command.find((item) => item.name === cmd) : undefined
+  const command = cmd ? (input.commands ?? input.sync.data.command).find((item) => item.name === cmd) : undefined
   if (cmd && command && command.source !== "skill" && !input.queued) {
     setBusy()
     try {
@@ -382,6 +399,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
         return false
       }
 
+      input.dispatch?.()
       await sendSlashCommand({
         client: input.client,
         sessionID: input.draft.sessionID,
@@ -450,6 +468,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
       return false
     }
 
+    input.dispatch?.()
     await input.client.v2.session.prompt({
       sessionID: input.draft.sessionID,
       id: messageID,
@@ -469,14 +488,15 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
   }
 }
 
-type PromptSubmitInput = {
+export type PromptSubmitInput = {
   beforeSubmit?: (context: {
     directory: string
     sessionID?: string
+    standardAppend: boolean
     getAgent(): string | undefined
     canSetAgent(name: string): boolean
     setAgent(name: string): boolean
-  }) => Promise<boolean>
+  }) => Promise<boolean | { commit(): void }>
   prompt: ReturnType<typeof usePrompt>
   info: Accessor<
     | {
@@ -749,6 +769,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
   const submit = async (options?: PromptSubmitOptions) => {
     const submitStarted = performance.now()
+    let toolbarReceipt: { commit(): void } | undefined
 
     if (!options?.skipBeforeSubmit && input.beforeSubmit) {
       const serverID = server.key
@@ -757,6 +778,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       const accepted = await input.beforeSubmit({
         directory,
         sessionID,
+        standardAppend: !options?.resume && !options?.prompt && input.mode() === "normal",
         getAgent: () => local.agent.current()?.name,
         canSetAgent: (name) => local.agent.list().some((agent) => agent.name === name),
         setAgent: (name) => {
@@ -765,6 +787,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         },
       })
       if (!accepted || server.key !== serverID || sdk().directory !== directory || params.id !== sessionID) return
+      if (typeof accepted === "object") toolbarReceipt = accepted
     }
 
     const selectionSettled = await local.session.settled().then(
@@ -948,6 +971,13 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
+    const sourceHost = sdk()
+    const sourceSession = params.id
+    const resolvedImages = await Promise.all(images.map(resolveAnnotationPart)).catch((error: unknown) => {
+      showToast({ title: language.t("common.error"), description: errorMessage(error) })
+      return undefined
+    })
+    if (!resolvedImages || sdk().scope !== sourceHost.scope || sdk().directory !== sourceHost.directory || params.id !== sourceSession) return
     const operationFor = (sessionID: string) =>
       promptSubmitOperation({
         sessionID,
@@ -960,7 +990,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         model,
         variant,
         chain,
-        files: imagePromptFiles(images),
+        files: imagePromptFiles(resolvedImages),
         requestText: optimization.requestText,
         system: optimization.system,
         delivery: activeFollowupDelivery,
@@ -1306,7 +1336,18 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             goal: pinGoal,
           })
         }
-        input.onQueue?.(draft)
+        if (input.onQueue && draft.prompt.some((part) => part.type === "image" && part.annotation)) {
+          const { snapshotAnnotationQueue } = await import("../image-annotation/queue")
+          const snapshot = await snapshotAnnotationQueue(draft.prompt)
+          try {
+            input.onQueue({ ...draft, prompt: snapshot.prompt })
+          } catch (error) {
+            await snapshot.rollback()
+            throw error
+          }
+          await snapshot.commit().catch(() => showToast({ title: "Local image cleanup failed", description: "The queued snapshot is safe. The original draft has been retained." }))
+        } else input.onQueue?.(draft)
+        if (input.onQueue) toolbarReceipt?.commit()
         removeUnchangedContextItems(context)
         clearInput()
         if (retry) deletePromptRetry(retryKey, retry)
@@ -1461,7 +1502,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             new_session: isNewSession,
             duration_ms: performance.now() - sendStarted,
           })
-          if (sent) completeAdmission()
+          if (sent) {
+            completeAdmission()
+            toolbarReceipt?.commit()
+          }
           return sent
         })
         .catch((err) => {
@@ -1478,7 +1522,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           restoreInput()
           return false
         })
-      if (isNewSession || options?.waitForAdmission) return await sending
+      // Keep a one-shot toolbar receipt bound to this submit until admission settles.
+      if (isNewSession || options?.waitForAdmission || toolbarReceipt) return await sending
     } finally {
       if (shared) {
         shared.resolveInFlight?.()

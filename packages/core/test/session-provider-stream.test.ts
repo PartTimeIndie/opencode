@@ -10,16 +10,26 @@ import {
 } from "@opencode-ai/core/session/provider-stream"
 
 test("provider stream idle timeout config treats empty values as unset", () => {
-  expect(providerStreamIdleTimeoutMs("")).toBe(60_000)
-  expect(providerStreamIdleTimeoutMs("   ")).toBe(60_000)
+  expect(providerStreamIdleTimeoutMs("")).toBe(90_000)
+  expect(providerStreamIdleTimeoutMs("   ")).toBe(90_000)
   expect(providerStreamIdleTimeoutMs("40")).toBe(40)
   expect(providerStreamIdleTimeoutMs("0")).toBe(false)
+})
 
-  const glm = { provider: "zhipuai-coding-plan", id: "glm-5.3-flash" }
-  expect(providerStreamIdleTimeouts(glm, "invalid")).toEqual({ initialMs: 60_000, afterProgressMs: 240_000 })
-  expect(providerStreamIdleTimeouts(glm, "")).toEqual({ initialMs: 60_000, afterProgressMs: 240_000 })
-  expect(providerStreamIdleTimeouts(glm, "40")).toEqual({ initialMs: 40, afterProgressMs: 40 })
-  expect(providerStreamIdleTimeouts(glm, "0")).toEqual({ initialMs: false, afterProgressMs: false })
+test.each([
+  ["tensorfold", "bonsai-2-27b"],
+  ["zhipuai-coding-plan", "glm-5.3-flash"],
+  ["openai", "gpt-6-luna"],
+  ["anthropic", "claude-sonnet-4-5"],
+  ["custom-provider", "unlisted-model"],
+])("provider %s/%s uses common phase defaults and preserves explicit overrides", (provider, id) => {
+  for (const value of ["", "   ", "invalid", "NaN", "Infinity", "-Infinity"]) {
+    expect(providerStreamIdleTimeouts({ provider, id }, value)).toEqual({ initialMs: 90_000, afterProgressMs: 240_000 })
+  }
+  expect(providerStreamIdleTimeouts({ provider, id }, " 40 ")).toEqual({ initialMs: 40, afterProgressMs: 40 })
+  for (const value of ["0", "-1"]) {
+    expect(providerStreamIdleTimeouts({ provider, id }, value)).toEqual({ initialMs: false, afterProgressMs: false })
+  }
 })
 
 test("provider errors do not renew the post-progress idle window", async () => {

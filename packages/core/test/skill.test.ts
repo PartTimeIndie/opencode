@@ -43,7 +43,7 @@ description: ${description}
 }
 
 describe("SkillV2", () => {
-  it.effect("recognizes only an explicit leading slash invocation of the selected skill or alias", () =>
+  it.effect("recognizes explicit slash tokens anywhere in the message, including multiple skills and aliases", () =>
     Effect.sync(() => {
       const skill = new SkillV2.Info({
         name: "manual",
@@ -51,15 +51,29 @@ describe("SkillV2", () => {
         location: AbsolutePath.make("/skills/manual.md"),
         content: "Manual",
       })
-      for (const text of ["/manual", " /manual now", "/shortcut\nnow"])
+      for (const text of [
+        "/manual",
+        " /manual now",
+        "/shortcut\nnow",
+        "Please /manual now",
+        "Bitte nutze /shortcut dafür",
+        "Prüfe und behebe das\n\n/other\n\n/manual",
+        "/other /manual /third",
+        "Bitte\t/manual\r\nprüfen",
+      ])
         expect(SkillV2.invokedBySlash(skill, text)).toBe(true)
       for (const text of [
         "Use manual",
-        "Please /manual",
+        "Please /other",
         "/manual-other",
         "/manual/other",
         "/manual!",
         "`/manual`",
+        "https://example.com/manual",
+        "folder/manual",
+        "//manual",
+        "\\/manual",
+        "/Manual",
         "",
       ])
         expect(SkillV2.invokedBySlash(skill, text)).toBe(false)

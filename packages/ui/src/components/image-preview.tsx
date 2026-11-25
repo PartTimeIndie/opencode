@@ -6,6 +6,8 @@ import { ZoomableImage } from "./image-zoom"
 export interface ImagePreviewProps {
   src: string
   alt?: string
+  onAnnotate?: () => void
+  annotateLabel?: string
 }
 
 export function ImagePreview(props: ImagePreviewProps) {
@@ -15,6 +17,7 @@ export function ImagePreview(props: ImagePreviewProps) {
       <div data-slot="image-preview-container">
         <Kobalte.Content data-slot="image-preview-content">
           <div data-slot="image-preview-header">
+            {props.onAnnotate && <button type="button" data-action="annotate-copy" onClick={props.onAnnotate}>{props.annotateLabel ?? "Edit as new copy"}</button>}
             <Kobalte.CloseButton
               data-slot="image-preview-close"
               as={IconButton}

@@ -8,7 +8,7 @@ import { Identifier } from "../id/id"
 import { SessionSchema } from "../session/schema"
 import { SessionSupervision } from "../session/supervision"
 import { and, eq, isNull, lte, or } from "drizzle-orm"
-import { Cause, Clock, Context, Effect, Layer, Schema, SynchronizedRef } from "effect"
+import { Cause, Clock, Context, Deferred, Effect, Fiber, Layer, Schema, Scope, SynchronizedRef } from "effect"
 
 export type Status = "running" | "completed" | "error" | "cancelled"
 
@@ -72,7 +72,7 @@ export class AlreadyRunningError extends Error {
 export interface Interface {
   readonly list: (parentSessionID?: SessionSchema.ID) => Effect.Effect<Info[]>
   readonly reserve: (input: ReserveInput) => Effect.Effect<Info, LimitError | AlreadyRunningError>
-  readonly launch: (taskID: SessionSchema.ID, run: Effect.Effect<string, unknown>) => Effect.Effect<Info>
+  readonly launch: (taskID: SessionSchema.ID, run: Effect.Effect<string, unknown, Scope.Scope>) => Effect.Effect<Info>
   readonly fail: (taskID: SessionSchema.ID, error: string) => Effect.Effect<Info | undefined>
   readonly get: (taskID: SessionSchema.ID) => Effect.Effect<Info | undefined>
   readonly wait: (taskID: SessionSchema.ID, timeout?: number) => Effect.Effect<{ info?: Info; timedOut: boolean }>
@@ -231,14 +231,54 @@ export const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2.Service
+    const scope = yield* Scope.Scope
     const ownerID = Identifier.ascending("job")
+    const owned = new Map<SessionSchema.ID, {
+      token: string
+      state: "reserved" | "running" | "closing" | "settled"
+      lost: Deferred.Deferred<void>
+      heartbeat?: Fiber.Fiber<void, never>
+    }>()
+
+    // A result, cancellation or expired lease is not proof that its independent
+    // execution scope finished. Only this generation's owner may acknowledge it.
+    const acknowledge = Effect.fn("TaskJob.acknowledge")(function* (taskID: SessionSchema.ID, token: string) {
+      const now = yield* Clock.currentTimeMillis
+      const row = yield* db
+        .update(BackgroundJobTable)
+        .set({ time_owner_settled: now })
+        .where(
+          and(
+            eq(BackgroundJobTable.id, taskID),
+            eq(BackgroundJobTable.owner_id, ownerID),
+            eq(BackgroundJobTable.cleanup_token, token),
+            or(
+              eq(BackgroundJobTable.status, "completed"),
+              eq(BackgroundJobTable.status, "error"),
+              eq(BackgroundJobTable.status, "cancelled"),
+            ),
+          ),
+        )
+        .returning({ id: BackgroundJobTable.id })
+        .get()
+        .pipe(Effect.orDie)
+      // A foreign/replaced generation stays unknown. Finishing this local scope
+      // cannot attest the new owner's effects or repair its durable evidence.
+      if (!row) return
+      const current = owned.get(taskID)
+      if (current?.token === token) {
+        current.state = "settled"
+        if (current.heartbeat) yield* Fiber.interrupt(current.heartbeat)
+        if (owned.get(taskID)?.token === token) owned.delete(taskID)
+      }
+    })
 
     yield* Effect.addFinalizer(() =>
       Effect.uninterruptible(
         Effect.gen(function* () {
           const local = yield* background.list()
           const now = yield* Clock.currentTimeMillis
-          yield* db
+          yield* Effect.forEach([...owned.entries()], ([taskID, owner]) => db
             .update(BackgroundJobTable)
             .set({
               status: "cancelled",
@@ -252,13 +292,20 @@ export const layer = Layer.effect(
                 eq(BackgroundJobTable.type, "task"),
                 eq(BackgroundJobTable.status, "running"),
                 eq(BackgroundJobTable.owner_id, ownerID),
+                eq(BackgroundJobTable.id, taskID),
+                eq(BackgroundJobTable.cleanup_token, owner.token),
               ),
             )
             .run()
-            .pipe(Effect.orDie)
+            .pipe(Effect.orDie), { discard: true })
           yield* Effect.forEach(
-            local.filter((job) => job.type === "task" && job.status === "running"),
+            local.filter((job) => job.type === "task" && owned.has(SessionSchema.ID.make(job.id))),
             (job) => background.cancel(job.id).pipe(Effect.timeoutOption(2_000), Effect.ignore),
+            { discard: true },
+          )
+          yield* Effect.forEach(
+            [...owned.entries()].filter(([, owner]) => owner.state === "reserved"),
+            ([id, owner]) => acknowledge(id, owner.token),
             { discard: true },
           )
         }),
@@ -301,6 +348,7 @@ export const layer = Layer.effect(
 
     const settle = Effect.fn("TaskJob.settle")(function* (
       taskID: SessionSchema.ID,
+      token: string,
       status: Exclude<Status, "running">,
       value?: string,
     ) {
@@ -322,6 +370,7 @@ export const layer = Layer.effect(
             eq(BackgroundJobTable.type, "task"),
             eq(BackgroundJobTable.status, "running"),
             eq(BackgroundJobTable.owner_id, ownerID),
+            eq(BackgroundJobTable.cleanup_token, token),
           ),
         )
         .returning()
@@ -362,7 +411,8 @@ export const layer = Layer.effect(
       }),
       reserve: Effect.fn("TaskJob.reserve")(function* (input) {
         const now = yield* Clock.currentTimeMillis
-        return yield* db
+        const token = Identifier.ascending("job")
+        const result = yield* db
           .transaction((tx) =>
             Effect.gen(function* () {
               yield* tx
@@ -388,7 +438,8 @@ export const layer = Layer.effect(
                 .from(BackgroundJobTable)
                 .where(and(eq(BackgroundJobTable.id, input.taskID), eq(BackgroundJobTable.type, "task")))
                 .get()
-              if (existing?.status === "running") return yield* Effect.fail(new AlreadyRunningError(input.taskID))
+              if (existing && (existing.status === "running" || existing.time_owner_settled === null))
+                return yield* Effect.fail(new AlreadyRunningError(input.taskID))
               const active = yield* tx
                 .select({ metadata: BackgroundJobTable.metadata })
                 .from(BackgroundJobTable)
@@ -411,6 +462,8 @@ export const layer = Layer.effect(
                 owner_id: ownerID,
                 lease_until: now + leaseDuration,
                 heartbeat_at: now,
+                cleanup_token: token,
+                time_owner_settled: null,
                 delivery_status: "pending",
                 time_created: now,
                 time_updated: now,
@@ -437,55 +490,79 @@ export const layer = Layer.effect(
                 : Effect.die(error),
             ),
           )
-      }),
+        const owner = { token, state: "reserved" as const, lost: yield* Deferred.make<void>() }
+        owned.set(input.taskID, owner)
+        // Preparation can take longer than a lease (history, consent, clone).
+        // One generation-bound heartbeat owns the whole reserve-to-run interval.
+        const heartbeat = yield* Effect.gen(function* () {
+          while (true) {
+            yield* Effect.sleep(heartbeatInterval)
+            const now = yield* Clock.currentTimeMillis
+            const row = yield* db.update(BackgroundJobTable)
+              .set({ heartbeat_at: now, lease_until: now + leaseDuration, time_updated: now })
+              .where(and(eq(BackgroundJobTable.id, input.taskID), eq(BackgroundJobTable.type, "task"),
+                eq(BackgroundJobTable.status, "running"), eq(BackgroundJobTable.owner_id, ownerID),
+                eq(BackgroundJobTable.cleanup_token, token)))
+              .returning({ id: BackgroundJobTable.id }).get().pipe(Effect.orDie)
+            if (!row) return
+          }
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(owner.lost, undefined)),
+          Effect.interruptible,
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
+        owned.get(input.taskID)!.heartbeat = heartbeat
+        return result
+      }, Effect.uninterruptible),
       launch: Effect.fn("TaskJob.launch")(function* (taskID, run) {
+        const owner = owned.get(taskID)
+        if (!owner || owner.state !== "reserved") return yield* Effect.die(`Task job is not reserved here: ${taskID}`)
         const info = yield* read(taskID)
-        if (!info || info.status !== "running" || info.ownerID !== ownerID)
+        const row = yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, taskID)).get().pipe(Effect.orDie)
+        if (!info || info.status !== "running" || info.ownerID !== ownerID || row?.cleanup_token !== owner.token || owner.state !== "reserved")
           return yield* Effect.die(`Task job is not owned by this process: ${taskID}`)
-        const ownership = Effect.gen(function* () {
-          yield* Effect.sleep(heartbeatInterval)
-          const now = yield* Clock.currentTimeMillis
-          const row = yield* db
-            .update(BackgroundJobTable)
-            .set({ heartbeat_at: now, lease_until: now + leaseDuration, time_updated: now })
-            .where(
-              and(
-                eq(BackgroundJobTable.id, taskID),
-                eq(BackgroundJobTable.type, "task"),
-                eq(BackgroundJobTable.status, "running"),
-                eq(BackgroundJobTable.owner_id, ownerID),
-              ),
-            )
-            .returning({ id: BackgroundJobTable.id })
-            .get()
-            .pipe(Effect.orDie)
-          if (!row) return yield* Effect.interrupt
-        }).pipe(Effect.forever)
-        yield* background.start({
+        owner.state = "running"
+        const started = yield* background.start({
           id: taskID,
           type: "task",
           title: info.title,
           metadata: info.metadata,
+          onSettled: acknowledge(taskID, owner.token),
           run: Effect.raceFirst(
             run.pipe(
               Effect.matchCauseEffect({
-                onSuccess: (output) => settle(taskID, "completed", output).pipe(Effect.as(output)),
+                onSuccess: (output) => settle(taskID, owner.token, "completed", output).pipe(Effect.as(output)),
                 onFailure: (cause) => {
                   if (Cause.hasInterruptsOnly(cause))
-                    return settle(taskID, "cancelled").pipe(Effect.andThen(Effect.failCause(cause)))
+                    return settle(taskID, owner.token, "cancelled").pipe(Effect.andThen(Effect.failCause(cause)))
                   const error = Cause.squash(cause)
-                  return settle(taskID, "error", error instanceof Error ? error.message : String(error)).pipe(
+                  return settle(taskID, owner.token, "error", error instanceof Error ? error.message : String(error)).pipe(
                     Effect.andThen(Effect.failCause(cause)),
                   )
                 },
               }),
             ),
-            ownership,
-          ),
+            Deferred.await(owner.lost).pipe(Effect.andThen(Effect.interrupt)),
+          ).pipe(Effect.interruptible),
         })
+        if (!started.accepted) {
+          owner.state = "closing"
+          yield* settle(taskID, owner.token, "error", "Task execution scope was not accepted; prior job is still draining")
+          yield* acknowledge(taskID, owner.token)
+          return yield* Effect.die(`Task execution scope was not accepted: ${taskID}`)
+        }
         return info
+      }, Effect.uninterruptible),
+      fail: Effect.fn("TaskJob.fail")(function* (taskID, error) {
+        const owner = owned.get(taskID)
+        const reserved = owner?.state === "reserved"
+        if (reserved) owner.state = "closing"
+        if (!owner) return yield* read(taskID)
+        const result = yield* settle(taskID, owner.token, "error", error)
+        if (reserved) yield* acknowledge(taskID, owner.token)
+        else yield* background.cancel(taskID).pipe(Effect.timeoutOption(2_000), Effect.ignore)
+        return result
       }),
-      fail: (taskID, error) => settle(taskID, "error", error),
       get,
       wait: Effect.fn("TaskJob.wait")(function* (taskID, timeout) {
         const info = yield* get(taskID)
@@ -535,13 +612,12 @@ export const layer = Layer.effect(
             status: "cancelled",
           })
         yield* background.cancel(taskID).pipe(Effect.timeoutOption(2_000), Effect.ignore)
+        // Cancellation does not prove an in-flight preparation has drained.
+        // Its caller confirms that boundary through fail, or the service closes.
         return row ? fromRow(row) : yield* read(taskID)
       }),
     })
   }),
 )
 
-export const defaultLayer = layer.pipe(
-  Layer.provide(BackgroundJob.defaultLayer),
-  Layer.provide(EventV2.defaultLayer),
-)
+export const defaultLayer = layer.pipe(Layer.provide(BackgroundJob.defaultLayer), Layer.provide(EventV2.defaultLayer))

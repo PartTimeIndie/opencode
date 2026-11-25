@@ -38,6 +38,36 @@ describe("SessionResume", () => {
     expect(decided).toEqual({ action: "terminal", failure })
   })
 
+  test("a short-term provider throttle keeps retrying longer than transport failures", () => {
+    const failure = SessionFailure.make("provider.rate-limit")
+    expect(SessionResume.policy("provider.rate-limit")).toMatchObject({
+      action: "auto-retry",
+      maxAttempts: 8,
+      maxDelayMs: 60_000,
+    })
+    expect([1, 2, 3, 4, 5, 6, 7, 8].map((attempt) => SessionResume.delayMs("provider.rate-limit", attempt))).toEqual([
+      2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000,
+    ])
+    // The sixth attempt, where transport recovery already settles, is still retried.
+    expect(SessionResume.decide({ failure, attempt: 5 })).toMatchObject({ action: "auto-retry", attempt: 6, remaining: 2 })
+    expect(SessionResume.decide({ failure, attempt: SessionResume.THROTTLE_RETRY_ATTEMPTS })).toEqual({
+      action: "terminal",
+      failure,
+    })
+    const budget = SessionResume.recoveryBudget()
+    expect(Array.from({ length: 10 }, () => budget.next("provider.rate-limit"))).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, undefined, undefined,
+    ])
+    // Callers without a failure code keep the shared transport-sized allowance.
+    const transport = SessionResume.recoveryBudget()
+    expect(Array.from({ length: 7 }, () => transport.next())).toEqual([1, 2, 3, 4, 5, undefined, undefined])
+  })
+
+  test("an exhausted plan quota stays terminal although it shares the rate-limit code", () => {
+    const failure = SessionFailure.make("provider.rate-limit", { retryability: "none", remediation: "report" })
+    expect(SessionResume.decide({ failure, attempt: 0 })).toEqual({ action: "terminal", failure })
+  })
+
   test("user-stop-no-retry: user.stop never auto-retries or resumes", () => {
     const failure = SessionFailure.make("user.stop")
     expect(SessionResume.policy("user.stop").action).toBe("terminal")

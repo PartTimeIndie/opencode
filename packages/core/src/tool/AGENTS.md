@@ -9,6 +9,11 @@ This folder owns Core's one local tool representation, process and Location regi
 - `tools.ts` exposes the registration-only `Tools.Service` view used by Location producers.
 - `registry.ts` stores only canonical tools, overlays Location registrations over application registrations, derives definitions, invokes tools, and applies generic output bounding.
 
+Fanout reviewer call IDs are deterministic local correlation keys, not host tool
+calls. Permission attribution uses the actual enclosing fanout call through a
+private host-owned boundary; never infer authority from a reviewer suffix. This
+separation does not itself authorize history capture or child admission.
+
 Do not add a second executable entry type, registry-owned executor, authorization callback, output-path callback, or legacy normalization path.
 
 ## Construction
@@ -29,7 +34,9 @@ const source = {
 
 Leaves own resolution, permission, and side-effect ordering. Translate only expected typed errors into `ToolFailure`; do not use `catchCause`, because interruption and defects must survive.
 
-Manual-only skills (`disable-model-invocation: true`) remain in the user slash catalog, but their names and descriptions are excluded from model guidance. A model skill call needs a leading canonical slash or alias in the durable user prompt before that assistant call; missing intent fails closed. Keep permission checks and host-granted capability leases after this gate. Test discovery, context updates, explicit loading and denied calls together.
+Manual-only skills (`disable-model-invocation: true`, the global legacy `skill_invocation.manual` list, or an explicit `manual` invocation entry) remain in the user slash catalog, but their names and descriptions stay out of model guidance unless an explicit entry sets `visible: true`. A model skill call needs an exact whitespace-delimited canonical slash or alias in the matching promoted, interactive durable input before that assistant call, including after prose or other slash skills; a toolbar-armed submit satisfies the gate through its appended token. Plugin, unattested, mismatched or later inputs do not grant selection. Keep permission checks and host-granted capability leases after this gate. Test discovery, context updates, explicit loading and denied calls together.
+
+Effective invocation policy resolves per skill in `../skill/policy.ts`: explicit agent entry → explicit global `skill_invocation.entries` → legacy default (frontmatter flag or legacy manual list) → built-in default (visible, `allow`). Catalog visibility is independent of invocation: a hidden skill can be `allow`/`ask`, and `manual` never blocks the user slash catalog. `ask` injects an extra evaluated permission rule layer (never SINGLE_USE metadata); explicit selection satisfies only that skill ask, never deny rules or tool permissions. Skill commands and synthetic injection use the same full permission assertion as the tool; deny and unreadable configuration fail closed before command expansion or hooks, and shell expansions need their own bash permission.
 
 OpenCode's global `skill_invocation.manual` restricts only the listed exact canonical skill names after source precedence. Aliases cannot expand the list and project config cannot relax it. Unlisted skills retain their existing modes and project exceptions; never turn a composer-toolbar-only request into a catalog-wide manual default. Keep the user catalog and explicit selection intact, and never rewrite shared Claude/Codex sources for this OpenCode-only policy. Image-generation tools are separate from skill invocation.
 
@@ -63,7 +70,13 @@ Both are scoped:
 
 The registry has no `PermissionV2.Service` dependency and performs no execution authorization. An internal built-in-only operation attaches a permission action solely to preserve whole-tool definition filtering; it is not part of public `Tool.make`. Most tools default to their registered name; `edit`, `write`, and `apply_patch` declare the shared `edit` action.
 
-Definition filtering is catalog visibility, not execution authorization. A call still executes the captured leaf policy if it reaches settlement.
+Definition filtering controls model-request visibility, not configuration discovery or execution authorization. A call still executes the captured leaf policy if it reaches settlement.
+
+Contract-scoped tools (for example the scheduler result tool) stay advertised for an open scheduled run: the registry advertises them when the current prompt carries their marker or when the session's latest host-injected contracted prompt is still unsettled. `ToolRegistry.openContractMarkers` derives that state from projected history (latest user prompt with the marker, closed by a completed call of the bound tool), and `contractTools()` exposes the name-to-marker pairs the runner feeds back through `MaterializationContext.openContractMarkers`. Ordinary interjected user inputs and allowed agent switches therefore cannot drop a run's result tool, while unrelated sessions and settled runs stay clean. Filtering remains visibility-only, and the configuration catalog still excludes contract tools.
+
+Read-only reviewers inspect Git through `git_status` (`scope: "summary"` or `"patch"`), never by granting a general shell. Availability is the intersection of the parent agent's delegable tools, the review agent's permissions, the registered workflow's tools and the saved child policy. Explicit project agent lists replace global lists: enabling only the reviewer or global build entry is insufficient. Check actual runner `tool_ids` and all owning config layers; do not bypass parent ceilings or widen existing child snapshots. Exercise production child requests and real staged/unstaged Git output in regression tests. Keep Git inspection non-executable (no fsmonitor, external diff or textconv callbacks), strip inherited `GIT_*` redirection and retain capture-loss markers.
+
+The Settings configuration catalog lists registered, user-configurable tools and their input schemas independently of Session capability leases, agent allowlists and execution permissions. Never build it from `materialize()` or activate skills just to populate Settings. Keep turn-only contract tools excluded, preserve Location/application collision rules, and keep all runtime filters and settlement checks in `materialize()`. Test catalog discovery before activation together with denied, unlisted and revoked runtime access; both tool-list endpoints must use the configuration catalog.
 
 ## Output
 

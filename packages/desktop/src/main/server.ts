@@ -1,4 +1,5 @@
 import { dirname, join } from "node:path"
+import { randomUUID } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { app, utilityProcess } from "electron"
 import type { Details } from "electron"
@@ -6,25 +7,46 @@ import { getLogger } from "./logging"
 import { getUserShell, loadShellEnv } from "./shell-env"
 import { getStore } from "./store"
 import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
+import { setTimeout } from "node:timers/promises"
+import { createServerSupervisor, type ServerState } from "./server-supervisor"
+import { createSidecarStop, forceSidecarStop } from "./sidecar-stop"
+import { formatSidecarFatalError } from "./sidecar-fatal-error"
+import { createSidecarActivityLog, parseSidecarDiagnostic, type SidecarActivityUpdate, type SidecarDiagnostic } from "./sidecar-diagnostics"
 
 export type HealthCheck = { wait: Promise<void> }
 
 type SidecarMessage =
   | { type: "ready" }
   | { type: "stopped" }
+  | { type: "execution-owner"; ownerID: string }
+  | { type: "diagnostic"; sample: SidecarDiagnostic }
+  | { type: "activity"; update: SidecarActivityUpdate }
   | { type: "error"; error: { message: string; stack?: string } }
 
-export type SidecarListener = { stop: () => Promise<void> }
+export type SidecarListener = {
+  stop: () => Promise<void>
+  forceStop: () => Promise<void>
+  retry: () => void
+  snapshot: () => ServerState
+}
+
+export type SidecarExit = {
+  pid: number | undefined
+  uptimeMs: number
+  activity?: ReturnType<ReturnType<typeof createSidecarActivityLog>["snapshot"]>
+  lastSample?: SidecarDiagnostic & { sampledAt: number }
+}
 
 const SIDECAR_SERVICE_NAME = "opencode server"
-const SIDECAR_START_STALL_TIMEOUT = 60_000
-const SIDECAR_STOP_TIMEOUT = 6_000
 
 type SpawnLocalServerOptions = {
   userDataPath: string
   onStdout?: (message: string) => void
   onStderr?: (message: string) => void
-  onExit?: (code: number) => void
+  onSpawn?: (pid: number | undefined) => void
+  onDiagnostic?: (sample: SidecarDiagnostic & { pid: number | undefined }) => void
+  onExit?: (code: number, detail: SidecarExit) => void
+  onState?: (state: ServerState) => void
 }
 
 export function getDefaultServerUrl(): string | null {
@@ -47,6 +69,8 @@ export function preferAppEnv(userDataPath: string, browserAutomationEnabled: boo
     ...(shell ? loadShellEnv(shell, getLogger()) : null),
     OPENCODE_EXPERIMENTAL_ICON_DISCOVERY: "true",
     OPENCODE_EXPERIMENTAL_FILEWATCHER: "true",
+    // The Windows native watcher can terminate the entire desktop sidecar (watcher.node / 0xc0000409).
+    ...(process.platform === "win32" ? { OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "true" } : {}),
     OPENCODE_CLIENT: "desktop",
     XDG_STATE_HOME: process.env.XDG_STATE_HOME ?? userDataPath,
   })
@@ -64,185 +88,101 @@ export async function spawnLocalServer(
   options: SpawnLocalServerOptions,
 ) {
   const sidecar = join(dirname(fileURLToPath(import.meta.url)), "sidecar.js")
-  let child: ReturnType<typeof utilityProcess.fork> | undefined
-  let currentExit: Promise<number> | undefined
-  let stopping = false
-  let restartTimer: NodeJS.Timeout | undefined
-  let replacementRunning = false
-  let replacementPromise: Promise<void> | undefined
-  let restartAttempt = 0
-
-  const startChild = async () => {
-    const nextChild = utilityProcess.fork(sidecar, [], {
-      cwd: process.cwd(),
-      env: createSidecarEnv(),
-      serviceName: SIDECAR_SERVICE_NAME,
-      stdio: "pipe",
-    })
-    child = nextChild
-    let ready = false
-    const exit = defer<number>()
-    currentExit = exit.promise
-
-    const onProcessGone = (_event: unknown, details: Details) => {
-      if (details.type !== "Utility" || details.name !== SIDECAR_SERVICE_NAME) return
-      options.onStderr?.(`utility process gone reason=${details.reason} exitCode=${details.exitCode}`)
-    }
-
-    app.on("child-process-gone", onProcessGone)
-    nextChild.once("exit", (code) => {
-      app.off("child-process-gone", onProcessGone)
-      if (child === nextChild) child = undefined
-      options.onExit?.(code)
-      exit.resolve(code)
-      if (ready && !stopping) scheduleRestart()
-    })
-    nextChild.on("error", (error) => options.onStderr?.(`utility process error: ${serializeError(error).message}`))
-
-    nextChild.stdout?.on("data", (chunk: Buffer) => options.onStdout?.(chunk.toString("utf8").trimEnd()))
-    nextChild.stderr?.on("data", (chunk: Buffer) => options.onStderr?.(chunk.toString("utf8").trimEnd()))
-
-    await new Promise<void>((resolve, reject) => {
-      let done = false
-      let timeout: NodeJS.Timeout
-
-      const fail = (error: Error) => {
-        if (done) return
-        done = true
-        cleanup()
-        reject(error)
-      }
-
-      const refreshTimeout = () => {
-        clearTimeout(timeout)
-        timeout = setTimeout(() => {
-          fail(new Error(`Sidecar did not become ready within ${SIDECAR_START_STALL_TIMEOUT}ms: ${sidecar}`))
-        }, SIDECAR_START_STALL_TIMEOUT)
-      }
-
-      const onMessage = (message: SidecarMessage) => {
-        if (message.type === "ready") {
-          if (done) return
-          done = true
-          ready = true
-          cleanup()
-          resolve()
-          return
-        }
-        if (message.type === "error") {
-          fail(Object.assign(new Error(message.error.message), { stack: message.error.stack }))
-        }
-      }
-      const onExit = (code: number) => {
-        fail(new Error(`Sidecar exited before ready with code ${code}`))
-      }
-      const cleanup = () => {
-        clearTimeout(timeout)
-        nextChild.off("message", onMessage)
-        nextChild.off("exit", onExit)
-      }
-
-      nextChild.on("message", onMessage)
-      nextChild.on("exit", onExit)
-      refreshTimeout()
-      nextChild.postMessage({
-        type: "start",
-        hostname,
-        port,
-        password,
-        userDataPath: options.userDataPath,
+  const previousOwners = new Set<string>()
+  const supervisor = createServerSupervisor({
+    changed: (state) => options.onState?.(state),
+    error: (error) => options.onStderr?.(`sidecar recovery failed: ${serializeError(error).message}`),
+    spawn: () => {
+      const ownerID = `desktop_${randomUUID()}`
+      const spawnedAt = Date.now()
+      let acknowledged = false
+      const child = utilityProcess.fork(sidecar, [], {
+        cwd: process.cwd(),
+        env: createSidecarEnv(),
+        serviceName: SIDECAR_SERVICE_NAME,
+        stdio: "pipe",
       })
-    }).catch((error) => {
-      if (child === nextChild) child = undefined
-      nextChild.kill()
-      throw error
-    })
-
-    const url = `http://${hostname}:${port}`
-    let healthy = false
-    const gone = exit.promise.then((code) => {
-      if (healthy) return
-      throw new Error(`Sidecar exited before health check passed with code ${code}`)
-    })
-    const readyHealth = (async () => {
-      while (true) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-        if (await checkHealth(url, password)) {
-          healthy = true
-          return
-        }
+      let pid = child.pid
+      const activity = createSidecarActivityLog()
+      let lastSample: (SidecarDiagnostic & { sampledAt: number }) | undefined
+      child.once("spawn", () => { pid = child.pid; options.onSpawn?.(pid) })
+      const exit = defer<number>()
+      let ended = false
+      const onProcessGone = (_event: unknown, details: Details) => {
+        if (details.type !== "Utility" || details.name !== SIDECAR_SERVICE_NAME) return
+        options.onStderr?.(`utility process gone pid=${pid ?? "unknown"} reason=${details.reason} exitCode=${details.exitCode}`)
       }
-    })()
-
-    return { health: Promise.race([readyHealth, gone]) }
-  }
-
-  function scheduleRestart() {
-    if (stopping || restartTimer || replacementRunning) return
-    const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(restartAttempt, 5))
-    restartAttempt++
-    options.onStderr?.(`sidecar restart scheduled in ${delayMs}ms`)
-    restartTimer = setTimeout(() => {
-      restartTimer = undefined
-      const nextReplacement = runReplacement()
-      replacementPromise = nextReplacement
-      void nextReplacement.finally(() => {
-        if (replacementPromise === nextReplacement) replacementPromise = undefined
+      app.on("child-process-gone", onProcessGone)
+      child.on("message", (message: SidecarMessage) => {
+        if (ended) return
+        if (message.type === "execution-owner" && message.ownerID === ownerID) acknowledged = true
+        if (message.type === "activity") activity.accept(message.update)
+        if (message.type === "diagnostic") {
+          const sample = parseSidecarDiagnostic(message.sample)
+          if (!sample) return
+          lastSample = { ...sample, sampledAt: Date.now() }
+          options.onDiagnostic?.({ pid, ...sample })
+        }
       })
-    }, delayMs)
-  }
-
-  async function runReplacement() {
-    if (stopping || replacementRunning) return
-    replacementRunning = true
-    try {
-      const replacement = await startChild()
-      await replacement.health
-      restartAttempt = 0
-      options.onStdout?.("sidecar restart completed")
-    } catch (error) {
-      options.onStderr?.(`sidecar restart failed: ${serializeError(error).message}`)
-      if (!stopping) scheduleRestart()
-    } finally {
-      replacementRunning = false
-      if (!stopping && !child) scheduleRestart()
-    }
-  }
-
-  const initial = await startChild().catch((error) => {
-    stopping = true
-    child?.kill()
-    throw error
-  })
-
-  let stoppingPromise: Promise<void> | undefined
-
-  return {
-    listener: {
-      stop: () => {
-        if (stoppingPromise) return stoppingPromise
-        stopping = true
-        if (restartTimer) clearTimeout(restartTimer)
-        stoppingPromise = (async () => {
-          const current = child
-          const exit = currentExit
-          if (!current || !exit) return
-          current.postMessage({ type: "stop" })
-          await Promise.race([
-            exit.then(() => undefined),
-            delay(SIDECAR_STOP_TIMEOUT).then(() => {
-              current.kill()
-            }),
-          ])
-        })()
-        return stoppingPromise
-      },
+      // Keep an error observer after the startup listener is removed.
+      child.on("error", (type, location, report) => options.onStderr?.(formatSidecarFatalError(type, location, report)))
+      child.once("exit", (code) => {
+        ended = true
+        if (acknowledged && supervisor.snapshot().phase !== "stopped") {
+          previousOwners.add(ownerID)
+          const oldest = previousOwners.values().next().value
+          if (previousOwners.size > 32 && oldest) previousOwners.delete(oldest)
+        }
+        app.off("child-process-gone", onProcessGone)
+        exit.resolve(code)
+        options.onExit?.(code, {
+          pid,
+          uptimeMs: Date.now() - spawnedAt,
+          ...(code !== 0 ? { activity: activity.snapshot(), lastSample } : {}),
+        })
+      })
+      child.stdout?.on("data", (chunk: Buffer) => options.onStdout?.(chunk.toString("utf8").trimEnd()))
+      child.stderr?.on("data", (chunk: Buffer) => options.onStderr?.(chunk.toString("utf8").trimEnd()))
+      return {
+        exited: exit.promise,
+        ready: async (signal: AbortSignal) => {
+          signal.throwIfAborted()
+          await new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+              child.off("message", message)
+              child.off("error", fail)
+              signal.removeEventListener("abort", aborted)
+            }
+            const fail = (error: unknown) => { cleanup(); reject(error) }
+            const aborted = () => fail(signal.reason)
+            const message = (value: SidecarMessage) => {
+              if (value.type === "ready") { cleanup(); resolve() }
+              if (value.type === "error") fail(new Error(value.error.message))
+            }
+            signal.addEventListener("abort", aborted, { once: true })
+            child.on("message", message)
+            child.on("error", fail)
+            child.postMessage({ type: "start", hostname, port, password, userDataPath: options.userDataPath,
+              recovery: { ownerID, previousOwners: [...previousOwners] },
+            })
+          })
+          while (!signal.aborted) {
+            if (await checkHealth(`http://${hostname}:${port}`, password, 3000, signal)) return
+            await setTimeout(100, undefined, { signal })
+          }
+          signal.throwIfAborted()
+        },
+        stop: createSidecarStop({ requestStop: () => child.postMessage({ type: "stop" }), exited: exit.promise, isExited: () => ended }),
+        forceStop: () => forceSidecarStop({ kill: () => { child.kill() }, exited: exit.promise, isExited: () => ended }),
+      }
     },
-    health: { wait: initial.health },
-  }
+  })
+  // Publish the listener immediately so quitting during startup can cancel it.
+  const health = supervisor.start()
+  return { listener: supervisor, health: { wait: health } }
 }
 
-export async function checkHealth(url: string, password?: string | null, timeoutMs = 3000): Promise<boolean> {
+export async function checkHealth(url: string, password?: string | null, timeoutMs = 3000, signal?: AbortSignal): Promise<boolean> {
   let healthUrl: URL
   try {
     healthUrl = new URL("/global/health", url)
@@ -260,7 +200,7 @@ export async function checkHealth(url: string, password?: string | null, timeout
     const res = await fetch(healthUrl, {
       method: "GET",
       headers,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     })
     return res.ok
   } catch {
@@ -289,10 +229,6 @@ function createSidecarEnv(): Record<string, string> {
   env.OPENCODE_DEFER_BACKGROUND_STARTUP = "1"
   env.OPENCODE_NODE_WORKER = join(dirname(fileURLToPath(import.meta.url)), "storage-worker.js")
   return env
-}
-
-function delay(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
 
 function serializeError(error: unknown) {

@@ -125,7 +125,7 @@ function modelPickerRecentLimit(value: number | undefined) {
 }
 
 export function followupSetting(value: unknown): Settings["general"]["followup"] {
-  return value === "steer" ? "steer" : "queue"
+  return value === "queue" ? "queue" : "steer"
 }
 
 function publishSidebarSessionLimit(value: number) {
@@ -169,7 +169,7 @@ export const defaultSettings: Settings = {
   general: {
     autoSave: true,
     releaseNotes: true,
-    followup: "queue",
+    followup: "steer",
     showFileTree: false,
     showNavigation: false,
     showSearch: false,
@@ -242,9 +242,10 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 /** Pure migration contract for persisted settings.v3 blobs; exported for regression tests. */
 export function migrateSettings(value: unknown) {
   if (!isRecord(value)) return value
-  const general = isRecord(value.general) ? value.general : undefined
   const appearance = isRecord(value.appearance) ? value.appearance : undefined
-  const migrated = {
+  // Delivery is a user choice, not a storage-schema migration. Rewriting steer
+  // to queue silently defers corrections until the running activity has ended.
+  return {
     ...value,
     appearance: {
       ...defaultSettings.appearance,
@@ -258,15 +259,6 @@ export function migrateSettings(value: unknown) {
     logging: {
       ...defaultSettings.logging,
       ...(isRecord(value.logging) ? value.logging : {}),
-    },
-  }
-  if (!general || general.followup !== "steer" || general.followupQueueMigrated === true) return migrated
-  return {
-    ...migrated,
-    general: {
-      ...general,
-      followup: "queue",
-      followupQueueMigrated: true,
     },
   }
 }

@@ -15,6 +15,7 @@
         "host:projects",
         "host:navigation",
         "host:sessions",
+        "host:session-attention-read",
         "host:http"
       ]
     }

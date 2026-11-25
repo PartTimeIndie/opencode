@@ -2,10 +2,12 @@ import { beforeAll, describe, expect, mock, test } from "bun:test"
 import { createRoot, createSignal, getOwner, type Owner } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { NormalizedProviderListResponse } from "@opencode-ai/ui/context"
+import type { Project } from "@opencode-ai/sdk/v2/client"
 import type { State } from "./types"
 import type { QueryOptionsApi } from "../server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { directoryKey } from "./utils"
+import { projectInventoryMetadata } from "../project-inventory"
 
 let createChildStoreManager: typeof import("./child-store").createChildStoreManager
 const querySingles: Array<() => { queryKey?: unknown[]; enabled?: boolean; queryFn?: unknown }> = []
@@ -91,6 +93,33 @@ beforeAll(async () => {
 })
 
 describe("createChildStoreManager", () => {
+  test("listing many project aliases does not allocate query observers or evict the active store", () => {
+    const before = providerQueryOptionsCreated
+    const dispose = createOwner((owner) => {
+      const manager = createChildStoreManager({
+        owner, scope: ServerScope.local, persist,
+        isBooting: () => false, isLoadingSessions: () => false,
+        onBootstrap() {}, onMcp() {}, onDispose() {},
+        initialSessionLimit: () => 4, translate: (key) => key,
+        queryOptions: queryOptionsApi, global: { provider: () => provider },
+      })
+      const active = manager.peek("/active", { bootstrap: false })
+      active[1]("projectMeta", { name: "Active project" })
+      for (let pass = 0; pass < 10; pass++) {
+        for (let index = 0; index < 100; index++) {
+          expect(projectInventoryMetadata(undefined, [`/project-${index}`, `/alias-${index}`], manager.existing)).toBeUndefined()
+        }
+      }
+      expect(Object.keys(manager.children)).toEqual(["/active"])
+      expect(manager.existing("/active")).toBe(active)
+      expect(projectInventoryMetadata(undefined, ["/missing", "/active"], manager.existing)).toEqual({ name: "Active project" })
+      expect(projectInventoryMetadata({ worktree: "/active" } as Project, ["/active"], () => {
+        throw new Error("server metadata must not read local stores")
+      })).toBeUndefined()
+    })
+    dispose()
+    expect(providerQueryOptionsCreated - before).toBe(1)
+  })
   test("does not evict the active directory during mark", () => {
     const owner = createRoot((dispose) => {
       const current = getOwner()

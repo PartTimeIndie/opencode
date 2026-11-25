@@ -28,7 +28,7 @@ import { testEffect } from "../lib/effect"
 const it = testEffect(Database.layerFromPath(":memory:"))
 
 for (const ending of endings) {
-  it.effect(`diagnosis C: historical ending ${ending.seq} is ${ending.expected}`, () =>
+  it.effect(`diagnosis C: synthetic ending ${ending.seq} is ${ending.expected}`, () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make(`ses_ending_${ending.seq}`)
       const messageID = SessionV1.MessageID.ascending()

@@ -1044,7 +1044,18 @@
   }
 
   .settings-v2-agent-tool-controls {
-    justify-content: space-between;
+    min-width: 0;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-v2-agent-tool-identity {
+    width: 100%;
+  }
+
+  .settings-v2-agent-tool-scope summary {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 

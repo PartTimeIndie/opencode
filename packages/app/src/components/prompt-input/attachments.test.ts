@@ -3,6 +3,11 @@ import { attachmentMime, pickAttachmentFiles, sameClipboardFile, uniqueClipboard
 import { pasteMode } from "./paste"
 
 describe("attachmentMime", () => {
+  test("keeps short archive headers out of text decoding", async () => {
+    for (const [name, mime] of [["save.7z", "application/x-7z-compressed"], ["save.zip", "application/zip"], ["save.tar.gz", "application/gzip"]]) {
+      expect(await attachmentMime(new File(["PK"], name))).toBe(mime)
+    }
+  })
   test("keeps PDFs when the browser reports the mime", async () => {
     const file = new File(["%PDF-1.7"], "guide.pdf", { type: "application/pdf" })
     expect(await attachmentMime(file)).toBe("application/pdf")

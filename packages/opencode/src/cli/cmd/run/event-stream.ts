@@ -90,16 +90,35 @@ export async function waitForTurnCompletion(input: {
   wait: () => Promise<unknown>
   timeoutMs?: number
   pollMs?: number
+  extensionMs?: number
+  maxExtensions?: number
+  readDurable?: () => Promise<"done" | "incomplete" | "unknown" | undefined>
 }) {
   // A deferred desktop completion listener can start after 65s, then claim for
   // 55s; a 5s scan interval completes that bounded terminal wait.
   const timeoutMs = input.timeoutMs ?? 125_000
+  // The server decides the verdict asynchronously: a continuation successor
+  // defers it, and an evaluation retry releases its claim with exponential
+  // backoff (5s up to 5min). Under load those decisions can outlast the plain
+  // terminal deadline, which used to fail the whole run with a missing-verdict
+  // error even though the still-open event stream would deliver the verdict
+  // moments later. Extensions are opt-in and bounded so callers keep a hard
+  // ceiling; a closed event stream can never gain more wait.
+  const extensionMs = input.extensionMs ?? 0
+  const maxExtensions = input.maxExtensions ?? 0
+  let extensions = 0
   let activityID: string | undefined
   let waitedActivityID: string | undefined
   let deadline = Date.now() + timeoutMs
+  let nextDurableRead = 0
   while (!input.interrupted()) {
     const verdict = input.tracker.get(input.messageID)
     if (verdict !== undefined) return verdict
+    if (input.readDurable && Date.now() >= nextDurableRead) {
+      nextDurableRead = Date.now() + 1_000
+      const durable = await input.readDurable()
+      if (durable !== undefined) return durable
+    }
     const activity = input.tracker.activity(input.messageID)
     if (activity?.activityID !== activityID) {
       activityID = activity?.activityID
@@ -113,9 +132,28 @@ export async function waitForTurnCompletion(input: {
       deadline = Date.now() + timeoutMs
       continue
     }
-    if (input.done() || Date.now() >= deadline) return input.tracker.get(input.messageID)
+    if (input.done()) return input.tracker.get(input.messageID)
+    if (Date.now() >= deadline) {
+      if (extensions >= maxExtensions) return input.tracker.get(input.messageID)
+      extensions += 1
+      deadline = Date.now() + extensionMs
+      continue
+    }
     await Promise.race([input.completed, Bun.sleep(input.pollMs ?? 25)])
   }
+}
+
+export function turnCompletionError(verdict: "done" | "incomplete" | "unknown" | undefined, required: boolean) {
+  if (verdict === "done" || (verdict === undefined && !required)) return
+  const error = new Error(
+    verdict === "incomplete"
+      ? "Turn remained incomplete after automatic continuations"
+      : verdict === "unknown"
+        ? "Turn completion verdict unavailable: the bound final verdict is unknown"
+        : "Turn completion verdict unavailable: no bound final verdict arrived before the completion wait ended",
+  )
+  error.name = verdict === "incomplete" ? "TurnCompletionIncompleteError" : "TurnCompletionVerdictUnavailableError"
+  return error
 }
 
 export async function waitForRunCompletion(input: { completed: Promise<string | undefined>; wait: Promise<unknown> }) {
@@ -129,6 +167,37 @@ export async function waitForRunCompletion(input: { completed: Promise<string | 
       return input.wait
     }),
   ])
+}
+
+export async function waitForTerminalAssistant<T>(input: {
+  wait: Promise<unknown>
+  observe: (signal?: AbortSignal) => Promise<{ terminal: boolean; assistant?: T }>
+  interrupted: () => boolean
+  pollMs?: number
+}): Promise<T | undefined> {
+  const controller = new AbortController()
+  const stopped = new Promise<void>((resolve) => {
+    if (controller.signal.aborted) resolve()
+    else controller.signal.addEventListener("abort", () => resolve(), { once: true })
+  })
+  const poll = async (): Promise<T | undefined> => {
+    while (!input.interrupted()) {
+      if (controller.signal.aborted) return undefined
+      const state = await input.observe(controller.signal)
+      // A settled wait — fulfilled or rejected — ends the race lifetime: a late
+      // observation must never start or continue a further polling round.
+      if (controller.signal.aborted || input.interrupted()) return undefined
+      if (state.terminal && state.assistant) return state.assistant
+      await Promise.race([Bun.sleep(input.pollMs ?? 250), stopped])
+      if (controller.signal.aborted || input.interrupted()) return undefined
+    }
+    return undefined
+  }
+  try {
+    return await Promise.race([input.wait.then(() => undefined), poll()])
+  } finally {
+    controller.abort()
+  }
 }
 
 export async function settleEventStream(input: {

@@ -18,6 +18,7 @@ import type { ModelV2 } from "./model"
 import type { Catalog } from "./catalog"
 import { EventV2 } from "./event"
 import { KeyedMutex } from "./effect/keyed-mutex"
+import { CrashActivity } from "./observability/crash-activity"
 import type { SessionSchema } from "./session/schema"
 
 export const ID = Schema.String.pipe(Schema.brand("Plugin.ID"))
@@ -245,7 +246,7 @@ export const layer = Layer.effect(
             const preflight = findConflict()
             if (preflight) return yield* Effect.die(new Error(`Plugin ${input.id} request profile conflicts with ${preflight.id}`))
             const childScope = yield* Scope.fork(scope)
-            const result = yield* input.effect.pipe(
+            const result = yield* CrashActivity.track({ kind: "plugin", pluginID: input.id, name: "core.initialize" }, input.effect.pipe(
               Scope.provide(childScope),
               Effect.withSpan("Plugin.load", {
                 attributes: {
@@ -253,7 +254,7 @@ export const layer = Layer.effect(
                 },
               }),
               Effect.onExit((exit) => (Exit.isFailure(exit) ? Scope.close(childScope, exit) : Effect.void)),
-            )
+            ))
             const conflict = findConflict()
             if (conflict) {
               yield* Scope.close(childScope, Exit.void)
@@ -305,7 +306,10 @@ export const layer = Layer.effect(
               next[field] = draft
             }
           }
-          const exit = yield* match(next as any).pipe(
+          const operation = { kind: "plugin", pluginID: item.id, name: `core.${name}` } as const
+          const callback = CrashActivity.trackSync({ ...operation, name: `${operation.name}.callback` },
+            () => match(next as any))
+          const exit = yield* CrashActivity.track(operation, callback).pipe(
             Effect.withSpan(`Plugin.hook.${name}`, {
               attributes: {
                 plugin: item.id,

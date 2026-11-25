@@ -794,6 +794,46 @@ Recent work
     ])
   })
 
+  test("replays only completed fanout receipts after a local cancellation", () => {
+    const messages = toLLMMessages(
+      [
+        new SessionMessage.Assistant({
+          id: id("interrupted-fanout"),
+          type: "assistant",
+          agent: "build",
+          model: { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") },
+          content: [
+            new SessionMessage.AssistantTool({
+              type: "tool",
+              id: "fanout-call",
+              name: "multi_agent_fanout",
+              state: new SessionMessage.ToolStateError({
+                status: "error",
+                input: { workflow: "review" },
+                content: [],
+                structured: {
+                  partial_results: [{ reviewer: { model: "fake/model" }, sessionID: "ses_child", status: "success", result: { findings: [{ title: "Bug" }] } }],
+                  reviewers: [{ reviewer: { model: "fake/model-2" }, state: "running" }],
+                },
+                error: { type: "unknown", message: "Tool execution aborted" },
+              }),
+              time: { created, completed: created },
+            }),
+          ],
+          time: { created, completed: created },
+        }),
+      ],
+      model,
+    )
+    const result = messages[1]?.content[0]
+    expect(result?.type).toBe("tool-result")
+    if (result?.type !== "tool-result") return
+    expect(result.result.type).toBe("error")
+    expect(result.result.value).toContain('"findings":[{"title":"Bug"}]')
+    expect(result.result.value).not.toContain("fake/model-2")
+    expect(result.result.value).toContain("fanout_failed")
+  })
+
   test("extracts Bedrock document tool attachments into synthetic user media", async () => {
     const messages = toLLMMessages(
       [

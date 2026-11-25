@@ -162,13 +162,18 @@ export function createPluginDesktopServices(input: {
     if (Date.now() - invocation.createdAt > targetLifetimeMs) return recoverText(text, "The original target expired before insertion.")
     const inserted = await insertForegroundText(invocation.targetWindow, text, invocation.controller.signal)
     if (inserted.ok) return inserted
+    // The overlay only shows the recovered clipboard hint; the main log must
+    // still name the cause. The dictated text itself never reaches the log.
+    input.logger.warn("desktop text insertion failed", { pluginID: registration.pluginID, error: inserted.error })
     return recoverText(text, inserted.error)
   }
 
-  const readClipboard = (sender: WebContents, registrationID: string, invocationID: string) => {
+  const readClipboard = async (sender: WebContents, registrationID: string, invocationID: string) => {
     const invocation = requireInvocation(requireRegistration(sender, registrationID), invocationID)
     if (Date.now() - invocation.createdAt > targetLifetimeMs) throw new Error("The desktop service invocation expired.")
-    const text = clipboard.readText()
+    const text = await clipboard.readText()
+    requireInvocation(requireRegistration(sender, registrationID), invocationID)
+    if (Date.now() - invocation.createdAt > targetLifetimeMs) throw new Error("The desktop service invocation expired.")
     if (text.length > maximumTextLength) throw new Error("Clipboard text is too large.")
     return text
   }
@@ -177,7 +182,7 @@ export function createPluginDesktopServices(input: {
     const invocation = requireInvocation(requireRegistration(sender, registrationID), invocationID)
     if (Date.now() - invocation.createdAt > targetLifetimeMs) throw new Error("The desktop service invocation expired.")
     if (typeof text !== "string" || !text || text.length > maximumTextLength) throw new Error("The clipboard text is empty or too large.")
-    clipboard.writeText(text)
+    return clipboard.writeText(text)
   }
 
   const dispose = () => {
@@ -392,8 +397,8 @@ export function createPluginDesktopServices(input: {
     return invocation
   }
 
-  function recoverText(text: string, error: string) {
-    clipboard.writeText(text)
+  async function recoverText(text: string, error: string) {
+    await clipboard.writeText(text)
     return { ok: false as const, error: `${error} The text was copied to the clipboard.`, recoveredToClipboard: true }
   }
 

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { ReadReceipt } from "@opencode-ai/core/tool/read-receipt"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
 import { FileKnowledge } from "@opencode-ai/core/file-knowledge"
+import { ReadTool } from "@opencode-ai/core/tool/read"
 
 const text = (content: string) => ({
   encoding: "utf8" as const,
@@ -34,6 +35,29 @@ describe("read receipt coverage", () => {
     expect(ReadReceipt.coverage(page)).toEqual({ ranges: [[3, 4]], end: 4 })
     expect(FileKnowledge.full(ReadReceipt.coverage(page)!)).toBe(false)
     expect(ReadReceipt.coverage({ ...page, truncated: true })).toEqual({ ranges: [[3, 4]] })
+  })
+  test("full-line mode grants long lines only when the same bounded text is rendered", () => {
+    const page = new ReadToolFileSystem.TextPage({
+      type: "text-page",
+      content: "ü".repeat(3000),
+      mime: "text/plain",
+      offset: 4,
+      truncated: false,
+      lineCount: 1,
+      totalLines: 4,
+      fullLines: true,
+    })
+    expect(ReadReceipt.coverage(page)).toEqual({ ranges: [[4, 4]], end: 4 })
+    expect(ReadReceipt.coverage({ ...page, fullLines: false })?.ranges).toEqual([])
+    expect(ReadReceipt.coverage({ ...page, content: "ü".repeat(ReadToolFileSystem.MAX_READ_BYTES) })?.ranges).toEqual(
+      [],
+    )
+    const oversized = { ...page, content: "ü".repeat(ReadToolFileSystem.MAX_READ_BYTES) }
+    const rendered = ReadTool.toModelOutput({ path: "long.txt" }, oversized)
+    expect(rendered[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining(ReadToolFileSystem.MAX_LINE_SUFFIX),
+    })
   })
   test("listings, images and truncation markers grant no bytes; empty text is fully known", () => {
     expect(

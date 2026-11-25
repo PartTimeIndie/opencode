@@ -5,13 +5,14 @@ import { existsSync, linkSync, lstatSync, readFileSync, realpathSync, rmSync, wr
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { ToolFailure } from "@opencode-ai/llm"
-import { Effect, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { FSUtil } from "../fs-util"
 import { Global } from "../global"
 import { PermissionV2 } from "../permission"
 import { Control } from "../control"
 import { ControlSurface } from "../control-surface"
 import { Surface } from "../surface"
+import { CrashActivity } from "../observability/crash-activity"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
 
@@ -21,12 +22,15 @@ export const description = `Create one durable OpenCode Surface for questions, c
 
 Modes: "blocking" pauses tool completion until the user replies (questions); "interactive" runs non-blocking controls and host actions; "passive" is non-blocking read-only information. Interactive/passive payloads use Control.PartData and stay pending until dismissed; never wrap them in a \`surface\` field.
 
+Control payloads require \`version: 1\`, \`controlID\`, and \`controls\`. For a passive status use \`{ "mode": "passive", "version": 1, "controlID": "status", "controls": [{ "id": "summary", "type": "review_section", "label": "Status", "content": "..." }] }\`. Markdown is content, not a control type. Correct an invalid payload in its original mode; never turn passive information into a blocking question or add actions to it.
+
 Blocking payloads are inline \`{ "mode": "blocking", "questions": [...] }\` (optional ignored top-level "title"; \`phase\` only as \`"implementation_complete_followup"\`) or source-backed \`{ "mode": "blocking", "sourceFile": { path, sha256, count } }\` for large validated local reviews (content-addressed \`<sha256>.json\` below the managed question-payloads state directory; the tool validates path, hash, count, and schema, then writes a hash-bound response file).
 
 Blocking contract:
 - Never put \`actions\` on a blocking tool input or question; explicit form events belong only in \`question.form.actions\`. Interactive Control actions follow Control.PartData; passive surfaces cannot declare actions.
 - No legacy \`context\`, \`content\`, or \`markdown\` question fields; put visible copy in \`body\` blocks (\`markdown\`, \`action_link\`, \`media_checklist\`). Keep \`question\` short plain text.
 - \`options\` must be objects \`{ id, label, description }\`; string arrays or a \`choices\` field fail. Mark a recommended option first with "(Recommended)" at the end of the label. \`allowOther\`/\`custom\` add the free-text option automatically.
+- When the required user action is sending a specific text or slash command into the session chat, set \`chatSend\` on that question (\`{ text, label?, description? }\`). The host renders a one-click approval button that sends the text verbatim and answers the question with it; never also demand the text as free input.
 - The runtime shows one pending question per session; bundle related choices into one call.
 - The host renders the expectation line; set \`showExpectation: false\` only when the question body is already the concise prompt.
 - Agent handoffs are not Surface actions: use \`switch_agent\` with the exact target agent and follow-up prompt.
@@ -78,6 +82,7 @@ export type Input = typeof Input.Type
 export const BlockingOutput = Schema.Struct({
   mode: Schema.Literal("blocking"),
   answers: Schema.Array(Surface.Answer),
+  answerSource: Schema.NullOr(Surface.AnswerSource).pipe(Schema.optional),
   keys: Schema.Array(Schema.String).pipe(Schema.optional),
   responseFile: Schema.String.pipe(Schema.optional),
 })
@@ -153,7 +158,8 @@ export const toModelOutput = (input: Input, output: typeof Output.Encoded) => {
               `"${output.keys?.[index] ?? `#${index + 1}`}"="${answer.length ? answerText(answer) : "Unanswered"}"`,
           )
           .join(", ")
-  return `User has answered your questions: ${formatted}.${output.responseFile ? ` Durable response: ${output.responseFile}.` : ""} You can now continue with the user's answers in mind.`
+  const actor = output.answerSource === "main" ? "Main-Orchestrator" : output.answerSource === "recommended" ? "Main-Orchestrator using the recorded recommendation" : output.answerSource === "user" ? "User" : "An unknown legacy respondent"
+  return `${actor} has answered your questions: ${formatted}.${output.responseFile ? ` Durable response: ${output.responseFile}.` : ""} Answer source: ${output.answerSource ?? "unknown"}. This receipt is not permission, a user commission or a host approval.`
 }
 
 export const toModelContent = (input: Input, output: typeof Output.Encoded) => [
@@ -281,11 +287,16 @@ export function validateInput(input: unknown) {
   if (input.phase !== undefined && input.phase !== "implementation_complete_followup")
     return correction(
       `Invalid field ["phase"]. Expected "implementation_complete_followup" or omission, got ${JSON.stringify(input.phase)}.`,
+      input.mode,
     )
   if (input.mode === "interactive" || input.mode === "passive") {
     const diagnostic = ControlSurface.validatePartData(input)[0]
-    if (diagnostic) return correction(`${diagnostic.code} at ${diagnostic.path}: ${diagnostic.message}`)
-    if (input.mode === "passive" && hasActions(input)) return correction("Passive surfaces cannot declare actions.")
+    if (diagnostic) return correction(`${diagnostic.code} at ${diagnostic.path}: ${diagnostic.message}`, input.mode)
+    if (input.mode === "passive" && hasActions(input))
+      return correction("Passive surfaces cannot declare actions.", input.mode)
+    // Catch schema failures here too, before generic tool decoding loses the mode-specific guidance.
+    const decoded = Schema.decodeUnknownExit(ControlInput)(input)
+    if (Exit.isFailure(decoded)) return correction(Cause.pretty(decoded.cause), input.mode)
     return
   }
   if (input.title !== undefined && typeof input.title !== "string")
@@ -314,7 +325,9 @@ function validateQuestionSourcePayload(input: unknown) {
   return diagnostic ? correction(diagnostic) : undefined
 }
 
-function correction(diagnostic: string) {
+function correction(diagnostic: string, mode?: unknown) {
+  if (mode === "interactive" || mode === "passive")
+    return `${diagnostic}\n\nThe surface tool is available, but this payload is invalid (mode: ${mode}). Correct it and retry once with Control.PartData directly on the input: { "mode": "${mode}", "version": 1, "controlID": "status", "controls": [{ "id": "summary", "type": "review_section", "label": "Status", "content": "..." }] }. Markdown belongs in content or markdown fields, never controls[].type. Preserve the original mode and content; do not substitute a blocking question or a text fallback. Passive surfaces cannot declare actions. Omit dock unless explicitly requested.`
   return `${diagnostic}\n\n${correctiveInput}`
 }
 
@@ -364,6 +377,7 @@ export const layer = Layer.effectDiscard(
                 Effect.mapError(() => new ToolFailure({ message: "Permission denied: surface" })),
                 Effect.andThen(
                   Effect.gen(function* () {
+                    const trace = { kind: "session-stage", sessionID: context.sessionID } as const
                     if (input.mode !== "blocking") {
                       yield* Effect.forEach(
                         Surface.actionMetadata(controlData(input)).flatMap((action) => action.permissions),
@@ -383,14 +397,14 @@ export const layer = Layer.effectDiscard(
                             .pipe(Effect.mapError(() => new ToolFailure({ message: `Permission denied: ${required.action}` }))),
                         { discard: true },
                       )
-                      const request = yield* surface
+                      const request = yield* CrashActivity.track({ ...trace, name: "surface.present" }, surface
                         .present({
                           sessionID: context.sessionID,
                           mode: input.mode,
                           surface: controlData(input),
                           tool: { messageID: context.assistantMessageID, callID: context.toolCallID },
                         })
-                        .pipe(Effect.mapError(conflict))
+                        .pipe(Effect.mapError(conflict)))
                       return {
                         mode: request.mode,
                         requestID: Surface.ID.make(request.id),
@@ -401,8 +415,8 @@ export const layer = Layer.effectDiscard(
                     const resolved =
                       "questions" in input
                         ? { questions: input.questions }
-                        : yield* readQuestionSource(input.sourceFile)
-                    const answers = yield* surface
+                        : yield* CrashActivity.track({ ...trace, name: "surface.read-source" }, readQuestionSource(input.sourceFile))
+                    const answers = yield* CrashActivity.track({ ...trace, name: "surface.await-answer" }, surface
                       .askDurable({
                         sessionID: context.sessionID,
                         questions: resolved.questions,
@@ -412,13 +426,20 @@ export const layer = Layer.effectDiscard(
                       .pipe(
                         Effect.catchTag("QuestionV2.ConflictError", (error) => Effect.fail(conflict(error))),
                         Effect.catchTag("QuestionV2.RejectedError", Effect.die),
-                      )
+                      ))
+                    const answerSource = surface.answerSourceForTool ? yield* surface.answerSourceForTool({
+                      sessionID: context.sessionID, messageID: context.assistantMessageID, callID: context.toolCallID,
+                    }) : null
                     if (!("source" in resolved))
-                      return { mode: "blocking" as const, answers: answers.map((answer) => [...answer]) }
-                    const responseFile = yield* writeQuestionResponse(resolved.source, answers)
+                      return { mode: "blocking" as const, answers: answers.map((answer) => [...answer]), answerSource }
+                    const responseFile = yield* CrashActivity.track(
+                      { ...trace, name: "surface.write-response" },
+                      writeQuestionResponse(resolved.source, answers),
+                    )
                     return {
                       mode: "blocking" as const,
                       answers: answers.map((answer) => [...answer]),
+                      answerSource,
                       keys: [...resolved.source.keys],
                       responseFile,
                     }

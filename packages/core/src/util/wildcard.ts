@@ -10,7 +10,9 @@ export function match(input: string, pattern: string) {
 
   if (escaped.endsWith(" .*")) escaped = escaped.slice(0, -3) + "( .*)?"
 
-  return new RegExp("^" + escaped + "$", process.platform === "win32" ? "si" : "s").test(normalized)
+  // Tool policies are also rendered in the browser, which has no Node process.
+  const windows = typeof process !== "undefined" && process.platform === "win32"
+  return new RegExp("^" + escaped + "$", windows ? "si" : "s").test(normalized)
 }
 
 export function all<T>(input: string, patterns: Record<string, T>) {

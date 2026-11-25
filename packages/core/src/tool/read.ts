@@ -34,6 +34,10 @@ const LocationInput = Schema.Struct({
   limit: ReadToolFileSystem.PageInput.fields.limit.annotate({
     description: "The maximum number of directory entries or text lines to read",
   }),
+  fullLines: ReadToolFileSystem.PageInput.fields.fullLines.annotate({
+    description:
+      "Text files only: return complete lines without the 2000-character cap, within a 50 KiB page. Use a small limit for long lines. An oversized single line fails without a read receipt.",
+  }),
 })
 const Input = Schema.Struct({
   ...LocationInput.fields,
@@ -127,6 +131,7 @@ const formatTextPage = (resource: string, output: Extract<ModelOutput, { type: "
   const continuation = output.truncated
     ? `(Showing lines ${output.offset}-${last}. Use offset=${output.next ?? last + 1} to continue.)`
     : `(End of file - read through line ${last})`
+  const fullLines = ReadToolFileSystem.rendersFullLines(output)
   return [
     `<path>${resource}</path>`,
     `<type>file</type>`,
@@ -134,7 +139,7 @@ const formatTextPage = (resource: string, output: Extract<ModelOutput, { type: "
     "<content>",
     pageLines
       .slice(0, ReadToolFileSystem.MAX_READ_LINES)
-      .map((line, index) => `${output.offset + index}: ${cappedLine(line)}`)
+      .map((line, index) => `${output.offset + index}: ${fullLines ? line : cappedLine(line)}`)
       .join("\n"),
     "",
     continuation,
@@ -173,10 +178,19 @@ export const layer = Layer.effectDiscard(
 
     const readArtifact = (
       resource: string,
-      input: { readonly offset?: number; readonly limit?: number; readonly offsetBytes?: number },
+      input: {
+        readonly offset?: number
+        readonly limit?: number
+        readonly offsetBytes?: number
+        readonly fullLines?: boolean
+      },
       context: Tool.Context,
     ): Effect.Effect<Output, ToolFailure> =>
       Effect.gen(function* () {
+        if (input.fullLines)
+          return yield* new ToolFailure({
+            message: "fullLines is supported only for filesystem text reads, not stored tool output",
+          })
         if (!contentStore) return yield* new ToolFailure({ message: "Stored tool output retrieval is unavailable" })
         const located = yield* contentStore.locate({ uri: resource, sessionID: context.sessionID })
         if (!located) return yield* new ToolFailure({ message: "Stored tool output does not belong to this session" })
@@ -298,7 +312,7 @@ export const layer = Layer.effectDiscard(
       .register({
         [name]: Tool.make({
           description:
-            "Read a text file or supported image, page through a large UTF-8 text file by line offset, or list a directory page. Relative paths resolve from the current location; absolute paths are read directly.",
+            "Read a text file or supported image, page through a large UTF-8 text file by line offset, or list a directory page. Relative paths resolve from the current Location. External targets, including those reached via links, require external_directory approval.",
           input: Input,
           output: Output,
           validateInput,
@@ -307,7 +321,7 @@ export const layer = Layer.effectDiscard(
             const resource = readPath(input)
             if (resource.startsWith(ContentStore.URI_PREFIX)) return readArtifact(resource, input, context)
             return Effect.gen(function* () {
-              const target = yield* mutation.resolve({ path: resource })
+              const target = yield* mutation.resolve({ path: resource }, LocationMutation.guardedPaths)
               if (target.externalDirectory)
                 yield* permission.assert({
                   ...LocationMutation.externalDirectoryPermission(target.externalDirectory),
@@ -315,8 +329,6 @@ export const layer = Layer.effectDiscard(
                   agent: context.agent,
                   source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
                 })
-              const absolute = AbsolutePath.make(target.canonical)
-              const type = yield* reader.inspect(absolute)
               yield* permission.assert({
                 action: name,
                 resources: [target.resource],
@@ -325,11 +337,21 @@ export const layer = Layer.effectDiscard(
                 agent: context.agent,
                 source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
               })
+              const current = yield* mutation.resolve({ path: resource }, LocationMutation.guardedPaths)
+              if (!LocationMutation.sameTarget(target, current))
+                return yield* new ToolFailure({ message: "Read target changed while waiting; retry manually." })
+              const absolute = AbsolutePath.make(target.canonical)
+              const type = yield* reader.inspect(absolute)
+              if (type === "directory" && input.fullLines)
+                return yield* new ToolFailure({
+                  message: "fullLines is supported only for text files, not directories",
+                })
               if (type === "directory")
                 return yield* reader.list(absolute, { offset: input.offset, limit: input.limit })
               const content = yield* reader.read(absolute, target.resource, {
                 offset: input.offset,
                 limit: input.limit,
+                ...(input.fullLines === undefined ? {} : { fullLines: input.fullLines }),
               })
               if ("encoding" in content && content.encoding === "base64" && SUPPORTED_IMAGE_MIMES.has(content.mime)) {
                 return yield* image.normalize(target.resource, { ...content, encoding: "base64" }).pipe(
@@ -360,6 +382,8 @@ export const layer = Layer.effectDiscard(
               Effect.mapError((error) => {
                 const message =
                   error instanceof FileKnowledge.StorageError ||
+                  error instanceof ToolFailure ||
+                  error instanceof ReadToolFileSystem.FullLineLimitError ||
                   error instanceof ReadToolFileSystem.BinaryFileError ||
                   error instanceof ReadToolFileSystem.MediaIngestLimitError ||
                   error instanceof Image.DecodeError ||

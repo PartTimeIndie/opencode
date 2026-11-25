@@ -88,6 +88,25 @@ describe("Timeline.constructMessageRows", () => {
     expect(rows.map((row) => row._tag)).toEqual(["UserMessage", "Thinking"])
   })
 
+  test.each([
+    { text: "", showSummaries: true },
+    { text: "Hidden reasoning", showSummaries: false },
+  ])("uses the active status when reasoning has no visible content (%j)", ({ text, showSummaries }) => {
+    const reasoning = {
+      id: "reasoning",
+      sessionID: userMessage.sessionID,
+      messageID: assistantMessage.id,
+      type: "reasoning",
+      text,
+      time: { start: 2 },
+    } satisfies Part
+    const parts = (id: string) => (id === assistantMessage.id ? [reasoning] : [])
+    const rows = (status: "busy" | "idle") =>
+      Timeline.constructMessageRows(userMessage, parts, [assistantMessage], 0, showSummaries, status, true)
+    expect(rows("busy").map((row) => row._tag)).toEqual(["UserMessage", "Thinking"])
+    expect(rows("idle").map((row) => row._tag)).toEqual(["UserMessage"])
+  })
+
   test("keeps the active thinking indicator mounted as tools appear and disappear", () => {
     const tool = {
       id: "tool",

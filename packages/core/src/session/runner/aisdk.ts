@@ -2,6 +2,8 @@ import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { convertBase64ToUint8Array } from "@ai-sdk/provider-utils"
 import {
   LLMEvent,
+  RequestRuntimeContext,
+  StructuredOutputTransport,
   ToolResultValue,
   type FinishReason,
   type LLMRequest,
@@ -22,9 +24,14 @@ type ToolPromptPart = Extract<PromptMessage, { role: "tool" }>["content"][number
 type StreamPart =
   Awaited<ReturnType<LanguageModelV3["doStream"]>>["stream"] extends ReadableStream<infer Part> ? Part : never
 
+export const supportsRuntimeContext = (language: LanguageModelV3) =>
+  language.provider === "openai.responses" || language.provider === "openai.chat"
+
 export function stream(language: LanguageModelV3, request: LLMRequest): Stream.Stream<LLMEvent> {
   return Stream.unwrap(
     Effect.sync(() => {
+      const contextError = RequestRuntimeContext.validate(request, supportsRuntimeContext(language))
+      if (contextError) return Stream.succeed(providerError(contextError, request))
       const abortController = new AbortController()
       const toolNames = new Map<string, string>()
       return Stream.fromEffect(
@@ -63,6 +70,7 @@ export function stream(language: LanguageModelV3, request: LLMRequest): Stream.S
 }
 
 function toCallOptions(request: LLMRequest): CallOptions {
+  const normalized = StructuredOutputTransport.normalize(request)
   return {
     prompt: [
       // Qwen-style templates accept only one system message at the beginning.
@@ -70,18 +78,26 @@ function toCallOptions(request: LLMRequest): CallOptions {
         ? []
         : [{ role: "system" as const, content: request.system.map((part) => part.text).join("\n\n") }]),
       ...request.messages.flatMap((message) => toPromptMessage(message)),
+      ...(request.runtimeContext?.length
+        ? [{ role: "system" as const, content: request.runtimeContext.map((part) => part.text).join("\n") }]
+        : []),
     ],
-    tools: request.tools.map((tool) => ({
+    tools: normalized.tools.map((tool) => ({
       type: "function" as const,
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
     })),
-    toolChoice: request.toolChoice
-      ? request.toolChoice.type === "tool"
-        ? { type: "tool" as const, toolName: request.toolChoice.name ?? "" }
-        : { type: request.toolChoice.type }
+    toolChoice: normalized.toolChoice
+      ? normalized.toolChoice.type === "tool"
+        ? { type: "tool" as const, toolName: normalized.toolChoice.name ?? "" }
+        : { type: normalized.toolChoice.type }
       : undefined,
+    responseFormat: normalized.responseFormat?.type === "json"
+      ? { type: "json", schema: normalized.responseFormat.schema }
+      : normalized.responseFormat?.type === "text"
+        ? { type: "text" }
+        : undefined,
     maxOutputTokens: request.generation?.maxTokens,
     temperature: request.generation?.temperature,
     topP: request.generation?.topP,
@@ -90,7 +106,11 @@ function toCallOptions(request: LLMRequest): CallOptions {
     presencePenalty: request.generation?.presencePenalty,
     stopSequences: request.generation?.stop ? [...request.generation.stop] : undefined,
     seed: request.generation?.seed,
-    providerOptions: toProviderOptions(request.providerOptions),
+    // Keep host context at system rank, including SDK reasoning-model defaults
+    // that otherwise rewrite every system message to developer.
+    providerOptions: request.runtimeContext?.length
+      ? { ...toProviderOptions(request.providerOptions), openai: { ...toProviderOptions(request.providerOptions)?.openai, systemMessageMode: "system" } }
+      : toProviderOptions(request.providerOptions),
     headers: request.http?.headers,
   }
 }
@@ -223,6 +243,15 @@ function toJsonValue(value: unknown): JsonValue | undefined {
 function toEvents(part: StreamPart, toolNames: Map<string, string>, request: LLMRequest): LLMEvent[] {
   switch (part.type) {
     case "stream-start":
+      for (const warning of part.warnings) {
+        if (warning.type === "other") continue
+        const schema = request.responseFormat?.type === "json" && /^responseFormat(?:\.|$)/.test(warning.feature)
+        const choice = (request.responseFormat?.type === "tool"
+          || request.toolChoice?.type === "tool" || request.toolChoice?.type === "required")
+          && /^(?:toolChoice|tools)(?:\.|$)/.test(warning.feature)
+        if (schema || choice)
+          throw new Error("AI SDK discarded a requested structured-output transport constraint")
+      }
       return [LLMEvent.stepStart({ index: 0 })]
     case "text-start":
       return [LLMEvent.textStart({ id: part.id, providerMetadata: part.providerMetadata })]
@@ -283,18 +312,29 @@ function toEvents(part: StreamPart, toolNames: Map<string, string>, request: LLM
   }
 }
 
-function toUsage(
+export function toUsage(
   usage: Extract<StreamPart, { type: "finish" }>["usage"],
   providerMetadata: Extract<StreamPart, { type: "finish" }>["providerMetadata"],
 ) {
   if (!usage) return undefined
   const inputTokens = usage.inputTokens.total
   const outputTokens = usage.outputTokens.total
+  // OpenAI-compatible SDKs synthesize cacheRead=0 when the wire response omitted
+  // cached_tokens. That is not measured cache usage. Preserve unknown just as the
+  // native Chat adapter does; an explicit wire zero remains a valid measurement.
+  const raw = usage.raw
+  const openAIUsage = raw && ("prompt_tokens" in raw || ("input_tokens" in raw && !("cache_read_input_tokens" in raw)))
+  const details = raw && "prompt_tokens" in raw ? raw.prompt_tokens_details : raw?.input_tokens_details
+  const cacheRead = openAIUsage
+    ? details && typeof details === "object" && !Array.isArray(details) && typeof details.cached_tokens === "number"
+      ? details.cached_tokens
+      : undefined
+    : usage.inputTokens.cacheRead
   return {
     inputTokens,
     outputTokens,
     nonCachedInputTokens: usage.inputTokens.noCache,
-    cacheReadInputTokens: usage.inputTokens.cacheRead,
+    cacheReadInputTokens: cacheRead,
     cacheWriteInputTokens: usage.inputTokens.cacheWrite,
     reasoningTokens: usage.outputTokens.reasoning,
     totalTokens: inputTokens === undefined || outputTokens === undefined ? undefined : inputTokens + outputTokens,

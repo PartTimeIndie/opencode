@@ -1,5 +1,6 @@
 import { expect } from "bun:test"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
@@ -27,6 +28,7 @@ const pluginUrl = pathToFileURL(path.join(import.meta.dir, "..", "fixture", "age
 
 const provider = ProviderTest.fake()
 const configLayer = Config.layer.pipe(
+  Layer.provide(EffectFlock.defaultLayer),
   Layer.provide(FSUtil.defaultLayer),
   Layer.provide(Env.defaultLayer),
   Layer.provide(AuthTest.empty),

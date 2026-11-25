@@ -79,16 +79,23 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
             .readFileString(path.join(location.project.directory, ".ignore"))
             .pipe(Effect.catch(() => Effect.succeed("")))
           if (ignorefile) ignored.add(ignorefile)
-          return (yield* fs.list({ path: RelativePath.make(ctx.query.path) })).map((item) => ({
-            name: path.basename(item.path),
-            path: item.path,
-            absolute: path.resolve(location.directory, item.path),
-            type: item.type,
-            ignored: ignored.ignores(
-              path.relative(location.project.directory, path.resolve(location.directory, item.path)) +
-                (item.type === "directory" ? "/" : ""),
-            ),
-          }))
+          return (yield* fs.list({ path: RelativePath.make(ctx.query.path) })).map((item) => {
+            const absolute = path.resolve(location.directory, item.path)
+            return {
+              name: path.basename(item.path),
+              path: item.path,
+              absolute,
+              type: item.type,
+              ignored: ignored.ignores(
+                ignoreEntryPath({
+                  projectDirectory: location.project.directory,
+                  directory: location.directory,
+                  absolute,
+                  isDirectory: item.type === "directory",
+                }),
+              ),
+            }
+          })
         }),
       )
     })
@@ -137,3 +144,25 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       .handle("status", status)
   }),
 ).pipe(Layer.provide(LocationServiceMap.layer))
+
+type PathModule = Pick<typeof path, "isAbsolute" | "relative">
+
+// The ignore library rejects anything that is not a relative path with a
+// RangeError, which would turn the whole listing into a generic 500. Prefer the
+// path relative to the project root so nested worktrees match the project's
+// ignore rules; when the two roots cannot be relativized (Windows mount or
+// drive-alias spellings of the same checkout, e.g. C:\repo opened through an
+// E:\ real path), fall back to the instance-relative entry path.
+export function ignoreEntryPath(input: {
+  projectDirectory: string
+  directory: string
+  absolute: string
+  isDirectory: boolean
+  pathModule?: PathModule
+}) {
+  const pathModule = input.pathModule ?? path
+  const suffix = input.isDirectory ? "/" : ""
+  const relative = pathModule.relative(input.projectDirectory, input.absolute)
+  if (!pathModule.isAbsolute(relative)) return relative + suffix
+  return pathModule.relative(input.directory, input.absolute) + suffix
+}

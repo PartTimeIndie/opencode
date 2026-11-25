@@ -15,6 +15,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { WorkspaceCheckout } from "@opencode-ai/core/session/workspace/checkout"
 import { SessionTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { ReadTool } from "@opencode-ai/core/tool/read"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
@@ -37,13 +38,15 @@ export function withKnownFileTools<A, E>(
     newSession: (id: string) => Effect.Effect<Client>
     database: Database.Interface
     store: ReturnType<typeof FileKnowledge.make>
+    afterPermission: (effect: Effect.Effect<void>) => void
   }) => Effect.Effect<A, E>,
 ) {
   const database = Database.layerFromPath(":memory:")
+  let afterPermission: Effect.Effect<void> = Effect.void
   const permission = Layer.succeed(
     PermissionV2.Service,
     PermissionV2.Service.of({
-      assert: () => Effect.void,
+      assert: () => Effect.suspend(() => afterPermission),
       ask: () => Effect.die("unused"),
       reply: () => Effect.die("unused"),
       materializationRules: () => Effect.succeed([]),
@@ -54,6 +57,7 @@ export function withKnownFileTools<A, E>(
   )
   const base = Layer.mergeAll(
     database,
+    WorkspaceCheckout.layer,
     permission,
     FSUtil.defaultLayer,
     Layer.succeed(Location.Service, Location.Service.of(location({ directory: AbsolutePath.make(directory) }))),
@@ -141,6 +145,14 @@ export function withKnownFileTools<A, E>(
           })
         return { batch, call: (call: Call) => batch([call]).pipe(Effect.map((results) => results[0]!)) }
       })
-    return yield* body({ ...(yield* newSession("ses_known_tools")), newSession, database, store })
+    return yield* body({
+      ...(yield* newSession("ses_known_tools")),
+      newSession,
+      database,
+      store,
+      afterPermission: (effect) => {
+        afterPermission = effect
+      },
+    })
   }).pipe(Effect.provide(Layer.mergeAll(dependencies, tools)))
 }

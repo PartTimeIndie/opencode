@@ -53,6 +53,8 @@ export function selectModel(input: {
    */
   readonly inherit?: ModelV2.Ref | undefined
   readonly extra?: ReadonlyArray<ModelV2.Ref> | undefined
+  /** Registered workflow workers are one assigned model, never a parent fallback chain. */
+  readonly direct?: boolean
 }): Selection {
   const base = input.inherit ?? input.agent ?? input.parent
   if (input.model === undefined) {
@@ -69,6 +71,7 @@ export function selectModel(input: {
   if (!match) return { ok: false, requested: input.model, allowed }
   const variant = input.variant === undefined ? match.variant : ModelV2.VariantID.make(input.variant)
   const step = { id: match.id, providerID: match.providerID, ...(variant === undefined ? {} : { variant }) }
+  if (input.direct) return { ok: true, model: { ...step, chain: null } }
   const chainBase =
     input.parent?.chain === null
       ? input.parent

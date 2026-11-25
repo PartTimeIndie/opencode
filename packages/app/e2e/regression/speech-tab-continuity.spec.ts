@@ -11,6 +11,7 @@ const second = "ses_speech_second"
 ;([
   { name: "desktop", width: 1280, height: 720 },
   { name: "mobile", width: 390, height: 844 },
+  { name: "new-draft", width: 1280, height: 720 },
 ]).forEach((viewport) => test(`recording survives a session tab switch and inserts only into its original draft (${viewport.name})`, async ({ page }, testInfo) => {
   const errors: string[] = []
   page.on("pageerror", (error) => errors.push(error.message))
@@ -46,11 +47,14 @@ const second = "ses_speech_second"
     requests.push(route.request().postDataJSON())
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, text: "Pinned browser transcript" }) })
   })
-  await page.addInitScript(({ directory, encoded, server, first, second }) => {
+  await page.addInitScript(({ directory, encoded, server, first, second, draft }) => {
     localStorage.setItem("settings.v3", JSON.stringify({}))
     localStorage.setItem("opencode.app-plugin.speech-to-text-app.settings.transcriptionChain", JSON.stringify("model:test/stt"))
     localStorage.setItem("opencode.global.dat:server", JSON.stringify({ projects: { [server]: [{ worktree: directory, expanded: true }] }, lastProject: { [server]: directory } }))
-    localStorage.setItem("opencode.global.dat:tabs", JSON.stringify([first, second].map((sessionId) => ({ type: "session", server, dirBase64: encoded, sessionId }))))
+    localStorage.setItem("opencode.global.dat:tabs", JSON.stringify([
+      ...(draft ? [{ type: "draft", draftID: "speech-draft", server, directory }] : [{ type: "session", server, dirBase64: encoded, sessionId: first }]),
+      { type: "session", server, dirBase64: encoded, sessionId: second },
+    ]))
     Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: {
       async getUserMedia() { return { getTracks: () => [Object.assign(new EventTarget(), { stop() {} })] } },
       async enumerateDevices() { return [] }, addEventListener() {}, removeEventListener() {},
@@ -70,11 +74,15 @@ const second = "ses_speech_second"
       async close() {}
     }
     Object.defineProperty(window, "AudioContext", { configurable: true, value: AudioContext })
-  }, { directory, encoded: base64Encode(directory), server, first, second })
+  }, { directory, encoded: base64Encode(directory), server, first, second, draft: viewport.name === "new-draft" })
 
   await page.setViewportSize(viewport)
-  await page.goto(`/${base64Encode(directory)}/session/${first}`)
+  await page.goto(viewport.name === "new-draft" ? "/new-session?draftId=speech-draft" : `/${base64Encode(directory)}/session/${first}`)
   const mic = page.locator('[data-action="speech-to-text"]:visible').first()
+  if (viewport.name === "new-draft") {
+    await page.getByRole("tab", { name: "New session", exact: true }).click()
+    await expect(page.getByRole("tab", { name: "New session", exact: true })).toHaveAttribute("aria-selected", "true")
+  }
   await expect(mic).toBeVisible()
   await mic.click()
   await expect(mic).toHaveAttribute("aria-pressed", "true")
@@ -93,7 +101,8 @@ const second = "ses_speech_second"
   if (viewport.name === "mobile") {
     await page.getByRole("button", { name: "Projects and sessions" }).click()
     await page.getByRole("link", { name: "Speech first" }).click()
-  } else await page.getByRole("tab", { name: "Speech first", exact: true }).click()
+  } else if (viewport.name === "new-draft") await page.getByRole("tab", { name: "New session", exact: true }).click()
+  else await page.getByRole("tab", { name: "Speech first", exact: true }).click()
   await expect(page.locator('[data-component="prompt-input"]:visible')).toContainText("Pinned browser transcript")
   await page.screenshot({ path: testInfo.outputPath("original-draft-updated.png") })
   expect(errors).toEqual([])

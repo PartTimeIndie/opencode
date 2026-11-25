@@ -304,28 +304,29 @@ export function MessageTimeline(props: {
 
   const [listRoot, setListRoot] = createSignal<HTMLDivElement>()
   const sessionID = createMemo(() => params.id)
+  // The inline Thinking row and the header must agree when a late idle
+  // signal belongs to an earlier activity.
   const sessionStatus = createMemo(() => {
     const id = sessionID()
     if (!id) return idle
-    return sync().data.session_status[id] ?? idle
+    const store = sync().data
+    const directory = sdk().directory
+    const snapshot = store.session_status[id] ?? idle
+    const activity = sessionActivity(directory, id)
+    const resolved = resolveLifecycleStatus({
+      activity: activity?.type,
+      activityTracked: latestAssistantCompletedBefore(store, id, sessionActivityStartedAt(directory, id)),
+      activitySettled: sessionActivitySettled(directory, id),
+      store: snapshot.type,
+      latestAssistantSettled: latestAssistantSettled(store, id),
+    })
+    if (snapshot.type === resolved) return snapshot
+    return activity && activity.type === resolved ? activity : idle
   })
   const working = createMemo(() => {
     const id = sessionID()
     if (!id) return false
-    const store = sync().data
-    const directory = sdk().directory
-    return sessionIsWorking(
-      store,
-      id,
-      resolveLifecycleStatus({
-        activity: sessionActivity(directory, id)?.type,
-        activityTracked: latestAssistantCompletedBefore(store, id, sessionActivityStartedAt(directory, id)),
-        activitySettled: sessionActivitySettled(directory, id),
-        store: sessionStatus().type,
-        latestAssistantSettled: latestAssistantSettled(store, id),
-      }),
-      sessionActivitySettled(directory, id),
-    )
+    return sessionIsWorking(sync().data, id, sessionStatus().type, sessionActivitySettled(sdk().directory, id))
   })
   const sessionMessages = createMemo(() => (sessionID() ? (sync().data.message[sessionID()!] ?? []) : []))
   const tint = createMemo(() => messageAgentColor(sessionMessages(), sync().data.agent))

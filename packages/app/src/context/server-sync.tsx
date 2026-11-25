@@ -50,14 +50,14 @@ import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from 
 import { createRefreshQueue } from "./global-sync/queue"
 import { directoryKey, normalizeCommandList, cmp } from "./global-sync/utils"
 import { PathKey } from "@/utils/path-key"
-import { createDirSyncContext, hydratedSessionStatus } from "./directory-sync"
+import { createDirSyncContext, hydratedSessionStatus, isSessionNotFoundError } from "./directory-sync"
 import { createSimpleContext, NormalizedProviderListResponse } from "@opencode-ai/ui/context"
 import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerConnection, useServer } from "./server"
 import { retry } from "@opencode-ai/core/util/retry"
 import type { ServerScope } from "@/utils/server-scope"
-import { hasActiveSessionTool, latestAssistantSettled, type TurnCompletionStatus } from "@/utils/session-status"
+import { hasActiveSessionTool, idleSignalSettlesActivity, type TurnCompletionStatus } from "@/utils/session-status"
 import { Persist, persisted } from "@/utils/persist"
 import { toggleMcp } from "./global-sync/mcp"
 import { updateGlobalConfig } from "./global-config-update"
@@ -74,6 +74,7 @@ import {
   sessionActivityGeneration,
   sessionActivityGenerationSnapshot,
   sessionActivitySettled,
+  sessionActivityStartedAt,
   updateSessionActivity,
 } from "@/utils/session-activity"
 
@@ -171,6 +172,15 @@ export function directoryStoreForEvent<T>(input: {
   return input.createLightweight()
 }
 
+// Stale references (restored tabs, favorites) can point at sessions the server
+// no longer knows. Swallow only that 404 after forgetting the record; every
+// other failure keeps rejecting so callers and bootstrap surfaces stay honest.
+export function recoverMissingSessionInfo(error: unknown, forget: () => void): undefined {
+  if (!isSessionNotFoundError(error)) throw error
+  forget()
+  return undefined
+}
+
 export function sessionsNeedingStatusRecovery(store: Pick<State, "session_status" | "message" | "part">) {
   return [
     ...new Set([
@@ -247,8 +257,10 @@ export function statusSnapshotRecoversMissedTerminal(
   incoming: SessionStatus | undefined,
   store: Pick<State, "message" | "part">,
   sessionID: string,
+  startedAt?: number,
+  now = Date.now(),
 ) {
-  return statusSnapshotSettlesActivity(incoming) && latestAssistantSettled(store, sessionID)
+  return statusSnapshotSettlesActivity(incoming) && idleSignalSettlesActivity(store, sessionID, startedAt, now)
 }
 
 export function reconcileSessionStatusSnapshot(input: {
@@ -265,7 +277,12 @@ export function reconcileSessionStatusSnapshot(input: {
   if (
     statusSnapshotSettlesActivity(input.incoming) &&
     (sessionActivityDismissed(input.directory, input.sessionID) ||
-      statusSnapshotRecoversMissedTerminal(input.incoming, input.store, input.sessionID)) &&
+      statusSnapshotRecoversMissedTerminal(
+        input.incoming,
+        input.store,
+        input.sessionID,
+        sessionActivityStartedAt(input.directory, input.sessionID),
+      )) &&
     sessionActivity(input.directory, input.sessionID)
   ) {
     finishSessionActivity(input.directory, input.sessionID)
@@ -916,6 +933,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const session = await sdkFor(directory)
       .session.get({ sessionID })
       .then((response) => response.data)
+      .catch((error) => recoverMissingSessionInfo(error, () => forgetSession(directory, sessionID)))
     if (!session?.id) return
     setStore(
       "session",
@@ -1321,6 +1339,21 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     },
   }))
 
+  const forgetSession = (directory: string, sessionID: string) => {
+    const key = directoryKey(directory)
+    retainedSessionIDs.get(key)?.delete(sessionID)
+    if (retainedSessionIDs.get(key)?.size === 0) retainedSessionIDs.delete(key)
+    locallyCreatedSessionIDs.get(key)?.delete(sessionID)
+    if (locallyCreatedSessionIDs.get(key)?.size === 0) locallyCreatedSessionIDs.delete(key)
+    children.existing(directory)?.[1](
+      "session",
+      produce((draft) => {
+        const index = draft.findIndex((session) => session.id === sessionID)
+        if (index >= 0) draft.splice(index, 1)
+      }),
+    )
+  }
+
   return {
     data: globalStore,
     set,
@@ -1395,20 +1428,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
           produce((draft) => mergeSessionList(draft, info)),
         )
       },
-      forget(directory: string, sessionID: string) {
-        const key = directoryKey(directory)
-        retainedSessionIDs.get(key)?.delete(sessionID)
-        if (retainedSessionIDs.get(key)?.size === 0) retainedSessionIDs.delete(key)
-        locallyCreatedSessionIDs.get(key)?.delete(sessionID)
-        if (locallyCreatedSessionIDs.get(key)?.size === 0) locallyCreatedSessionIDs.delete(key)
-        children.existing(directory)?.[1](
-          "session",
-          produce((draft) => {
-            const index = draft.findIndex((session) => session.id === sessionID)
-            if (index >= 0) draft.splice(index, 1)
-          }),
-        )
-      },
+      forget: forgetSession,
     },
     project: projectApi,
     todo: {

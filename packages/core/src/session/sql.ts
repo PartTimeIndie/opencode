@@ -30,6 +30,8 @@ export const SessionTable = sqliteTable(
       .references(() => ProjectTable.id, { onDelete: "cascade" }),
     workspace_id: text().$type<WorkspaceV2.ID>(),
     parent_id: text().$type<SessionSchema.ID>(),
+    fork_history_seq: integer(),
+    fork_dispatch_digest: text(),
     slug: text().notNull(),
     directory: DatabasePath.directoryColumn().notNull(),
     path: DatabasePath.pathColumn(),
@@ -252,6 +254,7 @@ export const SessionInputTable = sqliteTable(
     prompt: text({ mode: "json" }).notNull().$type<PromptData>(),
     execution_prompt: text({ mode: "json" }).$type<PromptData>(),
     delivery: text().$type<"steer" | "queue">().notNull(),
+    origin: text().$type<"interactive" | "plugin">(),
     admitted_seq: integer().notNull(),
     promoted_seq: integer(),
     held_at: integer(),
@@ -342,9 +345,11 @@ export const SessionFileMutationTable = sqliteTable(
     before_exists: integer({ mode: "boolean" }).notNull(),
     before_bytes: integer(),
     before_sha256: text(),
+    before_mode: integer(),
     after_exists: integer({ mode: "boolean" }).notNull(),
     after_bytes: integer(),
     after_sha256: text(),
+    after_mode: integer(),
     time_created: integer()
       .notNull()
       .$default(() => Date.now()),
@@ -355,3 +360,64 @@ export const SessionFileMutationTable = sqliteTable(
     index("session_file_mutation_target_idx").on(table.session_id, table.target),
   ],
 )
+
+// One row per (Session, canonical skill name): the latest selection generation
+// plus its tombstones. Selections are event-sourced; this projection is the
+// read model the skill gate and the Settings overview consume.
+export const SessionSkillSelectionTable = sqliteTable(
+  "session_skill_selection",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    name: text().notNull(),
+    generation: integer().notNull(),
+    origin_kind: text().$type<SkillSelectionOriginKind>().notNull(),
+    origin_id: text().notNull(),
+    origin_seq: integer().notNull(),
+    selected_at: integer().notNull(),
+    limit_minutes: integer().notNull(),
+    limit_messages: integer().notNull(),
+    forgotten_at: integer(),
+    // Durable adoption fence in the Session aggregate sequence space: lazy
+    // backfill may never adopt an origin at or before this sequence.
+    forgotten_seq: integer(),
+    // Last named-forget operation observed for this selection; reconciliation
+    // only (forget-all keeps its identity on the barrier row).
+    operation_id: text(),
+    renewal_declined_at: integer(),
+    renewal_declined_generation: integer(),
+    // Native receipts stay valid for the waiting call they were coordinated
+    // with; input origins always need to precede the consuming tool call.
+    bound_message_id: text().$type<SessionMessage.ID>(),
+    // The chat message admitted together with a native receipt. It must never
+    // create a second selection or a second counter booking later.
+    receipt_input_id: text().$type<SessionMessage.ID>(),
+    ...Timestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.session_id, table.name] }),
+    index("session_skill_selection_session_idx").on(table.session_id),
+    index("session_skill_selection_receipt_input_idx").on(table.session_id, table.receipt_input_id),
+  ],
+)
+
+// Forget-all writes a durable fence so lazy backfill can never resurrect
+// origins that predate the user's decision.
+export const SessionSkillSelectionBarrierTable = sqliteTable(
+  "session_skill_selection_barrier",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .primaryKey()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    forgotten_seq: integer().notNull(),
+    operation_id: text(),
+    operation_name: text(),
+    operation_payload: text(),
+    ...Timestamps,
+  },
+)
+
+export type SkillSelectionOriginKind = "input" | "chat_send" | "command" | "renewal"

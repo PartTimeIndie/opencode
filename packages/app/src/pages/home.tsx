@@ -112,7 +112,7 @@ function homeSessionSearchKey(record: HomeSessionRecord) {
 }
 
 function projectsFor(ctx: ServerCtx) {
-  return homeProjectsFor(ctx.projects.list(), ctx.sync.data.project)
+  return homeProjectsFor(ctx.projects.list(), ctx.projects.inventory())
 }
 
 export default function Home() {
@@ -254,11 +254,11 @@ function HomeDesign() {
     setSelection(next)
   }
 
-  function addProjects(conn: ServerConnection.Any, directories: string[]) {
-    const directory = directories[0]
-    if (!directory) return
+  async function addProjects(conn: ServerConnection.Any, directories: string[]) {
     const ctx = global.createServerCtx(conn)
-    directories.forEach(ctx.projects.open)
+    const registered = await Promise.all(directories.map(ctx.projects.register))
+    const directory = registered.find(Boolean)
+    if (!directory) return
     ctx.projects.touch(directory)
     setSelection({ server: ServerConnection.key(conn), directory })
   }
@@ -666,6 +666,7 @@ function HomeProjectRow(props: {
         class={`${HOME_PROJECT_NAV_ROW} pr-16`}
         data-selected={props.selected ? "" : undefined}
         aria-current={props.selected ? "page" : undefined}
+        title={props.project.worktree}
         onClick={() => props.selectProject(props.server, props.project.worktree)}
       >
         <HomeProjectAvatar project={props.project} />
@@ -733,7 +734,7 @@ function HomeProjectAvatar(props: { project: LocalProject }) {
     <ProjectAvatar
       fallback={name()}
       src={getProjectAvatarSource(props.project.id, props.project.icon)}
-      monochrome={getProjectAvatarMonochrome(props.project.id)}
+      monochrome={getProjectAvatarMonochrome(props.project.id, props.project.icon)}
       variant={getProjectAvatarVariant(props.project.icon?.color)}
     />
   )
@@ -753,7 +754,7 @@ function HomeSessionAvatar(props: {
     <ProjectAvatar
       fallback={displayName(props.project)}
       src={getProjectAvatarSource(props.project.id, props.project.icon)}
-      monochrome={getProjectAvatarMonochrome(props.project.id)}
+      monochrome={getProjectAvatarMonochrome(props.project.id, props.project.icon)}
       variant={getProjectAvatarVariant(props.project.icon?.color)}
       unread={state.unread()}
       loading={state.loading()}

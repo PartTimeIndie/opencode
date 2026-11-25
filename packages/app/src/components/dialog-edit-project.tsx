@@ -81,24 +81,30 @@ export function DialogEditProject(props: { project: LocalProject; server: Server
       const start = store.startup.trim()
 
       if (props.project.id && props.project.id !== "global") {
-        await serverSDK().client.project.update({
+        const result = await serverSDK().client.project.update({
           projectID: props.project.id,
           directory: props.project.worktree,
           name,
           icon: { color: store.color || "", override: store.iconOverride || "" },
           iconGeneration: { mode: store.iconMode },
           commands: { start },
-        })
-        serverSync().project.icon(props.project.worktree, store.iconOverride || undefined)
+        }, { throwOnError: true })
+        if (result.data) {
+          const updated = result.data
+          serverSync().set("project", (projects) => projects.map((project) => project.id === updated.id ? { ...project, ...updated } : project))
+        }
+        serverSync().project.icon(props.project.worktree, result.data.icon?.override || undefined)
         dialog.close()
         return
       }
 
+      const saved = await serverCtx().setDirectoryIcon(props.project.worktree, store.iconOverride || undefined)
       serverSync().project.meta(props.project.worktree, {
         name,
-        icon: { color: store.color || undefined, override: store.iconOverride || undefined },
+        icon: { color: store.color || undefined, override: undefined },
         commands: { start: start || undefined },
       })
+      serverSync().project.icon(props.project.worktree, saved.icon?.override)
       dialog.close()
     },
   }))
@@ -224,6 +230,9 @@ export function DialogEditProject(props: { project: LocalProject; server: Server
                 onChange={handleInputChange}
               />
               <div class="flex flex-col gap-1.5 text-12-regular text-text-weak self-center">
+                <Button type="button" variant="secondary" onClick={() => iconInput?.click()}>
+                  {language.t("dialog.project.edit.icon.choose")}
+                </Button>
                 <span>{language.t("dialog.project.edit.icon.hint")}</span>
                 <span>{language.t("dialog.project.edit.icon.recommended")}</span>
               </div>
@@ -328,6 +337,9 @@ export function DialogEditProject(props: { project: LocalProject; server: Server
           />
         </div>
 
+        <Show when={saveMutation.isError}>
+          <p role="alert" class="text-12-regular text-text-critical-base">{language.t("dialog.project.edit.saveFailed")}</p>
+        </Show>
         <div class="flex justify-end gap-2">
           <Button type="button" variant="ghost" size="large" onClick={() => dialog.close()}>
             {language.t("common.cancel")}

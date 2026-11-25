@@ -95,6 +95,8 @@ const GeminiThinkingConfig = Schema.Struct({
 })
 
 const GeminiGenerationConfig = Schema.Struct({
+  responseMimeType: Schema.optional(Schema.String),
+  responseJsonSchema: Schema.optional(JsonObject),
   maxOutputTokens: Schema.optional(Schema.Number),
   temperature: Schema.optional(Schema.Number),
   topP: Schema.optional(Schema.Number),
@@ -301,6 +303,9 @@ const fromRequest = Effect.fn("Gemini.fromRequest")(function* (request: LLMReque
   const toolsEnabled = request.tools.length > 0 && request.toolChoice?.type !== "none"
   const generation = request.generation
   const generationConfig = {
+    ...(request.responseFormat?.type === "json"
+      ? { responseMimeType: "application/json", responseJsonSchema: request.responseFormat.schema }
+      : request.responseFormat?.type === "text" ? { responseMimeType: "text/plain" } : {}),
     maxOutputTokens: generation?.maxTokens,
     temperature: generation?.temperature,
     topP: generation?.topP,
@@ -460,6 +465,7 @@ const step = (state: ParserState, event: GeminiEvent) => {
  */
 export const protocol = Protocol.make({
   id: ADAPTER,
+  jsonSchema: true,
   body: {
     schema: GeminiBody,
     from: fromRequest,

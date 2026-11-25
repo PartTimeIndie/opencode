@@ -9,6 +9,8 @@ import type {
   UserMessage,
 } from "@opencode-ai/sdk/v2"
 import { compareMessageTime } from "@/utils/message-order"
+import { toolDetailsMetadata } from "@opencode-ai/core/util/tool-details"
+import { recoveryNotice } from "./recovery-notice"
 
 const fallbackModel: UserMessage["model"] = { providerID: "", modelID: "" }
 
@@ -38,7 +40,14 @@ export function adaptSessionMessages(sessionID: string, input: readonly SessionM
       })
       continue
     }
-    if (message.type === "system") continue
+    if (message.type === "system") {
+      if (parentID && message.metadata?.systemNotice === "server-recovery") {
+        const notice = recoveryNotice(sessionID, message, parentID)
+        messages.push(notice.message)
+        parts.push({ id: message.id, part: notice.parts })
+      }
+      continue
+    }
 
     const adapted = adaptUserLikeMessage(sessionID, message, agent, model)
     if (!adapted) continue
@@ -53,7 +62,7 @@ export function adaptSessionMessages(sessionID: string, input: readonly SessionM
 export function needsOlderSessionMessageContext(input: readonly SessionMessage[]) {
   for (const message of orderedSessionMessages(input)) {
     if (isUserLikeMessage(message)) return false
-    if (message.type === "assistant") return true
+    if (message.type === "assistant" || (message.type === "system" && message.metadata?.systemNotice === "server-recovery")) return true
   }
   return false
 }
@@ -267,7 +276,8 @@ function adaptToolPart(sessionID: string, message: SessionMessageAssistant, cont
 
 function toolMetadata(content: SessionMessageAssistantTool) {
   const metadata = content.provider?.resultMetadata ?? {}
-  if (content.name !== "task" || content.state.status === "pending") return metadata
+  if (content.state.status === "pending") return metadata
+  if (content.name !== "task") return toolDetailsMetadata(content.name, content.state.structured, metadata)
   const structured = content.state.structured
   return {
     ...metadata,

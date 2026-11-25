@@ -42,6 +42,40 @@ const expectToolOutput = (body: OpenAIResponses.OpenAIResponsesBody): OpenAITool
 
 describe("OpenAI Responses route", () => {
   for (const codex of [false, true]) {
+    for (const affinity of [undefined, "ocf_shared_family"]) {
+      it.effect(`maps explicit cache affinity to Codex session-id only (codex=${codex}, affinity=${affinity})`, () =>
+        Effect.gen(function* () {
+          const headers = { "Session-Id": "actual-child-session", ...(affinity ? { "X-Session-Affinity": affinity } : {}) }
+          const input = LLM.updateRequest(request, {
+            model: (codex ? OpenAIResponses.codexRoute : OpenAIResponses.route)
+              .with({ auth: Auth.bearer("test-token").andThen(Auth.headers({ "ChatGPT-Account-Id": "test-account" })) })
+              .model({ id: "fixture" }),
+            providerOptions: { openai: { store: false, promptCacheKey: "body-cache-key" } },
+            http: { headers, body: { max_output_tokens: 999, metadata: { local: "kept" } } },
+          })
+          yield* LLMClient.generate(input).pipe(Effect.provide(dynamicResponse((transport) =>
+            Effect.gen(function* () {
+              const web = yield* HttpClientRequest.toWeb(transport.request).pipe(Effect.orDie)
+              expect(web.headers.get("session-id")).toBe(codex && affinity ? affinity : "actual-child-session")
+              expect(web.headers.get("authorization")).toBe("Bearer test-token")
+              expect(web.headers.get("chatgpt-account-id")).toBe("test-account")
+              const body = yield* Effect.promise(() => web.json())
+              expect(body).toMatchObject({ prompt_cache_key: "body-cache-key", store: false, metadata: { local: "kept" } })
+              if (codex) expect(body).not.toHaveProperty("max_output_tokens")
+              else expect(body).toHaveProperty("max_output_tokens", 999)
+              return transport.respond(sseEvents({ type: "response.completed", response: {} }), {
+                headers: { "content-type": "text/event-stream" },
+              })
+            }),
+          )))
+          expect(input.http?.headers).toEqual(headers)
+          expect(headers["Session-Id"]).toBe("actual-child-session")
+        }),
+      )
+    }
+  }
+
+  for (const codex of [false, true]) {
     for (const overlay of [false, true]) {
       it.effect(
         `preserves HTTP request semantics with ${codex ? "Codex" : "API-key"} auth and overlay=${overlay}`,
@@ -270,13 +304,52 @@ describe("OpenAI Responses route", () => {
             properties: {
               path: { type: "string" },
               reference: { type: "string" },
-              limit: { type: "integer", maximum: 2000 },
+              limit: {
+                anyOf: [{ type: "integer", maximum: 2000 }, { type: "integer", maximum: 51200 }],
+              },
               resource: { type: "string" },
             },
             additionalProperties: false,
           },
         },
       ])
+    }),
+  )
+
+  it.effect("retains every management action when flattening a discriminated tool union", () =>
+    Effect.gen(function* () {
+      const actions = ["dispatch", "status", "wait", "review", "answer", "integrate", "cancel", "settle"]
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.updateRequest(request, {
+          tools: [{
+            name: "orchestrator",
+            description: "Manage commissioned work.",
+            inputSchema: {
+              anyOf: [
+                { type: "object", properties: { tasks: { type: "array", items: { type: "object" } } }, required: ["tasks"] },
+                ...actions.map((action) => ({
+                  type: "object",
+                  properties: { action: { const: action }, originInputID: { type: "string" } },
+                  required: ["action"],
+                })),
+              ],
+            },
+          }],
+        }),
+      )
+      expect(prepared.body.tools?.[0]).toMatchObject({
+        type: "function",
+        name: "orchestrator",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { anyOf: actions.map((action) => ({ type: "string", enum: [action] })) },
+            originInputID: { type: "string" },
+            tasks: { type: "array", items: { type: "object" } },
+          },
+          additionalProperties: false,
+        },
+      })
     }),
   )
 

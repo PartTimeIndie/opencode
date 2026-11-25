@@ -173,8 +173,8 @@ describe("SessionRunnerModel", () => {
       ],
     })
   }
-  const luna = oauthSmallModel("gpt-5.6-luna")
-  const sol = oauthSmallModel("gpt-5.6-sol")
+  const luna = oauthSmallModel("gpt-6-luna")
+  const sol = oauthSmallModel("gpt-6.1-sol")
   const oauthLayer = (available: { readonly luna: boolean; readonly sol: boolean }) =>
     SessionRunnerModel.locationLayer.pipe(
       Layer.provide(
@@ -186,15 +186,16 @@ describe("SessionRunnerModel", () => {
           },
           model: {
             get: (_providerID, modelID) => {
-              if (modelID === ModelV2.ID.make("gpt-5.6-luna"))
+              if (modelID === luna.id)
                 return available.luna
                   ? Effect.succeed(luna)
                   : Effect.fail(new Catalog.ModelNotFoundError({ providerID: selected.providerID, modelID }))
-              if (modelID === ModelV2.ID.make("gpt-5.6-sol"))
+              if (modelID === sol.id)
                 return available.sol
                   ? Effect.succeed(sol)
                   : Effect.fail(new Catalog.ModelNotFoundError({ providerID: selected.providerID, modelID }))
-              return Effect.succeed(selected)
+              if (modelID === selected.id) return Effect.succeed(selected)
+              return Effect.fail(new Catalog.ModelNotFoundError({ providerID: selected.providerID, modelID }))
             },
             all: () => Effect.succeed([selected, luna, sol]),
             available: () => Effect.succeed([selected, luna, sol]),
@@ -286,14 +287,14 @@ describe("SessionRunnerModel", () => {
       const resolved = Option.getOrThrow(yield* service.resolveSmall(session))
       const prepared = yield* LLMClient.prepare<OpenAI56Body>(LLM.request({ model: resolved, prompt: "Title" }))
 
-      expect(String(resolved.id)).toBe("gpt-5.6-luna")
+      expect(String(resolved.id)).toBe("gpt-6-luna")
       expect(prepared.route).toBe("openai-responses-codex")
-      expect(prepared.metadata).toEqual({ transport: "http-json/codex" })
+      expect(prepared.metadata).toEqual({ transport: "http-json/codex-affinity-v1" })
       expect(prepared.body.reasoning).toEqual({ effort: "low" })
     }),
   )
 
-  oauthMissingLunaIt.effect("falls back to GPT-5.6 SOL without inheriting max", () =>
+  oauthMissingLunaIt.effect("falls back to GPT-6.1 SOL without inheriting max", () =>
     Effect.gen(function* () {
       const service = yield* SessionRunnerModel.Service
       const session = SessionV2.Info.make({
@@ -310,7 +311,7 @@ describe("SessionRunnerModel", () => {
       const resolved = Option.getOrThrow(yield* service.resolveSmall(session))
       const prepared = yield* LLMClient.prepare<OpenAI56Body>(LLM.request({ model: resolved, prompt: "Title" }))
 
-      expect(String(resolved.id)).toBe("gpt-5.6-sol")
+      expect(String(resolved.id)).toBe("gpt-6.1-sol")
       expect(prepared.body.reasoning).toEqual({ effort: "low" })
     }),
   )
@@ -454,7 +455,7 @@ describe("SessionRunnerModel", () => {
       const baseBody = basePrepared.body
       expect(base.route.endpoint.baseURL).toBe("https://chatgpt.com/backend-api/codex")
       expect(basePrepared.route).toBe("openai-responses-codex")
-      expect(basePrepared.metadata).toEqual({ transport: "http-json/codex" })
+      expect(basePrepared.metadata).toEqual({ transport: "http-json/codex-affinity-v1" })
       expect(baseBody).toMatchObject({ model: "gpt-5.6-sol", store: false })
       expect(baseBody.reasoning).toEqual({ effort: "max", summary: "auto" })
 

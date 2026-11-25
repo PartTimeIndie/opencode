@@ -3,10 +3,21 @@ import { LLMError, TransportReason } from "@opencode-ai/llm"
 import {
   AIChainLimits,
   chainStepFailureEligible,
+  chainStepRetryEligible,
   hasNonRetryableHttpStatus,
   normalizeAIChainSteps,
   providerFailureCode,
 } from "../src/ai-chain"
+
+describe("AIChain.chainStepRetryEligible", () => {
+  test("retries transient limits but not exhausted quota or retired models", () => {
+    expect(chainStepRetryEligible(Object.assign(new Error("Rate limit exceeded"), { statusCode: 429 }))).toBe(true)
+    expect(chainStepRetryEligible(new Error("insufficient_quota: account credits exhausted"))).toBe(false)
+    expect(chainStepRetryEligible(new Error("quota exceeded for this billing period"))).toBe(false)
+    expect(chainStepRetryEligible(Object.assign(new Error("model not found"), { statusCode: 404 }))).toBe(false)
+    expect(chainStepRetryEligible(new Error("authentication failed"))).toBe(false)
+  })
+})
 
 describe("AIChain.normalizeAIChainSteps", () => {
   test("classifies Cerebras TPM exhaustion without mistaking it for context overflow", () => {
@@ -100,6 +111,21 @@ describe("AIChain.normalizeAIChainSteps", () => {
 })
 
 describe("AIChain.chainStepFailureEligible", () => {
+  test("never renews a consumed format correction through generic or permissive chain fallback", () => {
+    const correction = new LLMError({
+      module: "RequestExecutor", method: "execute", structuredOutputCorrectionAttempted: true,
+      reason: new TransportReason({ kind: "provider-error", message: "service unavailable", canRetry: true, status: 503 }),
+    })
+    for (const error of [correction, new Error("wrapped", { cause: correction }), JSON.parse(JSON.stringify(correction))]) {
+      expect(chainStepFailureEligible(error)).toBe(false)
+      expect(chainStepFailureEligible(error, { provider: true, authorization: true })).toBe(false)
+      expect(chainStepRetryEligible(error)).toBe(false)
+    }
+    expect(chainStepFailureEligible(new LLMError({
+      module: correction.module, method: correction.method, reason: correction.reason,
+    }))).toBe(true)
+  })
+
   test("allows fallback after output truncation but not invalid token-budget requests", () => {
     expect(chainStepFailureEligible(new Error("Incomplete model response: output token budget exhausted"))).toBe(true)
     expect(

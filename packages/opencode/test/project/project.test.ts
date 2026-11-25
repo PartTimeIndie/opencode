@@ -23,6 +23,7 @@ import { ProjectDirectories } from "@opencode-ai/core/project/directories"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { rasterIcon, rasterSize } from "../lib/icon"
 
 const encoder = new TextEncoder()
 
@@ -476,7 +477,7 @@ describe("Project.discover", () => {
 
       yield* project.update({
         projectID: result.project.id,
-        icon: { override: "data:image/png;base64,override" },
+        icon: { override: rasterIcon(256) },
       })
 
       const updatedProject = yield* project.get(result.project.id)
@@ -489,7 +490,7 @@ describe("Project.discover", () => {
 
       const updated = yield* project.get(result.project.id)
       expect(updated).toBeDefined()
-      expect(updated!.icon?.override).toBe("data:image/png;base64,override")
+      expect(updated!.icon?.override).toStartWith("data:image/png;base64,")
       expect(updated!.icon?.url).toBeUndefined()
     }),
   )
@@ -558,13 +559,14 @@ describe("Project.update", () => {
 
       const updated = yield* project.update({
         projectID: result.project.id,
-        icon: { override: "data:image/png;base64,abc123" },
+        icon: { override: rasterIcon(256) },
       })
 
-      expect(updated.icon?.override).toBe("data:image/png;base64,abc123")
+      // Uploads are stored as normalized 128px thumbnails, never verbatim.
+      expect(rasterSize(updated.icon?.override!)).toEqual({ width: 128, height: 128 })
 
       const fromDb = yield* project.get(result.project.id)
-      expect(fromDb?.icon?.override).toBe("data:image/png;base64,abc123")
+      expect(fromDb?.icon?.override).toBe(updated.icon?.override)
     }),
   )
 
@@ -576,7 +578,7 @@ describe("Project.update", () => {
 
       yield* project.update({
         projectID: result.project.id,
-        icon: { url: "https://example.com/favicon.png", override: "data:image/png;base64,manual", color: "purple" },
+        icon: { url: "https://example.com/favicon.png", override: rasterIcon(256), color: "purple" },
       })
       const updated = yield* project.update({
         projectID: result.project.id,
@@ -584,12 +586,12 @@ describe("Project.update", () => {
         iconGeneration: { mode: "enabled" },
       })
 
-      expect(updated.icon).toEqual({
+      expect(updated.icon).toMatchObject({
         url: "https://example.com/favicon.png",
-        override: "data:image/png;base64,manual",
         color: "purple",
         generated: "data:image/png;base64,generated",
       })
+      expect(rasterSize(updated.icon!.override!)).toEqual({ width: 128, height: 128 })
       expect(updated.iconGeneration?.mode).toBe("enabled")
       expect(updated.iconGeneration?.attempt).toBeGreaterThan(0)
     }),
@@ -657,13 +659,13 @@ describe("Project.update", () => {
       const updated = yield* project.update({
         projectID: result.project.id,
         name: "Multi Update",
-        icon: { url: "https://example.com/favicon.ico", override: "data:image/png;base64,abc123", color: "#00ff00" },
+        icon: { url: "https://example.com/favicon.ico", override: rasterIcon(256), color: "#00ff00" },
         commands: { start: "make start" },
       })
 
       expect(updated.name).toBe("Multi Update")
       expect(updated.icon?.url).toBe("https://example.com/favicon.ico")
-      expect(updated.icon?.override).toBe("data:image/png;base64,abc123")
+      expect(rasterSize(updated.icon?.override!)).toEqual({ width: 128, height: 128 })
       expect(updated.icon?.color).toBe("#00ff00")
       expect(updated.commands?.start).toBe("make start")
     }),

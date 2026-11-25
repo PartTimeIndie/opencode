@@ -1,6 +1,6 @@
 export * as PermissionSafetyReview from "./safety-review"
 
-import { LLM } from "@opencode-ai/llm"
+import { LLM, LLMError, type LLMRequest } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor } from "@opencode-ai/llm/route"
 import { Cause, Context, Effect, Exit, Layer, Option, Schema } from "effect"
 import { produce } from "immer"
@@ -23,6 +23,17 @@ const Decision = Schema.Struct({
 const decodeJson = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 const decodeDecision = Schema.decodeUnknownOption(Decision)
 
+/** One technical result contract; the safety chain cannot renew its format budget. */
+export const generateDecision = Effect.fn("PermissionSafetyReview.generateDecision")(function* (request: LLMRequest) {
+  const result = yield* LLM.generateObject({
+    ...request,
+    schema: Decision,
+    retryCount: 1,
+    http: { ...request.http, retries: 0 },
+  })
+  return result.object
+})
+
 export type ReviewInput = {
   readonly safety: ConfigAccessControl.SafetyReview | undefined
   readonly sessionID: string
@@ -41,6 +52,8 @@ export type Attempt = {
   readonly status: "safe" | "unsafe" | "unavailable" | "transport_error" | "malformed"
   readonly reason?: string
   readonly transient?: boolean
+  readonly formatFailure?: boolean
+  readonly correctionAttempted?: boolean
 }
 
 export type Result = {
@@ -121,7 +134,7 @@ export const layer = Layer.effect(
         yield* Effect.logWarning("permission safety review model unavailable", reviewLog(input, reviewer.model, role))
         return { role, model: reviewer.model, status: "unavailable" as const, reason: "Model unavailable" }
       }
-      const result = yield* LLM.generate(
+      const result = yield* generateDecision(
         LLM.request({
           model: model.value,
           system:
@@ -145,29 +158,9 @@ export const layer = Layer.effect(
           ...reviewLog(input, reviewer.model, role),
           error: String(error),
         })
-        return {
-          role,
-          model: reviewer.model,
-          status: "transport_error" as const,
-          reason: "Provider request failed",
-          transient: AIChain.chainStepFailureEligible(error),
-        }
+        return { role, model: reviewer.model, ...classifyFailure(error) }
       }
-      const decoded = decodeDecisionFromText(result.value.text)
-      if (!decoded) {
-        const empty = result.value.text.trim().length === 0
-        yield* Effect.logWarning("permission safety review produced unparseable output", {
-          ...reviewLog(input, reviewer.model, role),
-          outputLength: result.value.text.length,
-        })
-        return {
-          role,
-          model: reviewer.model,
-          status: empty ? "transport_error" as const : "malformed" as const,
-          reason: empty ? "Reviewer produced no output" : "Invalid reviewer output",
-          transient: empty ? true : undefined,
-        }
-      }
+      const decoded = result.value
       yield* Effect.logInfo("permission safety review decision", {
         ...reviewLog(input, reviewer.model, role),
         decision: decoded.decision,
@@ -201,6 +194,8 @@ export const layer = Layer.effect(
         if (!primary) return { approved: false, cause: "reviewers_unavailable", risk: "high", attempts: [] }
         if (primary.status === "safe")
           return { approved: true, cause: "primary_safe", risk: "low", attempts: primaryAttempts }
+        if (primary.formatFailure || primary.correctionAttempted)
+          return { approved: false, cause: "reviewers_unavailable", risk: "high", attempts: primaryAttempts }
         const fallback = input.safety.fallback?.model
           ? yield* attempt(input, input.safety.fallback, "fallback")
           : undefined
@@ -217,17 +212,27 @@ export const layer = Layer.effect(
   }),
 )
 
-// A technical review failure must never end the permission review early:
-// transient stages get one bounded retry, every other technical outcome
-// (malformed output, non-transient transport errors, unresolvable models)
-// advances to the next configured chain stage. Only an explicit reviewer
-// decision terminates the chain, so an "unsafe" verdict can never disappear
-// behind a transport or parsing problem, and a technical problem can never
-// be mistaken for a verdict.
+export function classifyFailure(error: unknown) {
+  const formatFailure = error instanceof LLMError && error.module === "LLM" &&
+    error.method === "generateObject" && error.reason._tag === "InvalidProviderOutput"
+  const correctionAttempted = error instanceof LLMError && error.structuredOutputCorrectionAttempted === true
+  return {
+    status: formatFailure ? "malformed" as const : "transport_error" as const,
+    reason: formatFailure ? "Invalid reviewer output after the bounded format correction" : "Provider request failed",
+    ...(formatFailure ? { formatFailure: true } : {}),
+    ...(correctionAttempted ? { correctionAttempted: true } : {}),
+    transient: !formatFailure && !correctionAttempted && AIChain.chainStepFailureEligible(error),
+  }
+}
+
+// Provider failures keep the configured technical fallback policy. Exhausted
+// structured-output failures instead stop fail-closed: switching chain stages
+// must not renew the assignment's one same-model format correction. Neither
+// kind of technical failure is a safety verdict.
 export const MAX_STAGE_ATTEMPTS = 2
 
 export function nextChainAction(attempt: Attempt, stageAttempts: number): "stop" | "retry" | "advance" {
-  if (attempt.status === "safe" || attempt.status === "unsafe") return "stop"
+  if (attempt.status === "safe" || attempt.status === "unsafe" || attempt.formatFailure || attempt.correctionAttempted) return "stop"
   if (stageAttempts >= MAX_STAGE_ATTEMPTS) return "advance"
   return attempt.transient ? "retry" : "advance"
 }
@@ -257,7 +262,8 @@ export function runReviewerChain(
 // otherwise strict JSON decision: markdown fences, surrounding prose,
 // multiple objects, and trailing commas. The decision vocabulary itself stays
 // exact - anything that does not decode to {"decision":"safe"|"unsafe",
-// "reason":string} stays malformed and the chain advances to the next stage.
+// "reason":string} stays malformed. Legacy utility only: live reviews use the
+// technical generateDecision contract, not syntax extraction or chain repair.
 export function decodeDecisionFromText(text: string) {
   for (const candidate of decisionCandidates(text)) {
     for (const value of [candidate, stripTrailingCommas(candidate)]) {

@@ -144,19 +144,16 @@ export const activateFromSlash = Effect.fn("CapabilityLease.activateFromSlash")(
   readonly text: string
 }) {
   const name = input.text.trim().match(slashName)?.[1]
-  if (!name) return
   const leases = Option.getOrUndefined(yield* Effect.serviceOption(Service))
   const skills = Option.getOrUndefined(yield* Effect.serviceOption(SkillV2.Service))
   if (!leases || !skills) return
-  const skill = (yield* skills.list()).find((item) => item.name === name || item.aliases?.includes(name))
-  const requested = skill?.requestedCapabilities ?? []
-  if (!skill || requested.length === 0) return
-  yield* leases
-    .activate({
-      sessionID: input.sessionID,
-      agent: input.agent,
-      skill: skill.name,
-      requested,
-    })
-    .pipe(Effect.catchTag("CapabilityLease.DeniedError", () => Effect.void))
+  for (const skill of yield* skills.list()) {
+    const requested = skill.requestedCapabilities
+    if (!requested?.length) continue
+    const leading = skill.name === name || (name !== undefined && skill.aliases?.includes(name))
+    if (!leading) continue
+    yield* leases
+      .activate({ sessionID: input.sessionID, agent: input.agent, skill: skill.name, requested })
+      .pipe(Effect.catchTag("CapabilityLease.DeniedError", () => Effect.void))
+  }
 })

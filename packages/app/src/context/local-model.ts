@@ -68,9 +68,13 @@ export function toSessionModelRef(selection: LocalModelSelection, chains: LocalM
 
   if (!selection.model) return
   const variant = selection.variant ?? selection.model.variant
+  // A picked model is a deliberate direct selection. Without the explicit null the
+  // server keeps the session's chain and only moves its active step, so the chain
+  // would still advance to later models after the user chose a single model.
   return {
     id: selection.model.modelID,
     providerID: selection.model.providerID,
     ...(variant ? { variant } : {}),
+    chain: null,
   }
 }

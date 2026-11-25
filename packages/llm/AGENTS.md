@@ -12,6 +12,27 @@
 
 Per-type constructors live on the type, not as top-level re-exports. Use `Message.system(...)`, `Message.user(...)`, `Message.assistant(...)`, `Message.tool(...)`, `Model.make(...)`, `ToolDefinition.make(...)`, `ToolCallPart.make(...)`, `ToolResultPart.make(...)`, `ToolChoice.make(...)`, `ToolChoice.named(...)`, `SystemPart.make(...)`, and `GenerationOptions.make(...)` directly. The top-level `LLM` namespace is reserved for request-shaped call APIs: `LLM.request`, `LLM.generate`, `LLM.stream`, `LLM.updateRequest`, and `LLM.generateObject`. Two ways to construct the same thing is one too many.
 
+Structured-output transport is not result validation. Preserve the original schema,
+validate raw result input before a decoder can remove extra fields, and fail before
+HTTP for unsupported rules. Extend the conservative validator with semantic tests;
+never replace it with a best-effort JSON-Schema conversion that silently drops
+constraints. Review confidence uses inclusive `minimum`/`maximum` bounds; keep
+those constraints enforced locally and cover the registered review schema at the
+runner boundary so a validator change cannot disable every reviewer before HTTP.
+`generateObject` owns at most one format correction; low-level stream
+and transport code must not add another. Propagate the error's
+`structuredOutputCorrectionAttempted` marker across caller boundaries: a failed
+correction must not renew the budget through model-chain retries or fallback.
+Preserve the original provider/transport error classification. Keep original/corrected responses separate,
+account for both requests and preserve `retryCount: 0`. A completed wire-format test
+does not prove a provider model enforces the schema. See `README.md#structured-results`.
+Select native output only for a proven provider/endpoint profile, not because a
+compatible route shares a wire protocol. Enable strict mode only when the original
+schema already fits the conservative strict subset. Count expanded references and
+bound both compilation and validation work; memoization alone does not bound a
+reference graph's execution cost. Preserve the structured transport version in
+managed request fingerprints and reject HTTP overlays that replace the contract.
+
 ## Tests
 
 - Use `testEffect(...)` from `test/lib/effect.ts` for tests requiring Effect layers.

@@ -9,6 +9,8 @@ import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { DelegationPreferences } from "@opencode-ai/core/session/delegation-preferences"
+import { PermissionV2 } from "@opencode-ai/core/permission"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -153,6 +155,216 @@ const interruptEvent = Database.Service.use(({ db }) =>
 )
 
 describe("SessionV2.prompt", () => {
+  it.effect("rolls back Goal admission and its receipt when metadata projection fails", () => Effect.gen(function* () {
+    yield* setup
+    const sessions = yield* SessionV2.Service
+    const events = yield* EventV2.Service
+    yield* sessions.patchMetadata({ sessionID, patch: { set: { goal: "original" } } })
+    yield* events.project(SessionEvent.MetadataPatched, () => Effect.die(new Error("Goal metadata publication failed")))
+    const id = SessionMessage.ID.create()
+    const wakes = wakeCalls.length
+    const outcome = yield* sessions.prompt({ sessionID, id, prompt: new Prompt({ text: "continue" }),
+      metadataPatchOnAdmission: { set: { goal: "replacement", status: "active receipt" } },
+    }).pipe(Effect.exit)
+    expect(outcome._tag).toBe("Failure")
+    expect(yield* admitted(id)).toBeUndefined()
+    expect((yield* sessions.get(sessionID)).metadata?.goal).toBe("original")
+    expect((yield* sessions.get(sessionID)).metadata?.status).toBeUndefined()
+    expect(wakeCalls.length).toBe(wakes)
+  }))
+  it.effect("fences goal admission and commits its metadata only with a new durable input", () => Effect.gen(function* () {
+    yield* setup
+    const sessions = yield* SessionV2.Service
+    yield* sessions.patchMetadata({ sessionID, patch: { set: { goal: "new", status: "paused" } } })
+    const stale = yield* sessions.prompt({ sessionID, prompt: new Prompt({ text: "old continuation" }), resume: false,
+      expectedMetadata: { goal: "old" }, metadataPatchOnAdmission: { set: { status: "stale" } },
+    }).pipe(Effect.flip)
+    expect(stale._tag).toBe("SessionBusyError")
+    expect((yield* sessions.get(sessionID)).metadata?.status).toBe("paused")
+    const id = SessionMessage.ID.create()
+    const request = { sessionID, id, prompt: new Prompt({ text: "command" }), resume: false,
+      metadataPatchOnAdmission: { set: { goal: "first", status: "receipt" } },
+    }
+    yield* sessions.prompt(request)
+    expect((yield* sessions.get(sessionID)).metadata?.status).toBe("receipt")
+    yield* sessions.patchMetadata({ sessionID, patch: { set: { goal: "replacement", status: "paused" } } })
+    yield* sessions.prompt(request)
+    expect((yield* sessions.get(sessionID)).metadata?.goal).toBe("replacement")
+    const conflict = yield* sessions.prompt({ ...request, prompt: new Prompt({ text: "different" }) }).pipe(Effect.flip)
+    expect(conflict._tag).toBe("Session.PromptConflictError")
+    expect((yield* sessions.get(sessionID)).metadata?.goal).toBe("replacement")
+  }))
+  it.effect("preserves each durable subtask command boundary between ordinary steers", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const sessions = yield* SessionV2.Service
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const subtask = { command: "delegate", description: "Delegate work", agent: AgentV2.ID.make("build"),
+        model: { providerID: ProviderV2.ID.make("test"), id: ModelV2.ID.make("model") } }
+      const prompts = [new Prompt({ text: "before" }), new Prompt({ text: "first", subtask }),
+        new Prompt({ text: "second", subtask }), new Prompt({ text: "after" })]
+      const inputs = yield* Effect.forEach(prompts, (prompt) => sessions.prompt({
+        sessionID, id: SessionMessage.ID.create(), prompt, resume: false,
+      }))
+      for (const [index, input] of inputs.entries()) {
+        expect(yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)).toBe(1)
+        expect((yield* SessionInput.find(db, input.id))?.promotedSeq).toBeDefined()
+        expect((yield* SessionInput.find(db, input.id))?.prompt).toEqual(prompts[index])
+        const next = inputs[index + 1]
+        if (next) expect((yield* SessionInput.find(db, next.id))?.promotedSeq).toBeUndefined()
+        if (input.prompt.subtask) {
+          // A model/epoch rebuild before dispatch must not promote over the command.
+          expect(yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)).toBe(0)
+          const assistantMessageID = SessionMessage.ID.create()
+          yield* events.publish(SessionEvent.Step.Started, { sessionID, assistantMessageID,
+            agent: subtask.agent, model: subtask.model, timestamp: yield* DateTime.now })
+          yield* events.publish(SessionEvent.Step.Ended, { sessionID, assistantMessageID,
+            finish: "tool-calls", cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            timestamp: yield* DateTime.now })
+        }
+      }
+      expect(yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)).toBe(0)
+      const command = inputs[1]
+      if (!command) return yield* Effect.die("Missing test command")
+      const exact = yield* sessions.prompt({ sessionID, id: command.id, prompt: command.prompt, resume: false })
+      expect(exact.admittedSeq).toBe(command.admittedSeq)
+      const changed = yield* sessions.prompt({ sessionID, id: command.id,
+        prompt: new Prompt({ ...command.prompt, subtask: { ...subtask, command: "other" } }), resume: false,
+      }).pipe(Effect.as("unexpected"), Effect.catchTag("Session.PromptConflictError", () => Effect.succeed("conflict")))
+      expect(changed).toBe("conflict")
+      expect(yield* admittedCount).toBe(4)
+    }),
+  )
+
+  it.effect("shares scoped preference routing with explicit preconditions and defaults only to this Session", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const sessions = yield* SessionV2.Service
+      const authorized: string[] = []
+      const dependencies: DelegationPreferences.ScopedDependencies = { sessions,
+        writer: { read: () => Effect.die("Session scope must not read a config file"),
+          update: () => Effect.die("Session scope must not write a config file") },
+        documentTarget: () => Effect.die("Omitted scope must not use a UI's document scope"),
+        authorize: (input) => Effect.sync(() => { authorized.push(`${input.operation}:${input.scope}`) }),
+      }
+      expect(yield* DelegationPreferences.getScoped(dependencies, sessionID, {}))
+        .toEqual({ scope: "session", value: {}, revision: 0 })
+      expect(yield* DelegationPreferences.patchScoped(dependencies, sessionID,
+        { expectedRevision: 0, patch: { ordinaryQuestions: false } }))
+        .toEqual({ scope: "session", value: { ordinaryQuestions: false }, revision: 1 })
+      expect((yield* DelegationPreferences.getScoped(dependencies, sessionID, {})).value.ordinaryQuestions).toBe(false)
+      expect(authorized).toEqual(["get:session", "patch:session", "get:session"])
+      const stale = yield* DelegationPreferences.patchScoped(dependencies, sessionID,
+        { expectedRevision: 0, patch: { ordinaryQuestions: true } }).pipe(Effect.as("unexpected"),
+        Effect.catchTag("DelegationPreferences.Conflict", () => Effect.succeed("conflict")))
+      expect(stale).toBe("conflict")
+      for (const input of [
+        { patch: {} },
+        { scope: "project" as const, expectedRevision: 1, patch: {} },
+        { expectedRevision: 1, expectedVersion: "a".repeat(64), patch: {} },
+        { scope: "task" as const, expectedRevision: 1, patch: {} },
+        { taskID: sessionID, expectedRevision: 1, patch: {} },
+      ]) {
+        const outcome = yield* DelegationPreferences.patchScoped(dependencies, sessionID, input).pipe(Effect.as("unexpected"),
+          Effect.catchTag("DelegationPreferences.Invalid", () => Effect.succeed("invalid")))
+        expect(outcome).toBe("invalid")
+      }
+      const denied = yield* DelegationPreferences.patchScoped({ ...dependencies,
+        authorize: () => Effect.fail(new PermissionV2.DeniedError({ rules: [] })),
+      }, sessionID, { expectedRevision: 1, patch: { ordinaryQuestions: true } }).pipe(Effect.as("unexpected"),
+        Effect.catchTag("PermissionV2.DeniedError", () => Effect.succeed("denied")))
+      expect(denied).toBe("denied")
+      expect((yield* DelegationPreferences.read(sessions, sessionID)).revision).toBe(1)
+      expect(wakeCalls).toEqual([])
+    }),
+  )
+
+  it.effect("persists Session delegation defaults with a visible CAS conflict for concurrent stale writers", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const sessions = yield* SessionV2.Service
+      const before = yield* DelegationPreferences.read(sessions, sessionID)
+      expect(before).toEqual({ version: 1, revision: 0, session: {}, tasks: {} })
+      const outcomes = yield* Effect.all([
+        DelegationPreferences.patch(sessions, { sessionID, expectedRevision: 0, patch: { ordinaryQuestions: false } }),
+        DelegationPreferences.patch(sessions, { sessionID, expectedRevision: 0, patch: { ordinaryQuestions: true } }),
+      ].map((save) => save.pipe(Effect.as("saved"), Effect.catchTag("DelegationPreferences.Conflict", () => Effect.succeed("conflict")))), { concurrency: "unbounded" })
+      expect(outcomes.toSorted()).toEqual(["conflict", "saved"])
+      const stored = yield* DelegationPreferences.read(sessions, sessionID)
+      expect(stored.revision).toBe(1)
+      expect(typeof stored.session.ordinaryQuestions).toBe("boolean")
+      expect(stored.tasks).toEqual({})
+      const refreshed = yield* DelegationPreferences.patch(sessions, { sessionID, expectedRevision: 1,
+        patch: { preferences: [{ topic: "code", selections: [{ agent: "builder" }] }] } })
+      expect(refreshed.revision).toBe(2)
+      expect(refreshed.session.ordinaryQuestions).toBe(stored.session.ordinaryQuestions)
+      expect((yield* DelegationPreferences.read(sessions, sessionID))).toEqual(refreshed)
+      expect(yield* eventCount("session.next.metadata.patched.1")).toBe(2)
+      expect(wakeCalls).toEqual([])
+    }),
+  )
+  it.effect("keeps task preferences explicit, refuses foreign tasks and preserves unrelated metadata", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const sessions = yield* SessionV2.Service
+      const { db } = yield* Database.Service
+      const childID = SessionV2.ID.make("ses_preferences_child")
+      yield* db.insert(SessionTable).values({ id: childID, parent_id: sessionID, project_id: Project.ID.global,
+        slug: "child", directory: "/project", title: "child", version: "test",
+        agent_policy: { tools: { mode: "explicit", entries: {} }, permissionLayers: [],
+          source: { type: "task", sessionID, agent: AgentV2.ID.make("build") } },
+      }).run().pipe(Effect.orDie)
+      yield* sessions.patchMetadata({ sessionID, patch: { set: { unrelated: "keep" } } })
+      const state = yield* DelegationPreferences.patch(sessions, { sessionID, taskID: childID, expectedRevision: 0,
+        patch: { ordinaryQuestions: false } })
+      expect(state.session).toEqual({})
+      expect(state.tasks[childID]?.ordinaryQuestions).toBe(false)
+      expect((yield* sessions.get(sessionID)).metadata?.unrelated).toBe("keep")
+      const foreign = yield* DelegationPreferences.patch(sessions, { sessionID, taskID: sessionID, expectedRevision: 1,
+        patch: { ordinaryQuestions: true } }).pipe(Effect.as("unexpected"),
+        Effect.catchTag("DelegationPreferences.Invalid", (error) => Effect.succeed(error.reason)))
+      expect(foreign).toBe("task")
+      expect((yield* DelegationPreferences.read(sessions, sessionID)).revision).toBe(1)
+      yield* sessions.patchMetadata({ sessionID, patch: { set: { [DelegationPreferences.METADATA_KEY]: { version: 99 } } } })
+      const corrupt = yield* DelegationPreferences.read(sessions, sessionID).pipe(Effect.as("unexpected"),
+        Effect.catchTag("DelegationPreferences.Invalid", (error) => Effect.succeed(error.reason)))
+      expect(corrupt).toBe("state")
+    }),
+  )
+  it.effect("rejects a stale goal inbox fence before admission and permits one refreshed continuation", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const first = yield* session.prompt({
+        sessionID, prompt: new Prompt({ text: "Finish the authorized task" }), origin: "interactive", resume: false,
+        expectedLatestInputID: null,
+      })
+      const newer = yield* session.prompt({
+        sessionID, prompt: new Prompt({ text: "Also check the documentation" }), origin: "interactive", resume: false,
+      })
+      const count = yield* admittedCount
+      wakeCalls.length = 0
+      for (const expectedLatestInputID of [null, first.id]) {
+        const refusal = yield* session.prompt({
+          sessionID, prompt: new Prompt({ text: "Continue the active goal" }), origin: "plugin", expectedLatestInputID,
+        }).pipe(Effect.flip)
+        expect(refusal).toMatchObject({ _tag: "SessionBusyError", sessionID })
+        expect(yield* admittedCount).toBe(count)
+        expect(wakeCalls).toEqual([])
+      }
+      const continued = yield* session.prompt({
+        sessionID, prompt: new Prompt({ text: "Continue the active goal" }), origin: "plugin",
+        expectedLatestInputID: newer.id, resume: false,
+      })
+      expect(continued.origin).toBe("plugin")
+      expect(yield* admittedCount).toBe(count + 1)
+      const stored = yield* admitted(continued.id)
+      expect(stored?.origin).toBe("plugin")
+      expect(stored?.promotedSeq).toBeUndefined()
+    }),
+  )
+
   it.effect("delegates execution continuation through SessionExecution", () =>
     Effect.gen(function* () {
       yield* setup

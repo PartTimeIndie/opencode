@@ -623,7 +623,7 @@ test("drains manually typed skill slash followups as queued prompts", async ({ p
   page.on("response", (response) => {
     if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`)
   })
-  const { input, requests, emitIdle } = await setup(page, { sessionStatus: { [sessionID]: { type: "busy" } } })
+  const { input, requests, emitIdle } = await setup(page, { followup: "queue", sessionStatus: { [sessionID]: { type: "busy" } } })
 
   await input.click()
   await page.keyboard.type("/visual-qa-testing queued browser check")
@@ -656,7 +656,7 @@ test("sends queued followups immediately from Send now while the session is acti
   page.on("response", (response) => {
     if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`)
   })
-  const { input, requests } = await setup(page, { sessionStatus: { [sessionID]: { type: "busy" } } })
+  const { input, requests } = await setup(page, { followup: "queue", sessionStatus: { [sessionID]: { type: "busy" } } })
 
   await input.click()
   await page.keyboard.type("send this queued followup now")
@@ -707,6 +707,7 @@ test("keeps followups in the local queue while a blocking question is pending", 
     ],
   }
   const { input, requests } = await setup(page, {
+    followup: "queue",
     sessionStatus: { [sessionID]: { type: "idle" } },
     questions: () => [question],
   })

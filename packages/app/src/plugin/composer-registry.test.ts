@@ -26,6 +26,33 @@ function fixture() {
   return { registry, state, editor, dispose }
 }
 
+test("availability observers see late mount, disposal and remount without stale registrations", () => {
+  const registry = createComposerRegistry()
+  const observed: boolean[] = []
+  const unsubscribe = registry.subscribe(() => observed.push(!!registry.read(target)))
+  const editor = {
+    read: () => ({ ...target, text: "draft", mode: "normal" as const }),
+    change: () => {},
+    insertText: () => ({ ok: true }),
+    submitText: async () => ({ ok: true }),
+  }
+  expect(registry.read(target)).toBeUndefined()
+  const first = registry.register(target, editor)
+  expect(observed).toEqual([true])
+  expect(() => registry.register(target, editor)).toThrow("already registered")
+  expect(observed).toEqual([true])
+  first()
+  first()
+  expect(observed).toEqual([true, false])
+  const second = registry.register(target, editor)
+  first()
+  expect(observed).toEqual([true, false, true])
+  unsubscribe()
+  second()
+  expect(observed).toEqual([true, false, true])
+  expect(registry.read(target)).toBeUndefined()
+})
+
 test("composer read/change/insert/submit use exact server, directory, session and composer identity", async () => {
   const view = fixture()
   expect(view.registry.read(target)?.text).toBe("initial")
@@ -188,4 +215,65 @@ test("append callbacks preserve the editor's structured-append operation", async
   expect((await registry.runBeforeSubmit(target, agent)).ok).toBe(true)
   expect(appended).toEqual(["/review"])
   dispose()
+})
+
+test("uniqueComposerID resolves only one exact composer and never guesses", async () => {
+  const registry = createComposerRegistry()
+  const editor = (composerID = target.composerID) => ({
+    read: () => ({ ...target, composerID, mode: "normal" as const, text: "draft" }),
+    change() {},
+    insertText: () => ({ ok: true }),
+    submitText: async () => ({ ok: true }),
+  })
+  const dispose = registry.register(target, editor())
+  expect(
+    registry.uniqueComposerID({ serverID: target.serverID, directory: target.directory, sessionID: target.sessionID }),
+  ).toBe(target.composerID)
+  expect(
+    registry.uniqueComposerID({ serverID: target.serverID, directory: target.directory, sessionID: "other" }),
+  ).toBeUndefined()
+  registry.register({ ...target, composerID: "other" }, editor("other"))
+  expect(
+    registry.uniqueComposerID({ serverID: target.serverID, directory: target.directory, sessionID: target.sessionID }),
+  ).toBeUndefined()
+  dispose()
+})
+
+test("final append runs after plugin handlers and commits only on acceptance", async () => {
+  const view = fixture()
+  const order: string[] = []
+  let committed = false
+  view.registry.beforeSubmit(target, (context) => {
+    context.appendText("first")
+    order.push(`handler:${context.getText()}`)
+  })
+  view.registry.registerFinalAppend(({ getText, appendText }) => {
+    order.push(`final:${getText()}`)
+    appendText("second")
+    return {
+      commit: () => {
+        committed = true
+      },
+    }
+  })
+  const result = await view.registry.runBeforeSubmit(target, agent)
+  expect(result.ok).toBe(true)
+  expect(order).toEqual(["handler:initial\n\nfirst", "final:initial\n\nfirst"])
+  expect(committed).toBe(false)
+  result.commit?.()
+  expect(committed).toBe(true)
+  expect(view.state.text).toBe("initial\n\nfirst\n\nsecond")
+  view.dispose()
+
+  const blocked = fixture()
+  blocked.registry.beforeSubmit(target, (context) => context.preventSubmit("Review first"))
+  let blockedCommit = false
+  blocked.registry.registerFinalAppend(() => ({
+    commit: () => {
+      blockedCommit = true
+    },
+  }))
+  expect(await blocked.registry.runBeforeSubmit(target, agent)).toEqual({ ok: false, error: "Review first" })
+  expect(blockedCommit).toBe(false)
+  blocked.dispose()
 })

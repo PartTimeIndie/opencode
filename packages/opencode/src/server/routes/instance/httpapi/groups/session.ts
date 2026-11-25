@@ -1,6 +1,8 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "@/permission"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { DelegationPreferences } from "@opencode-ai/core/session/delegation-preferences"
+import { DelegationSettings } from "@opencode-ai/core/session/delegation-settings"
 
 import { Session } from "@/session/session"
 import { MessageV2 } from "@/session/message-v2"
@@ -19,7 +21,7 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import { ApiNotFoundError, ConflictError, ForbiddenError, InvalidRequestError, PermissionNotFoundError, SessionBusyError, UnknownError } from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 
@@ -43,6 +45,16 @@ export const MessagesQuery = Schema.Struct({
   limit: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
   before: Schema.optional(Schema.String),
 })
+export const AttentionQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  afterSeq: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+})
+export const AttentionSnapshot = Schema.Struct({
+  sessionID: Schema.String, title: Schema.String, directory: Schema.String, archived: Schema.Boolean,
+  cursor: Schema.Number, count: Schema.Number, lastFailureSeq: Schema.optional(Schema.Number),
+  last: Schema.optional(Schema.Struct({ id: Schema.String, status: Schema.String, closedSeq: Schema.Number })),
+  working: Schema.Boolean,
+})
 export const DeleteQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   overrideProtection: Schema.optional(QueryBoolean),
@@ -63,6 +75,10 @@ export const UpdatePayload = Schema.Struct({
     }),
   ),
 })
+export const DelegationQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  ...DelegationPreferences.Target.fields,
+})
 export const ProtectionPayload = Schema.Struct({
   protected: Schema.Boolean,
 })
@@ -77,6 +93,7 @@ export const SessionPaths = {
   status: `${root}/status`,
   exists: `${root}/:sessionID/exists`,
   get: `${root}/:sessionID`,
+  attentionState: `${root}/:sessionID/attention-state`,
   children: `${root}/:sessionID/children`,
   todo: `${root}/:sessionID/todo`,
   diff: `${root}/:sessionID/diff`,
@@ -86,6 +103,7 @@ export const SessionPaths = {
   remove: `${root}/:sessionID`,
   update: `${root}/:sessionID`,
   protection: `${root}/:sessionID/protection`,
+  delegationPreferences: `${root}/:sessionID/delegation-preferences`,
   fork: `${root}/:sessionID/fork`,
   share: `${root}/:sessionID/share`,
   revert: `${root}/:sessionID/revert`,
@@ -146,6 +164,11 @@ export const SessionApi = HttpApi.make("session")
             description: "Retrieve detailed information about a specific OpenCode session.",
           }),
         ),
+        HttpApiEndpoint.get("attentionState", SessionPaths.attentionState, {
+          params: { sessionID: SessionID }, query: AttentionQuery,
+          success: described(AttentionSnapshot, "Durable session activity summary"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(OpenApi.annotations({ identifier: "session.attentionState", summary: "Read terminal session activities" })),
         HttpApiEndpoint.get("children", SessionPaths.children, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
@@ -255,6 +278,27 @@ export const SessionApi = HttpApi.make("session")
             description: "Pin or unpin a session. Protected sessions are excluded from automatic archive purging.",
           }),
         ),
+        HttpApiEndpoint.get("delegationPreferences", SessionPaths.delegationPreferences, {
+          params: { sessionID: SessionID },
+          query: DelegationQuery,
+          success: DelegationSettings.Snapshot,
+          error: [ApiNotFoundError, InvalidRequestError, ConflictError, ForbiddenError, UnknownError],
+        }).annotateMerge(OpenApi.annotations({
+          identifier: "session.delegationPreferences",
+          summary: "Read scoped delegation settings",
+          description: "Read the Session default or an explicit owned task, project or global scope, including its revision or file version.",
+        })),
+        HttpApiEndpoint.patch("patchDelegationPreferences", SessionPaths.delegationPreferences, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: DelegationPreferences.ScopedPatch,
+          success: DelegationSettings.Snapshot,
+          error: [ApiNotFoundError, InvalidRequestError, ConflictError, ForbiddenError, UnknownError],
+        }).annotateMerge(OpenApi.annotations({
+          identifier: "session.patchDelegationPreferences",
+          summary: "Patch scoped delegation settings",
+          description: "Use the same scoped owner as the native language tool. Omitted scope means this Session; stale revisions or file versions fail without retry.",
+        })),
         HttpApiEndpoint.post("fork", SessionPaths.fork, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,

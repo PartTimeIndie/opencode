@@ -7,6 +7,7 @@ import { PermissionV2 } from "../permission"
 import { PluginBoot } from "../plugin/boot"
 import { SkillV2 } from "../skill"
 import { SkillCatalog } from "./catalog"
+import { SkillPolicy } from "./policy"
 import { SystemContext } from "../system-context/index"
 
 export interface Interface {
@@ -36,10 +37,9 @@ export const layer = Layer.effect(
         const permitted = SkillV2.available(yield* skills.list(), agent, policy)
         if (permitted.length === 0 && PermissionV2.evaluate("skill", "*", agent.permissions).effect === "deny")
           return SystemContext.empty
-        const catalog = SkillCatalog.project(
-          permitted,
-          Config.latest(config ? yield* config.entries() : [], "skill_groups"),
-        )
+        const entries = config ? yield* config.entries() : []
+        const policies = SkillPolicy.policiesFor(permitted, Config.globalLatest(entries, "skill_invocation"), agent.skills)
+        const catalog = SkillCatalog.project(permitted, Config.latest(entries, "skill_groups"), policies)
         const rendered = SkillCatalog.render(catalog)
         const cached = cache.get(rendered)
         if (cached) {

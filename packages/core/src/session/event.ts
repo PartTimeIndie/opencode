@@ -11,6 +11,7 @@ import { ProjectV2 } from "../project"
 import { RelativePath } from "../schema"
 import { SessionMessageID } from "./message-id"
 import { SessionFailure } from "./failure"
+import { StructuredOutputAttempt } from "./structured-output-attempt"
 
 export { FileAttachment }
 
@@ -184,6 +185,7 @@ export namespace PromptLifecycle {
       messageID: SessionMessageID.ID,
       prompt: Prompt,
       delivery: Schema.Literals(["steer", "queue"]),
+      origin: Schema.Literals(["interactive", "plugin"]).pipe(Schema.optional),
     },
   })
   export type Admitted = typeof Admitted.Type
@@ -220,6 +222,57 @@ export namespace PromptLifecycle {
     },
   })
   export type Promoted = typeof Promoted.Type
+}
+
+export namespace SkillSelection {
+  export const Origin = Schema.Struct({
+    kind: Schema.Literals(["input", "chat_send", "command", "renewal"]),
+    id: Schema.String,
+    seq: NonNegativeInt,
+  }).annotate({ identifier: "session.next.skill_selection.origin" })
+  export type Origin = typeof Origin.Type
+
+  export const Limits = Schema.Struct({
+    // Limits come from the positive-integer config validation; the durable
+    // event stores them with the union-light integer codec so the Session
+    // event union stays within type-instantiation limits.
+    minutes: NonNegativeInt,
+    messages: NonNegativeInt,
+  }).annotate({ identifier: "session.next.skill_selection.limits" })
+  export type Limits = typeof Limits.Type
+
+  /**
+   * Single durable ledger event for selection memory. One union member keeps
+   * the Session event union within type-instantiation limits; the mutation
+   * discriminates the recorded decision:
+   * - `selected`: provenance, limits snapshot, generation.
+   * - `forgotten`: optional name (absent forgets every selection and raises
+   *   the durable backfill barrier) plus the operation identity.
+   * - `renewal_declined`: suppression until the next genuine selection.
+   *
+   * Deliberately NOT a member of `DurableDefinitions`: the definition is
+   * registered with its sync option, so EventV2 persists and replays it
+   * durably, while the public Session event stream stays free of internal
+   * ledger noise. The projector subscribes by definition, so checkpoint
+   * replay and projection rebuild reconstruct the ledger exactly.
+   */
+  export const Mutation = EventV2.define({
+    type: "session.next.skill_selection.mutation",
+    ...options,
+    schema: {
+      ...Base,
+      mutation: Schema.Literals(["selected", "forgotten", "renewal_declined"]),
+      name: Schema.String.pipe(Schema.optional),
+      generation: NonNegativeInt.pipe(Schema.optional),
+      origin: Origin.pipe(Schema.optional),
+      selectedAt: V2Schema.DateTimeUtcFromMillis.pipe(Schema.optional),
+      limits: Limits.pipe(Schema.optional),
+      operationID: Schema.String.pipe(Schema.optional),
+      boundMessageID: SessionMessageID.ID.pipe(Schema.optional),
+      receiptInputID: SessionMessageID.ID.pipe(Schema.optional),
+    },
+  })
+  export type Mutation = typeof Mutation.Type
 }
 
 export const InterruptRequested = EventV2.define({
@@ -301,6 +354,7 @@ export namespace Step {
       agent: Schema.String,
       model: ModelV2.Ref,
       snapshot: Schema.String.pipe(Schema.optional),
+      structuredOutputAttempt: StructuredOutputAttempt.Receipt.pipe(Schema.optional),
     },
   })
   export type Started = typeof Started.Type

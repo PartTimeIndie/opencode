@@ -12,6 +12,8 @@ import type { SystemContext } from "../../system-context/index"
 import type { SessionContextEpoch } from "../context-epoch"
 import type { ToolOutputStore } from "../../tool-output-store"
 import type { ContentStore } from "../../content-store"
+import type { LegacyDelegationGuard } from "../legacy-delegation/guard"
+import type { WorkspaceCheckout } from "../workspace/checkout"
 
 export class StepLimitExceededError extends Schema.TaggedErrorClass<StepLimitExceededError>()(
   "SessionRunner.StepLimitExceededError",
@@ -46,6 +48,8 @@ export type RunError =
   | SessionContextEpoch.AgentReplacementBlocked
   | ToolOutputStore.Error
   | ContentStore.Error
+  | LegacyDelegationGuard.Blocked
+  | WorkspaceCheckout.Blocked
 
 /** Process-local settlement for every runner invocation, including foreground child sessions. */
 export const Settled = EventV2.define({

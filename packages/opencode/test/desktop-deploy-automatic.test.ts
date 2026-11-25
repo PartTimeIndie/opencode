@@ -2,28 +2,80 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { spawnSync } from "node:child_process"
 
 import {
   assertNoConflictingAutomaticRun,
+  automaticConsoleCommand,
   automaticDescriptorPath,
   cancelAutomaticHandoff,
   claimAutomaticHandoff,
   closeOpenCodeInventoried,
   createManifest,
   detectDeployStall,
+  deployBuildEnv,
   filterAutomaticShutdownTargets,
+  desktopShutdownTargets,
   listManifestBackups,
   parseDeployStatus,
   parseRecoveryChoice,
   parseRunDescriptor,
   codexRecoverySpawn,
   opencodeRecoverySpawn,
+  recoveryPrompt,
   readRunDescriptor,
   restoreVerifiedBackupTransaction,
   verifyManifest,
   writeRunDescriptor,
   type RunDescriptor,
 } from "../script/desktop-prod-deploy"
+
+describe("automatic CMD console", () => {
+  test("does not pass a repair CLI's pure mode into the production build", () => {
+    const inherited = { OPENCODE_PURE: "1", OPENCODE_DEFER_DB_STARTUP_REPAIRS: "1", PATH: "test-path" }
+    expect(deployBuildEnv(inherited)).toMatchObject({ OPENCODE_CHANNEL: "prod", PATH: "test-path" })
+    expect(deployBuildEnv(inherited).OPENCODE_PURE).toBeUndefined()
+    expect(deployBuildEnv(inherited).OPENCODE_DEFER_DB_STARTUP_REPAIRS).toBeUndefined()
+    expect(inherited.OPENCODE_PURE).toBe("1")
+  })
+
+  test.skipIf(process.platform !== "win32")(
+    "preserves working directory, literal arguments and failure exit codes",
+    () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "deploy console "))
+      const directory = path.join(root, "working %PATH% & !")
+      fs.mkdirSync(directory)
+      try {
+        const script = path.join(directory, "probe.ts")
+        const launcher = path.join(root, "launch.cmd")
+        fs.writeFileSync(
+          script,
+          "console.log(JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) })); process.exit(7)",
+        )
+        fs.writeFileSync(
+          launcher,
+          automaticConsoleCommand([process.execPath, script, "literal %PATH% & ! value"], directory),
+        )
+        const result = spawnSync("cmd.exe", ["/d", "/s", "/c", `""${launcher}""`], {
+          encoding: "utf8",
+          windowsVerbatimArguments: true,
+          timeout: 10_000,
+        })
+        expect(result.error).toBeUndefined()
+        expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 7, stderr: "" })
+        expect(JSON.parse(result.stdout.trim())).toEqual({ cwd: directory, args: ["literal %PATH% & ! value"] })
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test("rejects batch line injection", () => {
+    expect(() => automaticConsoleCommand(["bun", "unsafe\r\necho injected"], "C:\\repo")).toThrow(
+      "invalid automatic console argument",
+    )
+  })
+})
 
 function descriptor(overrides: Partial<RunDescriptor> = {}): RunDescriptor {
   return {
@@ -82,6 +134,14 @@ describe("automatic shutdown inventory", () => {
     ).toEqual([{ pid: 300 }])
   })
 
+  test("targets the installed desktop executable and keeps the CLI running", () => {
+    expect(desktopShutdownTargets([
+      { pid: 1, executablePath: "C:\\Programs\\OpenCode.exe" },
+      { pid: 2, executablePath: "C:\\Users\\me\\OpenCode\\bin\\opencode.exe" },
+      { pid: 3 },
+    ], "C:\\Programs\\OpenCode.exe").map((entry) => entry.pid)).toEqual([1])
+  })
+
   test("kills only processes that are still inventoried before force-close", async () => {
     const killed: number[] = []
     let calls = 0
@@ -127,6 +187,8 @@ describe("automatic handoff and single-flight ownership", () => {
   test("rejects malformed or mismatched run descriptors fail-closed", () => {
     expect(() => parseRunDescriptor({ version: 1 })).toThrow(/run ID/)
     expect(() => parseRunDescriptor(descriptor({ repoRoot: "relative" }))).toThrow(/absolute/)
+    expect(() => parseRunDescriptor(descriptor({ agentRetry: "yes" as never }))).toThrow(/agent retry mode/)
+    expect(parseRunDescriptor(descriptor({ agentRetry: true })).agentRetry).toBe(true)
     expect(() =>
       assertNoConflictingAutomaticRun({ status: "automatic-building", runID: "other" }, "current"),
     ).toThrow(/still in flight/)
@@ -206,19 +268,31 @@ describe("automatic recovery choices", () => {
     expect(parseRecoveryChoice("3")).toBe("previous-app")
     expect(parseRecoveryChoice("4")).toBe("restore-backup")
     expect(parseRecoveryChoice("0")).toBe("abort")
+    expect(parseRecoveryChoice(" 1 ")).toBe("opencode")
     expect(parseRecoveryChoice(undefined)).toBe("abort")
     expect(() => parseRecoveryChoice("9")).toThrow(/unknown recovery choice/)
   })
 
   test("starts repair CLIs without model overrides or permission bypasses", () => {
-    const open = opencodeRecoverySpawn({ cli: "opencode", repoRoot: "C:\\repo", contextPath: "C:\\state\\context.md" })
-    expect(open.args).toEqual(["run", "--interactive", "--dir", "C:\\repo", "--file", "C:\\state\\context.md"])
+    const open = opencodeRecoverySpawn({ cli: "opencode", repoRoot: "C:\\repo", contextPath: "C:\\state\\context.md", prompt: "Repair this build" })
+    expect(open.args).toEqual(["run", "--pure", "--interactive", "--dir", "C:\\repo", "Repair this build"])
     expect(open.args.join(" ")).not.toContain("--model")
     expect(open.args.join(" ")).not.toContain("dangerously-skip-permissions")
-    const codex = codexRecoverySpawn({ cli: "codex", repoRoot: "C:\\repo" })
-    expect(codex.args).toEqual([])
-    expect(() => opencodeRecoverySpawn({ cli: "", repoRoot: "C:\\repo", contextPath: "context" })).toThrow(/unavailable/)
-    expect(() => codexRecoverySpawn({ cli: "", repoRoot: "C:\\repo" })).toThrow(/unavailable/)
+    const codex = codexRecoverySpawn({ cli: "codex", repoRoot: "C:\\repo", prompt: "Repair this build" })
+    expect(codex.args).toEqual(["Repair this build"])
+    expect(() => opencodeRecoverySpawn({ cli: "", repoRoot: "C:\\repo", contextPath: "context", prompt: "repair" })).toThrow(/unavailable/)
+    expect(() => codexRecoverySpawn({ cli: "", repoRoot: "C:\\repo", prompt: "repair" })).toThrow(/unavailable/)
+    expect(() => codexRecoverySpawn({ cli: "codex", repoRoot: "C:\\repo", prompt: "" })).toThrow(/prompt is missing/)
+  })
+
+  test("passes the failed log and authorized deploy retry to either repair CLI", () => {
+    const prompt = recoveryPrompt({ runID: "run-1", repoRoot: "C:\\repo", logPath: "C:\\state\\build.log", message: "HTTP 504" })
+    expect(prompt).toContain("C:\\state\\build.log")
+    expect(prompt).toContain("HTTP 504")
+    expect(prompt).toContain("--approved-close --force-close-approved --agent-retry")
+    expect(prompt).toContain("ask the user here what to do and wait")
+    expect(opencodeRecoverySpawn({ cli: "opencode", repoRoot: "C:\\repo", contextPath: "C:\\state\\context.md", prompt }).args.at(-1)).toBe(prompt)
+    expect(codexRecoverySpawn({ cli: "codex", repoRoot: "C:\\repo", prompt }).args).toEqual([prompt])
   })
 
   test("offers only manifest-valid backups from the install parent", () => {

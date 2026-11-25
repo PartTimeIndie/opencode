@@ -4,6 +4,53 @@ const { default: plugin } = (await import(
 )) as { default: { app: (api: object) => void } }
 
 describe("desktop deploy external handoff", () => {
+  test.each(["connection failure", "command failure"])(
+    "shows %s before handoff and ignores stale cached running state",
+    async (failure) => {
+      const alerts: string[] = []
+      let calls = 0
+      let run: (ctx: { directory: string }) => Promise<void> = async () => undefined
+      const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window")
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: {
+          confirm: () => {
+            throw new Error("must not confirm after failed status")
+          },
+          alert: (message: string) => alerts.push(message),
+        },
+      })
+      try {
+        plugin.app({
+          toolbar: {
+            register: (value: { run: typeof run }) => {
+              run = value.run
+            },
+          },
+          kv: { get: () => ({ status: "running" }), set: () => undefined },
+          host: {
+            command: {
+              run: async () => {
+                calls += 1
+                if (failure === "connection failure") throw new Error("Failed to fetch local server")
+                return { exitCode: 1, output: "bun was not found" }
+              },
+            },
+          },
+        })
+        await expect(run({ directory: "E:/GitRepros/opencode" })).rejects.toThrow(
+          failure === "connection failure" ? "Failed to fetch local server" : "bun was not found",
+        )
+        expect(calls).toBe(1)
+        expect(alerts).toHaveLength(1)
+        expect(alerts[0]).toContain("Build and Deploy ist fehlgeschlagen")
+      } finally {
+        if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow)
+        else Reflect.deleteProperty(globalThis, "window")
+      }
+    },
+  )
+
   test("starts one approved automatic handoff instead of preparing inside the app", async () => {
     const commands: string[] = []
     const confirmations: string[] = []
@@ -44,7 +91,7 @@ describe("desktop deploy external handoff", () => {
       await run({ directory: "C:/GitRepros/opencode" })
       expect(commands).toHaveLength(2)
       expect(commands[1]).toContain('"automatic"')
-      expect(commands[1]).toContain('"--detach"')
+      expect(commands[1]).not.toContain('"--detach"')
       expect(commands[1]).toContain('"--approved-close"')
       expect(commands[1]).toContain('"--force-close-approved"')
       expect(commands[1]).toContain('"--restart"')
@@ -55,6 +102,42 @@ describe("desktop deploy external handoff", () => {
       else Reflect.deleteProperty(globalThis, "window")
     }
   })
+
+  test.each(["", "AUTOMATIC : detached console started"])(
+    "rejects exit code zero without a claimed worker: %s",
+    async (output) => {
+      const alerts: string[] = []
+      const statuses: Array<{ status: string }> = []
+      let run: (ctx: { directory: string }) => Promise<void> = async () => undefined
+      const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window")
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: { confirm: () => true, alert: (message: string) => alerts.push(message) },
+      })
+      try {
+        plugin.app({
+          toolbar: { register: (value: { run: typeof run }) => { run = value.run } },
+          ui: { loading: { with: async (_options: unknown, action: () => Promise<unknown>) => action() } },
+          kv: { get: () => statuses.at(-1), set: (_key: string, value: { status: string }) => statuses.push(value) },
+          host: {
+            command: {
+              run: async (input: { arguments: string[] }) => {
+                const script = Buffer.from(input.arguments.at(-1)!, "base64").toString("utf16le")
+                return { exitCode: 0, output: script.includes('"status"') ? "{}" : output }
+              },
+            },
+          },
+        })
+        await expect(run({ directory: "E:/GitRepros/opencode" })).rejects.toThrow("did not acknowledge handoff")
+        expect(alerts).toHaveLength(1)
+        expect(statuses.at(-1)?.status).toBe("failed")
+        expect(statuses.some((status) => status.status === "restarting")).toBe(false)
+      } finally {
+        if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow)
+        else Reflect.deleteProperty(globalThis, "window")
+      }
+    },
+  )
 
   test("aborts before any shutdown when the handoff is declined", async () => {
     const commands: string[] = []
@@ -156,7 +239,9 @@ describe("desktop deploy external handoff", () => {
     "staging",
     "launching-worker",
     "deploying",
-  ] as const)("refuses a second handoff while %s is in flight", async (status) => {
+  ] as const)("opens the visible cancellation console while %s is in flight", async (status) => {
+    const commands: string[] = []
+    const alerts: string[] = []
     let run: (ctx: { directory: string }) => Promise<void> = async () => {
       throw new Error("toolbar not registered")
     }
@@ -164,8 +249,8 @@ describe("desktop deploy external handoff", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        confirm: () => true,
-        alert: () => undefined,
+        confirm: () => { throw new Error("must not approve a second deploy") },
+        alert: (message: string) => alerts.push(message),
       },
     })
     try {
@@ -179,14 +264,24 @@ describe("desktop deploy external handoff", () => {
         kv: { get: () => undefined, set: () => undefined },
         host: {
           command: {
-            run: async () => ({
-              exitCode: 0,
-              output: JSON.stringify({ status, runID: "auto-1", updatedAt: new Date().toISOString() }),
-            }),
+            run: async (input: { arguments: string[] }) => {
+              const script = Buffer.from(input.arguments.at(-1)!, "base64").toString("utf16le")
+              commands.push(script)
+              return {
+                exitCode: 0,
+                output: commands.length === 1
+                  ? JSON.stringify({ status, runID: "auto-1", updatedAt: new Date().toISOString() })
+                  : "CANCELLATION_CONSOLE : started",
+              }
+            },
           },
         },
       })
-      await expect(run({ directory: "C:/GitRepros/opencode" })).rejects.toThrow(/still in flight/)
+      await run({ directory: "C:/GitRepros/opencode" })
+      expect(commands).toHaveLength(2)
+      expect(commands[1]).toContain("build-and-deploy.cmd")
+      expect(commands[1]).not.toContain("--cancel-conflict-only")
+      expect(alerts).toHaveLength(0)
     } finally {
       if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow)
       else Reflect.deleteProperty(globalThis, "window")

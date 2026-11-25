@@ -460,6 +460,64 @@ test("keeps the stop control when a cross-stream terminal precedes its own start
   expectNoSmokeErrors(errors, [], [])
 })
 
+test("keeps the timeline working after a late idle event during recovery", async ({ page }, testInfo) => {
+  const errors = trackPageErrors(page)
+  const events: { directory: string; payload: Record<string, unknown> }[] = []
+  const timestamp = Date.now()
+  const previous = fixture.messages[fixture.targetID].slice(-2).map((message) => ({
+    info: { ...message.info, sessionID },
+    parts: message.parts.map((part) => ({ ...part, sessionID })),
+  }))
+  const userID = "msg_zz_recovery_user"
+  const activityID = "activity_recovery"
+  const emit = (type: string, properties: Record<string, unknown>) =>
+    events.push({ directory, payload: { id: `evt_${type}`, type, properties: { sessionID, ...properties } } })
+  let busy = false
+  await setupPromptCutover(page, {
+    pageMessages: () => ({ items: previous }),
+    sessionStatus: () => (busy ? { [sessionID]: { type: "busy" } } : {}),
+    events: () => events.splice(0),
+    eventRetry: 100,
+  })
+  await openSession(page)
+  await expect(page.locator('[data-timeline-row="UserMessage"]').last()).toBeVisible()
+  busy = true
+  emit("session.next.activity.recovered", { activityID, timestamp })
+  emit("session.next.prompt.promoted", {
+    messageID: userID,
+    timestamp,
+    timeCreated: timestamp,
+    prompt: { text: "Resume the interrupted work." },
+  })
+  const thinking = page.locator(`[data-timeline-row="Thinking"][data-message-id="${userID}"]`)
+  const headerSpinner = page.locator('div:has(> h1[data-slot="session-title-child"]) [data-component="spinner"]')
+  const spinnerFrame = headerSpinner.locator("../..")
+  await expect(thinking).toBeVisible()
+
+  emit("session.status", { status: { type: "idle" } })
+  emit("session.updated", {
+    info: {
+      id: sessionID,
+      slug: "app-v2-prompt-cutover",
+      projectID,
+      directory,
+      title: "Recovered session",
+      version: "dev",
+      time: { created: timestamp - 1_000, updated: timestamp },
+    },
+  })
+  await expect(page.getByRole("heading", { name: "Recovered session" })).toBeVisible()
+  await expect(thinking).toBeVisible({ timeout: 1_000 })
+  await expect(spinnerFrame).toHaveCSS("width", "16px")
+  await page.screenshot({ path: testInfo.outputPath("recovered-activity-busy.png") })
+
+  busy = false
+  emit("session.next.activity.completed", { activityID, timestamp: Date.now() })
+  await expect(thinking).toBeHidden()
+  await expect.poll(async () => (await spinnerFrame.boundingBox())?.width ?? 0).toBe(0)
+  expectNoSmokeErrors(errors, [], [])
+})
+
 async function setupPromptCutover(
   page: Parameters<typeof mockOpenCodeServer>[0],
   overrides: Partial<Parameters<typeof mockOpenCodeServer>[1]> = {},

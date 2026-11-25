@@ -100,10 +100,7 @@ async function fixture(name: string, response = Promise.resolve({ ok: true, text
 }
 
 test.each([
-  ["multi-agent-review-app", "/multi-agent-review"],
   ["multi-agent-problem-solver-app", "/multi-agent-problem-solver"],
-  ["progressive-plan-builder-app", "/progressive-plan-builder"],
-  ["visual-qa-app", "/visual-qa-testing"],
 ])("%s appends its skill once without any composer DOM ancestor", async (name, skill) => {
   const view = await fixture(name!)
   const other = { ...target, composerID: "other", serverID: "test" }

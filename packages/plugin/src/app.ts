@@ -23,6 +23,8 @@ export type AppCapability =
   | "host:sessions"
   | "host:session-policy"
   | "host:session-context"
+  | "host:session-attention"
+  | "host:session-attention-read"
   | "host:git"
   | "host:http"
   | "host:command"
@@ -32,6 +34,7 @@ export type AppCapability =
   | "host:tts"
   | "host:audio"
   | "host:composer"
+  | "host:toolbar"
   | "host:skills"
   | "host:skill-content"
   | "host:text-input"
@@ -75,13 +78,22 @@ export type AppDockItem = {
 export type AppSlotMountContext = {
   element: HTMLElement
   signal: AbortSignal
+  context?: { slot: string; directory: string; sessionID: string }
 }
 
 export type AppSlotItem = {
   id: string
   slot: string
+} & ({
   mount(context: AppSlotMountContext): void | (() => void) | Promise<void | (() => void)>
-}
+  menu?: never
+} | {
+  mount?: never
+  menu: {
+    state(context: { directory: string; sessionID: string }): { label: string; checked: boolean; disabled?: boolean }
+    run(context: { directory: string; sessionID: string }): void | Promise<void>
+  }
+})
 
 export type AppToolbarPlacement = "top" | "composer"
 export type AppToolbarAlign = "left" | "right"
@@ -113,6 +125,22 @@ export type AppToolbarItem = {
     name: string
     aliases?: string[]
   }
+  /**
+   * Slash-command target for a declarative composer toggle. A command target
+   * appends its reference as plain text; it never dispatches the command.
+   * Use `skill` for skill references. Exactly one target per registration.
+   */
+  command?: {
+    name: string
+  }
+  /**
+   * Registers the shared one-shot composer toggle: clicking arms the item's
+   * `command` or `skill` reference for the next manually submitted normal
+   * message of that exact composer. Requires `host:composer` and `ui:toolbar`.
+   * Custom `run`/`mount` handlers override this standard action entirely;
+   * they never receive an additional hidden standard handler.
+   */
+  appendOnSubmit?: boolean
   icon?: {
     name?: string
     src?: string
@@ -169,6 +197,19 @@ export type AppSettingsField =
       description?: string
       options: { value: string; label: string }[]
       default: string
+    }
+  | {
+      key: string
+      type: "voice"
+      label: string
+      description?: string
+      default: string
+      /** Flat model-target key in this same settings item/storage scope. */
+      targetKey: string
+      /** Optional summary-language key; informational only, never a voice filter. */
+      languageKey?: string
+      /** Explicit custom-ID entry. Defaults to false; unknown saved IDs are always retained. */
+      allowCustom?: boolean
     }
   | { key: string; type: "number"; label: string; description?: string; min?: number; max?: number; default: number }
   | {
@@ -315,7 +356,10 @@ export type AppPluginStatus = {
 
 export type AppHostProject = {
   id: string
+  projectID?: string
   worktree: string
+  /** Exact directory spellings to use when listing this project's sessions. */
+  sessionDirectories?: string[]
   name: string
   icon?: {
     url?: string
@@ -357,6 +401,58 @@ export type AppHostGitActionInput = VcsGitActionInput & {
 export type AppHostGitActionResult = VcsGitActionResult
 export type AppHostGitSnapshot = VcsGitSnapshot
 export type AppHostGitDiscoverResult = VcsGitDiscoverResult
+
+export type AppHostGitHistoryInput = {
+  directory?: string
+  selector?: "all" | "head" | "branch"
+  ref?: string
+  firstParent?: boolean
+  limit?: number
+  cursor?: string
+}
+
+export type AppHostGitHistoryCommit = {
+  hash: string
+  short: string
+  parents: string[]
+  author: string
+  email: string
+  date: string
+  refs: string[]
+  subject: string
+  body: string
+  bodyTruncated: boolean
+  boundary: "none" | "shallow" | "missing"
+}
+
+export type AppHostGitHistoryPage = {
+  commits: AppHostGitHistoryCommit[]
+  hasMore: boolean
+  selector: "all" | "head" | "branch"
+  firstParent: boolean
+  headOid?: string
+  refLabels: { hash: string; label: string }[]
+  nextCursor?: string
+}
+
+export type AppHostGitCommitMessageInput = {
+  directory?: string
+  hash?: string
+  cursor?: string
+}
+
+export type AppHostGitCommitMessagePage = {
+  text: string
+  truncated: boolean
+  nextCursor?: string
+}
+
+/** Structured history error preserved across the host boundary (opt-in). */
+export type AppHostGitHistoryError = Error & {
+  code: string
+  recovery: string
+  status?: number
+}
 
 export type AppHostGitDiffInput = {
   directory?: string
@@ -554,10 +650,35 @@ export type AppHostImageGenerateResult =
 export type AppHostComposerInsertResult = {
   ok: boolean
   error?: string
+  insertionReceiptID?: string
+}
+
+export type AppHostClipboardWriteResult = { ok: true } | { ok: false; error: string }
+
+/** Preparation is consumed only by a user submit in the matching composer. */
+export type AppHostComposerSendPreparation = {
+  operationID: string
+  isActive(): boolean
+  subscribe(changed: () => void): () => void
+  prepare(input: { intentID: string; signal: AbortSignal }): Promise<
+    | { ok: true; text: string }
+    | { ok: true; insertionReceiptID: string }
+    /**
+     * `insertDraft` asks the host to keep this text as an unsent composer draft:
+     * the send stays blocked, the transaction unwinds, and only then is the
+     * draft inserted, so a plugin-side insertion can never race the rollback.
+     */
+    | { ok: false; error: string; insertDraft?: string }
+  >
 }
 
 export type AppHostComposerTarget = { directory: string; sessionID?: string; composerID: string }
-export type AppHostComposerSnapshot = AppHostComposerTarget & { text: string; mode: "normal" | "shell"; model?: string }
+export type AppHostComposerSnapshot = AppHostComposerTarget & {
+  text: string
+  mode: "normal" | "shell"
+  model?: string
+  agent?: string
+}
 export type AppHostComposerBeforeSubmitContext = AppHostComposerTarget & {
   mode: "normal" | "shell"
   signal: AbortSignal
@@ -589,6 +710,21 @@ export type AppHostSkillReference = {
   description?: string
   aliases: string[]
 }
+
+/** Read-only hints from command sources and the existing skill/policy evaluator.
+ * Manual-only hints grant no invocation authority. Missing-tool hints describe
+ * the supplied/current composer's selected agent, not a tool permission grant.
+ */
+export type AppHostSkillDiagnostic = {
+  name: string
+  title?: string
+  reference: string
+  kind: "command-not-skill" | "not-found" | "manual-only" | "missing-tools"
+  message: string
+  missingTools?: string[]
+}
+
+export type AppHostToolbarToggleResult = { ok: boolean; error?: string }
 
 export type AppHostSkillResolveResult = {
   skills: Array<{ name: string; content: string }>
@@ -698,7 +834,7 @@ export type AppPluginApi = {
   readonly capabilities: ReadonlySet<AppCapability>
   client: ReturnType<typeof createOpencodeClient>
   services: {
-    call(input: { pluginID: string; serviceID: string; version: number; input: unknown; directory?: string; signal?: AbortSignal }): Promise<{ ok: true; data: unknown } | { ok: false; error: string }>
+    call(input: { pluginID: string; serviceID: string; version: number; input: unknown; directory?: string; signal?: AbortSignal }): Promise<{ ok: true; data: unknown } | { ok: false; error: string; status?: number }>
   }
   dock: {
     register(item: AppDockItem): () => void
@@ -791,6 +927,12 @@ export type AppPluginApi = {
       }): () => void
     }
     sessions: {
+      attention: {
+        register(id: string): () => void
+        get(input: { directory: string; sessionID: string }): { enabled: boolean; available: boolean; pendingCount: number; error: boolean } | undefined
+        set(input: { directory: string; sessionID: string }, enabled: boolean): Promise<boolean>
+        subscribe(handler: () => void): () => void
+      }
       accessControl: {
         get(input: { directory: string; sessionID?: string }): Promise<{ mode: "ask" | "approve_for_me" | "full_access" }>
         set(input: { directory: string; sessionID: string; mode: "ask" | "approve_for_me" | "full_access" }): Promise<void>
@@ -835,6 +977,10 @@ export type AppPluginApi = {
     }
     git: {
       snapshot(input?: { directory?: string; limit?: number }): Promise<AppHostGitSnapshot>
+      /** Branch-filtered, anchored history page. Continuations pass only `cursor`. */
+      history(input?: AppHostGitHistoryInput): Promise<AppHostGitHistoryPage>
+      /** Next char-safe chunk of a full commit message. */
+      commitMessage(input: AppHostGitCommitMessageInput): Promise<AppHostGitCommitMessagePage>
       discover(input?: { directory?: string; maxDepth?: number }): Promise<AppHostGitDiscoverResult>
       diff(input?: AppHostGitDiffInput): Promise<AppHostGitDiffEntry[]>
       action(input: AppHostGitActionInput): Promise<AppHostGitActionResult>
@@ -864,6 +1010,7 @@ export type AppPluginApi = {
       read(target: AppHostComposerTarget): AppHostComposerSnapshot | undefined
       change(input: AppHostComposerTarget & { text: string; expectedText?: string }): AppHostComposerInsertResult
       beforeSubmit(target: AppHostComposerTarget, handler: AppHostComposerBeforeSubmitHandler): () => void
+      registerSendPreparation(target: AppHostComposerTarget, preparation: AppHostComposerSendPreparation): () => void
       insertText(input: {
         directory: string
         sessionID?: string
@@ -871,6 +1018,7 @@ export type AppPluginApi = {
         text: string
         position?: "cursor" | "end"
         replace?: string
+        operationID?: string
       }): Promise<AppHostComposerInsertResult>
       submitText(input: {
         directory: string
@@ -887,11 +1035,31 @@ export type AppPluginApi = {
         composerID?: string
         signal?: AbortSignal
       }): Promise<AppHostSkillReference[]>
+      diagnostics(input?: {
+        agent?: string
+        directory?: string
+        sessionID?: string
+        composerID?: string
+        signal?: AbortSignal
+      }): Promise<AppHostSkillDiagnostic[]>
       resolve(input: {
         names: string[]
         directory?: string
         signal?: AbortSignal
       }): Promise<AppHostSkillResolveResult>
+    }
+    /**
+     * Toggles the shared `appendOnSubmit` standard action of an app toolbar
+     * item for the current or explicitly addressed composer. The item id is
+     * the unscoped id used at `toolbar.register`. Requires `host:toolbar`.
+     */
+    toolbar: {
+      toggle(input: {
+        item: string
+        directory?: string
+        sessionID?: string
+        composerID?: string
+      }): Promise<AppHostToolbarToggleResult>
     }
     textInput: {
       capture(): AppHostTextInputTarget | undefined
@@ -902,6 +1070,12 @@ export type AppPluginApi = {
         accelerator: string
         onInvoke(invocation: AppHostDesktopServiceInvocation): void | Promise<void>
       }): Promise<AppHostDesktopServiceRegistration>
+      /**
+        * Writes text through the desktop shell, which unlike the web Clipboard
+        * API also works while the OpenCode window is in the background.
+        * Absent on hosts without a desktop shell.
+        */
+      writeClipboardText?(text: string): Promise<AppHostClipboardWriteResult>
     }
   }
   plugins: {

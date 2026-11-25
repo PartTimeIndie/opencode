@@ -154,6 +154,9 @@ export function update(adapter: Adapter, event: SessionEvent.Event, options: Upd
           new SessionMessage.System({
             id: event.data.messageID,
             type: "system",
+            // Envelope metadata is not part of synchronized event data. Derive the
+            // presentation marker from the host-issued ID so fresh replay agrees.
+            ...(event.data.messageID.startsWith("msg_crash_") ? { metadata: { systemNotice: "server-recovery" } } : {}),
             text: event.data.text,
             time: { created: event.data.timestamp },
           }),
@@ -211,6 +214,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event, options: Upd
               type: "assistant",
               agent: event.data.agent,
               model: event.data.model,
+              structuredOutputAttempt: event.data.structuredOutputAttempt,
               time: { created: event.data.timestamp },
               content: [],
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,

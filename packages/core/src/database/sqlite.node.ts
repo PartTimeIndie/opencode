@@ -14,6 +14,9 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
+import { CrashActivity } from "../observability/crash-activity"
+
+const traceSqlite = <A>(name: string, work: () => A) => CrashActivity.trackSync({ kind: "sqlite", name }, work)
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -55,10 +58,10 @@ const make = (options: Config) =>
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.prepare(query)
-        statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
+        const statement = traceSqlite("prepare", () => native.prepare(query))
+        traceSqlite("configure", () => statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers)))
         try {
-          return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
+          return Effect.succeed(traceSqlite("all.rows", () => statement.all(...(params as SQLInputValue[]))) as Array<Record<string, unknown>>)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -70,12 +73,14 @@ const make = (options: Config) =>
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
-        const statement = native.prepare(query)
-        statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-        statement.setReturnArrays(true)
+        const statement = traceSqlite("prepare", () => native.prepare(query))
+        traceSqlite("configure", () => {
+          statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
+          statement.setReturnArrays(true)
+        })
         try {
           return Effect.succeed(
-            statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
+            traceSqlite("all.values", () => statement.all(...(params as SQLInputValue[]))) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
           )
         } catch (cause) {
           return Effect.fail(
@@ -104,7 +109,7 @@ const make = (options: Config) =>
       },
       loadExtension: (path) =>
         Effect.try({
-          try: () => native.loadExtension(path),
+          try: () => traceSqlite("load-extension", () => native.loadExtension(path)),
           catch: (cause) =>
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to load extension", operation: "loadExtension" }),
@@ -148,16 +153,17 @@ const nativeLayer = (config: Config) =>
   Layer.effect(
     Sqlite.Native,
     Effect.gen(function* () {
-      const native = new DatabaseSync(config.filename, {
+      const native = traceSqlite("open", () => new DatabaseSync(config.filename, {
         readOnly: config.readonly,
         timeout: config.timeout ?? 30000,
         allowExtension: config.allowExtension,
         enableForeignKeyConstraints: true,
         open: true,
-      })
-      yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      native.exec("PRAGMA busy_timeout = 30000;")
-      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
+      }))
+      yield* Effect.addFinalizer(() => Effect.sync(() => traceSqlite("close", () => native.close())))
+      traceSqlite("pragma.busy-timeout", () => native.exec("PRAGMA busy_timeout = 30000;"))
+      if (config.disableWAL !== true && config.readonly !== true)
+        traceSqlite("pragma.journal-mode", () => native.exec("PRAGMA journal_mode = WAL;"))
       return native
     }),
   )

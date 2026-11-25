@@ -18,6 +18,7 @@ export const ProjectTable = sqliteTable("project", {
   icon_generation_attempt: integer().notNull().default(0),
   icon_generation_attempted_at: integer(),
   icon_generation_completed_at: integer(),
+  icon_generation_style: text(),
   ...Timestamps,
   time_initialized: integer(),
   sandboxes: DatabasePath.absoluteArrayColumn().notNull(),
@@ -40,3 +41,11 @@ export const ProjectDirectoryTable = sqliteTable(
   },
   (table) => [primaryKey({ columns: [table.project_id, table.directory] })],
 )
+
+// Folders without a project row (non-git directories resolve to `global`)
+// keep their icon here, addressed by one lexically canonical directory key.
+export const ProjectDirectoryIconTable = sqliteTable("project_directory_icon", {
+  directory: text().primaryKey(),
+  url: text().notNull(),
+  time_updated: integer().notNull(),
+})

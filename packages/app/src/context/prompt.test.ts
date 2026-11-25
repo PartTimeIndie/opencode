@@ -10,6 +10,11 @@ import {
 const dataUrl = (size: number) => `data:image/png;base64,${"a".repeat(size)}`
 
 describe("prompt store persistence", () => {
+  test("retains explicit archive extraction choice for source-backed drafts", () => {
+    const archive = { type: "image" as const, id: "archive", filename: "save.7z", sourcePath: "C:/Temp/save.7z", mime: "application/x-7z-compressed", unpack: true }
+    expect(sanitizePromptStore({ prompt: [archive], context: { items: [] } }).prompt[0]).toMatchObject({ unpack: true })
+    expect(migratePromptStore({ prompt: [archive], context: { items: [] } }).prompt[0]).toMatchObject({ unpack: true })
+  })
   test("sanitizes source-backed image data before persistence", () => {
     const store: PromptStore = {
       prompt: [

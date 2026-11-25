@@ -14,6 +14,9 @@ import { Persist, persisted } from "@/utils/persist"
 import { playSoundById } from "@/utils/sound"
 import { useSessionRoute } from "@/context/session-route"
 import { sessionNotificationEvent } from "./notification-event"
+import { useSessionAttention } from "./session-attention"
+import { attentionKey } from "@/session-attention/identity"
+import { useServer } from "./server"
 
 type NotificationBase = {
   directory?: string
@@ -116,6 +119,8 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     const platform = usePlatform()
     const settings = useSettings()
     const language = useLanguage()
+    const attention = useSessionAttention()
+    const server = useServer()
 
     const empty: Notification[] = []
 
@@ -228,9 +233,35 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
       return sessionID === activeSession
     }
 
+    const prioritySystem = new Map<string, { directory: string; sessionID: string; title: string; href: string; error: boolean }>()
+    let priorityTimer: ReturnType<typeof setTimeout> | undefined
+    const queuePrioritySystem = (directory: string, sessionID: string, title: string, href: string, error: boolean) => {
+      prioritySystem.set(attentionKey(server.key, directory, sessionID), { directory, sessionID, title, href, error })
+      if (priorityTimer) return
+      priorityTimer = setTimeout(async () => {
+        priorityTimer = undefined
+        if (meta.disposed) return
+        const candidates = [...prioritySystem.values()].filter((item) =>
+          attention.enabled() && attention.current(item)?.enabled && attention.current(item)?.count && !attention.visible(item))
+        prioritySystem.clear()
+        const items = (await Promise.all(candidates.map(async (item) => {
+          if (!platform.sessionAttention) return item
+          try { return await platform.sessionAttention.isVisible(attention.key(item)) ? undefined : item }
+          catch { return undefined }
+        }))).filter((item) => !!item)
+        if (meta.disposed || !attention.enabled() || !items.length ||
+          !(settings.notifications.agent() || settings.notifications.errors())) return
+        const first = items[0]!
+        void platform.notify(items.length === 1
+          ? language.t(first.error ? "session.attention.toast.failed" : "session.attention.toast.completed")
+          : language.t("session.attention.toast.multiple", { count: items.length }),
+          items.length === 1 ? first.title : language.t("session.attention.toast.open"), first.href, { always: true })
+      }, 1000)
+    }
+
     const handleSessionIdle = (directory: string, event: { properties: { sessionID?: string } }, time: number) => {
       const sessionID = event.properties.sessionID
-      void lookup(directory, sessionID).then((session) => {
+      void lookup(directory, sessionID).then(async (session) => {
         if (meta.disposed) return
         if (!session) return
         if (session.parentID) return
@@ -248,8 +279,11 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
         })
 
         const href = `/${base64Encode(directory)}/session/${sessionID}`
-        if (settings.notifications.agent()) {
-          void platform.notify(language.t("notification.session.responseReady.title"), session.title ?? sessionID, href)
+        const priority = attention.enabled() && !!sessionID && !!attention.current({ directory, sessionID })?.enabled
+        const fresh = priority ? await attention.refresh({ directory, sessionID }, true) : false
+        if (settings.notifications.agent() && !meta.disposed) {
+          if (priority && fresh) queuePrioritySystem(directory, sessionID, session.title ?? sessionID, href, false)
+          if (!priority) void platform.notify(language.t("notification.session.responseReady.title"), session.title ?? sessionID, href)
         }
       })
     }
@@ -260,7 +294,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
       time: number,
     ) => {
       const sessionID = event.properties.sessionID
-      void lookup(directory, sessionID).then((session) => {
+      void lookup(directory, sessionID).then(async (session) => {
         if (meta.disposed) return
         if (session?.parentID) return
 
@@ -281,8 +315,11 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
           session?.title ??
           (typeof error === "string" ? error : language.t("notification.session.error.fallbackDescription"))
         const href = sessionID ? `/${base64Encode(directory)}/session/${sessionID}` : `/${base64Encode(directory)}`
-        if (settings.notifications.errors()) {
-          void platform.notify(language.t("notification.session.error.title"), description, href, { always: true })
+        const priority = attention.enabled() && !!sessionID && !!attention.current({ directory, sessionID })?.enabled
+        const fresh = priority && sessionID ? await attention.refresh({ directory, sessionID }, true) : false
+        if (settings.notifications.errors() && !meta.disposed) {
+          if (priority && fresh && sessionID) queuePrioritySystem(directory, sessionID, session?.title ?? sessionID, href, true)
+          if (!priority) void platform.notify(language.t("notification.session.error.title"), description, href, { always: true })
         }
       })
     }
@@ -329,6 +366,8 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     })
     onCleanup(() => {
       meta.disposed = true
+      if (priorityTimer) clearTimeout(priorityTimer)
+      prioritySystem.clear()
       unsub()
       unsubSync()
     })

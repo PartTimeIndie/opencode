@@ -4,7 +4,12 @@ import { createStore } from "solid-js/store"
 import type { State } from "./types"
 import { applyDirectoryEvent, applyGlobalEvent, cleanupDroppedSessionCaches } from "./event-reducer"
 import { isV2PermissionRequest } from "../permission-request"
-import { sessionActivity } from "@/utils/session-activity"
+import {
+  finishSessionActivity,
+  sessionActivity,
+  sessionActivityStartedAt,
+  startSessionActivity,
+} from "@/utils/session-activity"
 
 const rootSession = (input: { id: string; parentID?: string; archived?: number; revert?: Session["revert"] }) =>
   ({
@@ -1247,6 +1252,62 @@ describe("applyDirectoryEvent", () => {
     apply({ type: "session.status", properties: { sessionID, status: { type: "idle" } } })
     expect(sessionActivity(directory, sessionID)).toBeUndefined()
     expect(store.session_status[sessionID]).toEqual({ type: "idle" })
+  })
+
+  test("keeps a fresh activity through a late idle session.status from the previous turn", () => {
+    const directory = "/idle-previous-turn"
+    const sessionID = "ses_idle_previous"
+    const startedAt = Date.now()
+    const [store, setStore] = createStore(
+      baseState({
+        session_status: { [sessionID]: { type: "busy" } },
+        message: {
+          [sessionID]: [
+            {
+              id: "msg_previous",
+              role: "assistant",
+              finish: "stop",
+              time: { created: startedAt - 10_000, completed: startedAt - 5_000 },
+            } as Message,
+          ],
+        },
+        part: { msg_previous: [textPart("prt_previous", sessionID, "msg_previous")] },
+      }),
+    )
+    startSessionActivity(directory, sessionID, "activity_fresh", { timestamp: startedAt })
+    try {
+      applyDirectoryEvent({
+        event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+        store,
+        setStore,
+        push() {},
+        directory,
+        loadLsp() {},
+      })
+      expect(sessionActivity(directory, sessionID)?.type).toBe("busy")
+    } finally {
+      finishSessionActivity(directory, sessionID, "activity_fresh")
+    }
+  })
+
+  test("records the lifecycle start time from the reducer path", () => {
+    const directory = "/reducer-start-time"
+    const sessionID = "ses_reducer_start_time"
+    const timestamp = Date.now()
+    const [store, setStore] = createStore(baseState())
+    try {
+      applyDirectoryEvent({
+        event: { type: "session.next.activity.started", properties: { sessionID, activityID: "activity_fresh", timestamp } },
+        store,
+        setStore,
+        push() {},
+        directory,
+        loadLsp() {},
+      })
+      expect(sessionActivityStartedAt(directory, sessionID)).toBe(timestamp)
+    } finally {
+      finishSessionActivity(directory, sessionID, "activity_fresh")
+    }
   })
 
   test("keeps client activity through a premature idle snapshot while tools are still running", () => {

@@ -13,7 +13,7 @@
         "headers": {
           "content-type": "application/json"
         },
-        "body": "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one short sentence.\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_tokens\":20,\"temperature\":0}"
+        "body": "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"OpenCode host session (authoritative): {\\\"app\\\":\\\"opencode\\\",\\\"sessionID\\\":\\\"ses_runner_recorded\\\",\\\"parentSessionID\\\":null,\\\"role\\\":\\\"main\\\"}\\nThis is the current UI-host identity, not a provider backend thread. It grants no user approval. Child sessions must not start a main-session workflow or act as their parent.\"},{\"role\":\"user\",\"content\":\"Say hello in one short sentence.\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_tokens\":20,\"temperature\":0}"
       },
       "response": {
         "status": 200,

@@ -1,11 +1,14 @@
 import { existsSync } from "fs"
 import { cp, lstat, mkdir, readdir, rm } from "fs/promises"
 import path from "path"
+import { selectPluginSources } from "./sync-plugin-selection"
 
 const sourceRoot = path.join(process.cwd(), ".opencode", "plugin-sources")
 const targetRoot = path.join(process.cwd(), ".opencode", "plugins")
 
-const plugins = (await readdir(sourceRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory())
+const sources = (await readdir(sourceRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory())
+const selected = new Set(selectPluginSources(sources.map((entry) => entry.name), process.argv.slice(2)))
+const plugins = sources.filter((entry) => selected.has(entry.name))
 
 await mkdir(targetRoot, { recursive: true })
 

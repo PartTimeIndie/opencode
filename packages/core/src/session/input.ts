@@ -1,6 +1,6 @@
 export * as SessionInput from "./input"
 
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lte } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import type { Database } from "../database/database"
 import type { EventV2 } from "../event"
@@ -9,14 +9,19 @@ import { NonNegativeInt } from "../schema"
 import { V2Schema } from "../v2-schema"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
+import { SessionAgentPolicy } from "./agent-policy"
 import { Prompt } from "./prompt"
 import { SessionSchema } from "./schema"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
+import { SessionActivityTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 
 type DatabaseService = Database.Interface["db"]
 
 export const Delivery = Schema.Literals(["steer", "queue"])
 export type Delivery = typeof Delivery.Type
+
+/** Transport-attested admission provenance. Absent means unattested (legacy rows). */
+export const Origin = Schema.Literals(["interactive", "plugin"])
+export type Origin = typeof Origin.Type
 
 export class Admitted extends Schema.Class<Admitted>("SessionInput.Admitted")({
   admittedSeq: NonNegativeInt,
@@ -26,6 +31,7 @@ export class Admitted extends Schema.Class<Admitted>("SessionInput.Admitted")({
   delivery: Delivery,
   timeCreated: V2Schema.DateTimeUtcFromMillis,
   promotedSeq: NonNegativeInt.pipe(Schema.optional),
+  origin: Origin.pipe(Schema.optional),
 }) {}
 
 const decodePrompt = Schema.decodeUnknownSync(Prompt)
@@ -40,6 +46,7 @@ const fromRow = (row: typeof SessionInputTable.$inferSelect): Admitted =>
     delivery: row.delivery,
     timeCreated: DateTime.makeUnsafe(row.time_created),
     ...(row.promoted_seq === null ? {} : { promotedSeq: row.promoted_seq }),
+    ...(row.origin === null ? {} : { origin: row.origin }),
   })
 
 export const held = Effect.fn("SessionInput.held")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
@@ -83,6 +90,16 @@ export const release = Effect.fn("SessionInput.release")(function* (
   events: EventV2.Interface,
   input: { id: SessionMessage.ID; sessionID: SessionSchema.ID; prompt: Prompt },
 ) {
+  const session = yield* db.select({ policy: SessionTable.agent_policy, dispatch: SessionTable.fork_dispatch_digest })
+    .from(SessionTable).where(eq(SessionTable.id, input.sessionID)).get().pipe(Effect.orDie)
+  const original = session?.dispatch ? yield* find(db, input.id) : undefined
+  // A steer admitted for a running dispatched child releases with the current
+  // agent/model stamp that releaseInput legitimately adds. The bound task
+  // assignment itself (also admitted as a steer) stays prompt-drift fenced.
+  const patchableSteer = original !== undefined &&
+    original.delivery === "steer" && original.id !== taskBoundInputID(session)
+  if (session?.dispatch && (!original || (!patchableSteer && !matchesPrompt(original, input))))
+    return yield* Effect.die(new LifecycleConflict({ id: input.id }))
   const row = yield* db
     .select({ id: SessionInputTable.id })
     .from(SessionInputTable)
@@ -153,6 +170,12 @@ export class LifecycleConflict extends Schema.TaggedErrorClass<LifecycleConflict
   id: SessionMessage.ID,
 }) {}
 
+/** The single task input a dispatched session's policy authorizes; every other send is fenced. */
+const taskBoundInputID = (session?: { policy: (typeof SessionTable.$inferSelect)["agent_policy"] } | undefined) =>
+  SessionAgentPolicy.isReadOnly(session?.policy ?? undefined)
+    ? session?.policy?.readOnlyInputID
+    : session?.policy?.mirrorWorkspace?.inputID ?? session?.policy?.mainWriteConsent?.inputID
+
 export const admit = Effect.fn("SessionInput.admit")(function* (
   db: DatabaseService,
   events: EventV2.Interface,
@@ -161,9 +184,40 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
     readonly sessionID: SessionSchema.ID
     readonly prompt: Prompt
     readonly delivery: Delivery
+    readonly origin?: Origin
   },
 ) {
   const existing = yield* find(db, input.id)
+  const session = yield* db.select({ policy: SessionTable.agent_policy, dispatch: SessionTable.fork_dispatch_digest })
+    .from(SessionTable).where(eq(SessionTable.id, input.sessionID)).get().pipe(Effect.orDie)
+  // A task-scoped Main exception cannot authorize a later assignment. Keep this
+  // guard below all transports, including direct task follow-ups and plugin sends.
+  const boundInputID = taskBoundInputID(session)
+  // Steering a running task child is a course correction inside its already
+  // authorized activity, not a later assignment: the runtime holds and releases
+  // it at the next safe turn like every other session's steer. The dispatch
+  // fence keeps protecting assignment authority — a queue delivery or a send
+  // to an idle dispatched session still requires the bound task input.
+  const steerActiveTask =
+    session?.dispatch !== undefined && session.dispatch !== null &&
+    input.delivery === "steer" && boundInputID !== input.id
+      ? (yield* db
+          .select({ id: SessionActivityTable.id })
+          .from(SessionActivityTable)
+          .where(
+            and(
+              eq(SessionActivityTable.session_id, input.sessionID),
+              inArray(SessionActivityTable.status, ["running", "recovering"]),
+              gt(SessionActivityTable.lease_until, Date.now()),
+            ),
+          )
+          .limit(1)
+          .get()
+          .pipe(Effect.orDie)) !== undefined
+      : false
+  if (session?.dispatch && !steerActiveTask && (boundInputID !== input.id ||
+    (existing !== undefined && !equivalent(existing, input))))
+    return yield* Effect.die(new LifecycleConflict({ id: input.id }))
   if (existing !== undefined) return existing
   const timestamp = yield* DateTime.now
   return yield* events
@@ -173,6 +227,7 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
       timestamp,
       prompt: input.prompt,
       delivery: input.delivery,
+      ...(input.origin === undefined ? {} : { origin: input.origin }),
     })
     .pipe(
       Effect.flatMap((event) =>
@@ -186,6 +241,7 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
                 prompt: input.prompt,
                 delivery: input.delivery,
                 timeCreated: timestamp,
+                ...(input.origin === undefined ? {} : { origin: input.origin }),
               }),
             ),
       ),
@@ -217,6 +273,7 @@ export const projectAdmitted = Effect.fn("SessionInput.projectAdmitted")(functio
     readonly prompt: Prompt
     readonly delivery: Delivery
     readonly timeCreated: DateTime.Utc
+    readonly origin?: Origin
   },
 ) {
   const message = yield* db
@@ -233,6 +290,7 @@ export const projectAdmitted = Effect.fn("SessionInput.projectAdmitted")(functio
     prompt: encodePrompt(input.prompt),
     delivery: input.delivery,
     time_created: DateTime.toEpochMillis(input.timeCreated),
+    ...(input.origin === undefined ? {} : { origin: input.origin }),
   }
   const stored = yield* db
     .insert(SessionInputTable)
@@ -486,6 +544,16 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
   sessionID: SessionSchema.ID,
   cutoff: number,
 ) {
+  const latest = yield* db.select().from(SessionInputTable)
+    .where(and(eq(SessionInputTable.session_id, sessionID), isNotNull(SessionInputTable.promoted_seq)))
+    .orderBy(desc(SessionInputTable.promoted_seq)).limit(1).get().pipe(Effect.orDie)
+  if (latest !== undefined && latest.promoted_seq !== null &&
+    decodePrompt(latest.execution_prompt ?? latest.prompt).subtask !== undefined) {
+    const assistant = yield* db.select({ seq: SessionMessageTable.seq }).from(SessionMessageTable)
+      .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant")))
+      .orderBy(desc(SessionMessageTable.seq)).limit(1).get().pipe(Effect.orDie)
+    if (!assistant || assistant.seq < latest.promoted_seq) return 0
+  }
   const rows = yield* db
     .select()
     .from(SessionInputTable)
@@ -501,7 +569,11 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
     .orderBy(asc(SessionInputTable.admitted_seq))
     .all()
     .pipe(Effect.orDie)
-  return yield* publish(db, events, sessionID, rows)
+  // A command owns its own dispatch boundary. Do not coalesce a later steer
+  // over it or turn several commands into only the last command's task.
+  const command = rows.findIndex((row) => decodePrompt(row.execution_prompt ?? row.prompt).subtask !== undefined)
+  const selected = command < 0 ? rows : rows.slice(0, command === 0 ? 1 : command)
+  return yield* publish(db, events, sessionID, selected)
 })
 
 export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(function* (

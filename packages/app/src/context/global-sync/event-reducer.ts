@@ -16,12 +16,18 @@ import type { State, VcsCache } from "./types"
 import { sessionTrimPreserveIDs, trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
 import { diffs as list, message as clean } from "@/utils/diffs"
-import { latestAssistantSettled, type TurnCompletionStatus } from "@/utils/session-status"
+import { idleSignalSettlesActivity, type TurnCompletionStatus } from "@/utils/session-status"
 import { markQuestionChanged } from "./question-revision"
 import { markPermissionChanged } from "./permission-revision"
 import { normalizePermissionRequest } from "../permission-request"
 import { clearSurfaceRequestProtocol, isSurfaceRequestSettled, markSurfaceRequestProtocol } from "../question-request"
-import { dismissSessionActivity, finishSessionActivity, startSessionActivity, updateSessionActivity } from "@/utils/session-activity"
+import {
+  dismissSessionActivity,
+  finishSessionActivity,
+  sessionActivityStartedAt,
+  startSessionActivity,
+  updateSessionActivity,
+} from "@/utils/session-activity"
 import { resolvePartText } from "@opencode-ai/ui/message-part-text"
 import { mergeSessionList, replaceSessionList } from "./session-list"
 import { mergePartsPreservingText } from "./session-message-window"
@@ -327,8 +333,9 @@ export function applyDirectoryEvent(input: {
     }
     case "session.next.activity.started":
     case "session.next.activity.recovered": {
-      const props = event.properties as { sessionID: string; activityID?: string }
-      if (!startSessionActivity(input.directory, props.sessionID, props.activityID)) break
+      const props = event.properties as { sessionID: string; activityID?: string; timestamp?: unknown }
+      const evidence = typeof props.timestamp === "number" && props.timestamp > 0 ? { timestamp: props.timestamp } : undefined
+      if (!startSessionActivity(input.directory, props.sessionID, props.activityID, evidence)) break
       input.setStore("session_status", props.sessionID, { type: "busy" })
       input.setStore(
         "turnCompletion",
@@ -349,7 +356,10 @@ export function applyDirectoryEvent(input: {
     }
     case "session.status": {
       const props = event.properties as { sessionID: string; status: SessionStatus }
-      if (props.status.type === "idle" && latestAssistantSettled(input.store, props.sessionID)) {
+      if (
+        props.status.type === "idle" &&
+        idleSignalSettlesActivity(input.store, props.sessionID, sessionActivityStartedAt(input.directory, props.sessionID))
+      ) {
         finishSessionActivity(input.directory, props.sessionID)
       }
       input.setStore("session_status", props.sessionID, reconcile(props.status))

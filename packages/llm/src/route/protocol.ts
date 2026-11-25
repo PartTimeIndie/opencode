@@ -36,6 +36,12 @@ import type { LLMError, LLMEvent, LLMRequest, ProtocolID } from "../schema"
 export interface Protocol<Body, Frame, Event, State> {
   /** Stable id for the wire protocol implementation. */
   readonly id: ProtocolID
+  /** The lowering preserves privileged caller context after all shared history. */
+  readonly runtimeContext?: "late-system"
+  /** Wire support only; this is not proof of deployment/model enforcement. */
+  readonly jsonSchema?: true
+  /** A documented deployment limitation for result-tool selection, not a general fallback. */
+  readonly structuredToolChoice?: (request: LLMRequest) => "named" | "auto"
   /** Request side: schema for the provider-native body and how to build it. */
   readonly body: ProtocolBody<Body>
   /** Response side: streaming state machine. */

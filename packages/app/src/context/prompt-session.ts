@@ -31,7 +31,7 @@ function isPartEqual(partA: ContentPart, partB: ContentPart) {
     case "agent":
       return partB.type === "agent" && partA.name === partB.name
     case "image":
-      return partB.type === "image" && partA.id === partB.id
+      return partB.type === "image" && partA.id === partB.id && !!partA.unpack === !!partB.unpack && JSON.stringify(partA.annotation) === JSON.stringify(partB.annotation)
   }
 }
 
@@ -50,7 +50,7 @@ function cloneSelection(selection?: FileSelection) {
 
 function clonePart(part: ContentPart): ContentPart {
   if (part.type === "text") return { ...part }
-  if (part.type === "image") return { ...part }
+  if (part.type === "image") return { ...part, ...(part.annotation ? { annotation: { ...part.annotation } } : {}) }
   if (part.type === "agent") return { ...part }
   return {
     ...part,

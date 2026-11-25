@@ -42,6 +42,25 @@ const skills = Layer.succeed(
           content: "Call spawn_agent.",
         }),
         new SkillV2.Info({
+          name: "untrusted-orchestrator",
+          requestedCapabilities: ["orchestrator"],
+          location: AbsolutePath.make("/skills/untrusted-orchestrator/SKILL.md"),
+          content: "No host grant.",
+        }),
+        new SkillV2.Info({
+          name: "mixed-orchestrator",
+          requestedCapabilities: ["orchestrator", "spawn_agent"],
+          location: AbsolutePath.make("/skills/mixed-orchestrator/SKILL.md"),
+          content: "Not an appended commissioning-only skill.",
+        }),
+        new SkillV2.Info({
+          name: "main-orchestrator",
+          aliases: ["managed-main"],
+          requestedCapabilities: ["orchestrator"],
+          location: AbsolutePath.make("/skills/main-orchestrator/SKILL.md"),
+          content: "Call orchestrator after host consent.",
+        }),
+        new SkillV2.Info({
           name: "multi-agent-orchestrator",
           requestedCapabilities: ["spawn_agent"],
           location: AbsolutePath.make("/skills/multi-agent-orchestrator/SKILL.md"),
@@ -111,6 +130,17 @@ describe("CapabilityLease", () => {
         text: "please spawn a session",
       })
       expect(Object.keys(yield* service.snapshot(slashSessionID, agent))).toEqual(["spawn_agent"])
+    }),
+  )
+
+  it.effect("retired Main skill declarations and appended references grant no capabilities", () =>
+    Effect.gen(function* () {
+      const service = yield* CapabilityLease.Service
+      for (const text of ["/main-orchestrator", "Implement the task\n\n/main-orchestrator", "Please /managed-main now", "/untrusted-orchestrator", "please /mixed-orchestrator", "please /spawn-new-agent now"]) {
+        yield* service.revoke(orchestratorSessionID, agent)
+        yield* CapabilityLease.activateFromSlash({ sessionID: orchestratorSessionID, agent, text })
+        expect(yield* service.snapshot(orchestratorSessionID, agent)).toEqual({})
+      }
     }),
   )
 

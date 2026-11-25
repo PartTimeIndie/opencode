@@ -92,6 +92,7 @@ const handoffLocationServices = Layer.merge(handoffAgents, handoffModels)
 const handoffLocations = Layer.succeed(
   LocationServiceMap,
   LocationServiceMap.of({
+    bindExecution: () => Effect.void,
     get: () => handoffLocationServices as never,
     invalidate: () => Effect.void,
   }),

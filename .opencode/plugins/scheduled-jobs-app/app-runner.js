@@ -9,7 +9,7 @@ import {
   scheduledJobPrompt,
 } from "./app-runner-helpers.js"
 import { resultContractMarker } from "./result-contract.js"
-export function createScheduledAppRunner(api, request, showToast) {
+export function createScheduledAppRunner(api, request, showToast, { reconcileIntervalMs = 60_000 } = {}) {
   const errorMessage = (error, fallback) => error?.data?.message || (error instanceof Error ? error.message : fallback)
   const sessionClient = (directory) => {
     const http = async (path, method = "GET", body) => {
@@ -392,10 +392,6 @@ export function createScheduledAppRunner(api, request, showToast) {
         return
       }
       if (lastRunStatus !== "running") return
-      const prompt = scheduledJobTaskPrompt(job)
-      if (!prompt) throw new Error("Scheduled app job has no prompt.")
-      api.host.projects.open(directory)
-      const client = sessionClient(directory)
       const persistedSessionID = stringValue(job, "lastRunSessionID")
       const persistedMessageID = stringValue(job, "lastRunMessageID")
       const persistedResultContract = stringValue(job, "lastRunResultContract")
@@ -406,30 +402,31 @@ export function createScheduledAppRunner(api, request, showToast) {
         throw new Error(`Unsupported scheduled job result contract: ${persistedResultContract}`)
       }
       if (persistedSessionID && persistedMessageID) {
-        const found = await client.session
-          .get({ sessionID: persistedSessionID })
-          .then((x) => x.data)
-          .catch((error) => {
-            if (schedulerErrorStatus(error) === 404) return
-            throw error
+        // A saved execution receipt is observation, not permission to resubmit
+        // work or overwrite a session's policy after a confirmed agent handoff.
+        // Only durable admission_missing evidence may retry the same input.
+        const admit = () => Promise.resolve().then(() => {
+          const prompt = scheduledJobTaskPrompt(job)
+          if (!prompt) throw new Error("Scheduled app job has no prompt.")
+          return sessionClient(directory).v2.session.prompt({
+            sessionID: persistedSessionID,
+            id: persistedMessageID,
+            agent: stringValue(run, "agent"),
+            model: scheduledJobModelSelection(run, api.ui.models.resolve),
+            delivery: "steer",
+            prompt: { text: persistedResultContract ? scheduledJobPrompt(prompt) : prompt },
           })
-        if (!found?.id) {
-          if (scheduledAppSessionStrategy(run) !== "job") {
-            throw new Error("Scheduled app job target session no longer exists.")
-          }
-          await createScheduledSession(
-            directory,
-            persistedSessionID,
-            scheduledAccessControlProfile(run) ?? (await api.host.sessions.accessControl.get({ directory })),
-          )
-          recreatedSession = true
-        }
-        if (found?.id) {
-          await applyScheduledSessionAccessControlProfile(directory, found, scheduledAccessControlProfile(run))
-        }
-        sessionID = persistedSessionID
-        messageID = persistedMessageID
-      } else if (scheduledJobSubmissionTargets.has(key)) {
+        }).then(() => ({ admitted: true })).catch((error) => ({ admitted: false, error }))
+        api.host.projects.open(directory)
+        api.host.navigation.openSession({ directory, sessionID: persistedSessionID })
+        trackScheduledJobRun({ ...link, directory, sessionID: persistedSessionID, messageID: persistedMessageID, admit })
+        return
+      }
+      const prompt = scheduledJobTaskPrompt(job)
+      if (!prompt) throw new Error("Scheduled app job has no prompt.")
+      api.host.projects.open(directory)
+      const client = sessionClient(directory)
+      if (scheduledJobSubmissionTargets.has(key)) {
         const target = scheduledJobSubmissionTargets.get(key)
         sessionID = target.sessionID
         messageID = target.messageID
@@ -445,7 +442,7 @@ export function createScheduledAppRunner(api, request, showToast) {
       if (!scheduledJobTrackingActive) return
       const targetSessionID = sessionID
       const targetMessageID = messageID
-      const resultContract = persistedSessionID && !persistedResultContract ? undefined : resultContractMarker
+      const resultContract = resultContractMarker
       const state = await schedulerStateResult(link, {
         status: "running",
         appSessionID: targetSessionID,
@@ -566,16 +563,25 @@ export function createScheduledAppRunner(api, request, showToast) {
       const slug = stringValue(job, "slug")
       const runId = stringValue(job, "lastRunRunId")
       if (!directory || !scopeId || !slug || !runId) continue
-      enqueueScheduledJobRun(bindScheduledJobRun({ directory, scopeId, slug, runId }))
+      const link = bindScheduledJobRun({ directory, scopeId, slug, runId })
+      // Leave an already queued submission retry on its own backoff.
+      if (!scheduledJobRetryGeneration.has(scheduledRunKey(link))) enqueueScheduledJobRun(link)
     }
   }
+  let reconciliationStarted = false
   const reconcileScheduledJobRuns = async () => {
     let attempt = 0
     while (scheduledJobTrackingActive) {
       const result = await resumeScheduledJobRuns()
         .then(() => ({ ok: true }))
         .catch((error) => ({ ok: false, error }))
-      if (result.ok || !isRetryableScheduledJobSubmissionError(result.error)) return
+      if (result.ok) {
+        // A scheduler run can become due after startup without its desktop link
+        // reaching this renderer. Recover from the persisted run on this lifecycle.
+        void waitForScheduledJobOutcome(reconcileIntervalMs).then(reconcileScheduledJobRuns)
+        return
+      }
+      if (!isRetryableScheduledJobSubmissionError(result.error)) return
       await waitForScheduledJobOutcome(Math.min(300000, 1000 * 2 ** Math.min(attempt, 8)))
       attempt += 1
     }
@@ -603,6 +609,10 @@ export function createScheduledAppRunner(api, request, showToast) {
         }),
       )
     },
-    resume: reconcileScheduledJobRuns,
+    resume() {
+      if (reconciliationStarted) return
+      reconciliationStarted = true
+      return reconcileScheduledJobRuns()
+    },
   }
 }

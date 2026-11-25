@@ -34,7 +34,7 @@ import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { Effect, Layer, Option, Schema, Stream } from "effect"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionActivityTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { tmpdir } from "./fixture/tmpdir"
 import { it } from "./lib/effect"
 
@@ -63,6 +63,7 @@ const noisyLog = () => {
 }
 
 const requests: LLMRequest[] = []
+const activationAsks: PermissionV2.AssertInput[] = []
 let responses: LLMEvent[][] = []
 const client = Layer.succeed(
   LLMClient.Service,
@@ -81,7 +82,10 @@ const client = Layer.succeed(
 const permission = Layer.succeed(
   PermissionV2.Service,
   PermissionV2.Service.of({
-    assert: () => Effect.void,
+    assert: (input) =>
+      Effect.sync(() => {
+        activationAsks.push(input)
+      }),
     ask: () => Effect.die("unused"),
     reply: () => Effect.die("unused"),
     materializationRules: () => Effect.succeed([]),
@@ -130,6 +134,7 @@ const harness = <A, E, R>(body: (session: SessionV2.Interface, directory: string
       const plugins = PluginV2.layer.pipe(Layer.provide(events))
       const applications = ApplicationTools.layer
       const registry = ToolRegistry.layer.pipe(
+        Layer.provide(database),
         Layer.provide(permission),
         Layer.provide(applications),
         Layer.provide(toolOutputStore),
@@ -225,6 +230,7 @@ const harness = <A, E, R>(body: (session: SessionV2.Interface, directory: string
 const setup = (sessionID: SessionV2.ID, directory: string) =>
   Effect.gen(function* () {
     requests.length = 0
+    activationAsks.length = 0
     responses = []
     configEntries = []
     const database = yield* Database.Service
@@ -286,6 +292,72 @@ const toolMessageTexts = (request: LLMRequest | undefined) =>
     )
 
 describe("tool-context recorded provider requests", () => {
+  it.effect(
+    "injects an explicit plugin tool only into the host-approved command's provider requests, not ordinary turns or later replay",
+    () =>
+      harness((session, directory) =>
+        Effect.gen(function* () {
+          const sessionID = SessionV2.ID.make("ses_explicit_request")
+          yield* setup(sessionID, directory)
+          const { db } = yield* Database.Service
+          yield* db
+            .insert(SessionActivityTable)
+            .values({
+              id: "explicit-request-activity",
+              session_id: sessionID,
+              status: "running",
+              kind: "prompt",
+              owner_id: "fixture-owner",
+              opened_seq: 0,
+              lease_until: Date.now() + 60000,
+            })
+            .run()
+            .pipe(Effect.orDie)
+          const registry = yield* ToolRegistry.Service
+          const observed: Array<Tool.Context["explicitInvocation"]> = []
+          yield* registry.register({
+            manual_export: Tool.withExplicitInvocation(
+              Tool.make({
+                description: "Explicit export probe",
+                input: Schema.Struct({}),
+                output: Schema.String,
+                execute: (_input, context) =>
+                  Effect.sync(() => {
+                    observed.push(context.explicitInvocation)
+                    return "preview only"
+                  }),
+              }),
+              "export-report",
+            ),
+          })
+          responses = [textTurn("ordinary", "No export requested")]
+          yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Describe an export" }), resume: false })
+          yield* session.resume(sessionID)
+          expect(requests[0]?.tools?.map((x) => x.name)).not.toContain("manual_export")
+          expect(activationAsks).toHaveLength(0)
+          responses = [toolTurn("explicit", "manual_export", {}), textTurn("explicit-done", "Done")]
+          yield* session.prompt({ sessionID, prompt: new Prompt({ text: "/export-report preview" }), resume: false })
+          yield* session.resume(sessionID)
+          expect(requests[1]?.tools?.map((x) => x.name)).toContain("manual_export")
+          expect(requests[2]?.tools?.map((x) => x.name)).toContain("manual_export")
+          expect(activationAsks.filter((x) => x.action === "manual_export")).toHaveLength(1)
+          expect(
+            activationAsks.find((x) => x.action === "manual_export")?.metadata?.[PermissionV2.SINGLE_USE_METADATA_KEY],
+          ).toBe(true)
+          expect(observed).toMatchObject([{ command: "export-report", activityID: "explicit-request-activity" }])
+          responses = [textTurn("unrelated", "Unrelated task")]
+          yield* session.prompt({
+            sessionID,
+            prompt: new Prompt({ text: "Now describe something else" }),
+            resume: false,
+          })
+          yield* session.resume(sessionID)
+          expect(requests[3]?.tools?.map((x) => x.name)).not.toContain("manual_export")
+          expect(observed).toHaveLength(1)
+        }),
+      ),
+  )
+
   it.effect("passes only retained prepared-request group results into tool settlement", () =>
     harness((session, directory) =>
       Effect.gen(function* () {

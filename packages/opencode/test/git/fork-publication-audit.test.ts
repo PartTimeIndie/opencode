@@ -14,6 +14,33 @@ function git(cwd: string, ...args: string[]) {
 }
 
 describe("fork publication audit", () => {
+  test("portable review fixtures contain synthetic data rather than copied private reviews or chats", () => {
+    for (const [name, count, binding] of [["questions", 6, "a"], ["options", 1, "c"]] as const) {
+      const source = readFileSync(new URL(`../../../app/e2e/fixtures/daily-review-${name}.json`, import.meta.url), "utf8")
+      const payload = JSON.parse(source)
+      expect(payload.questions).toHaveLength(count)
+      expect(payload.keys).toHaveLength(count)
+      expect(payload.binding).toBe(binding.repeat(64))
+      expect(source).not.toMatch(/daily-agent-review-\d{4}|Material-Digest|TryCloseAndDrain|PendingPersister|\bPU\b|C:[/\\]+Users/i)
+      expect(source.match(/\b[a-f0-9]{64}\b/g)).toEqual([binding.repeat(64)])
+      for (const [index, question] of payload.questions.entries()) {
+        expect(payload.keys[index]).toMatch(/^fixture-review-/)
+        expect(question.body[0].id).toBe(payload.keys[index])
+        expect(question.body[0].content).toContain("Example App")
+        expect(question.body[0].content).toContain("<details>")
+      }
+    }
+    const endings = JSON.parse(readFileSync(new URL("../session/fixtures/turn-stop-endings.json", import.meta.url), "utf8"))
+    expect(endings.map((ending: { expected: string }) => ending.expected)).toEqual(["incomplete", "done", "done"])
+    for (const ending of endings) {
+      expect(ending.text).toMatch(/synthetisch/i)
+      expect(ending.text).not.toMatch(/C:[/\\]+Users|crisc|ses_[a-z0-9]+/i)
+    }
+    const runner = readFileSync(new URL("../../../core/script/context-budget-model-check.ts", import.meta.url), "utf8")
+    expect(runner).not.toMatch(/C:[/\\]+GitRepros|\bPU\b/)
+    expect(runner).toContain("Synthetische Referenzauswahl")
+  })
+
   test("audits every indexed path and catches private ancestry even after untracking", () => {
     const root = mkdtempSync(join(tmpdir(), "opencode-publication-"))
     try {

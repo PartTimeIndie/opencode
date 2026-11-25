@@ -1,32 +1,19 @@
 import type { IpcMainEvent } from "electron"
 import { BrowserWindow } from "electron"
-import { write as writeLog } from "./logging"
+import { write } from "./logging"
 import { liveWindow } from "./window-lifecycle"
 
-// Windows can stop presenting a window's composited surface while the
-// renderer process stays alive and responsive: the window turns into the
-// native background color (gray in the light tone, near-black in the dark
-// tone) and only recovers when the user moves or resizes it. Moving the
-// window reallocates the DWM surface, so recovery mirrors that manual fix:
-// invalidate the surface first and nudge the window bounds by one pixel if
-// the renderer still reports stalled frames.
-
+// Request repaint only in response to an event. Never move/resize a window or
+// poll its surface: neither renderer liveness nor invalidate() acknowledges a
+// frame reaching the screen, so neither can diagnose or prevent a black window.
 export type FrameStallReport = {
   stallMs: number
   focused: boolean
   visibility: string
 }
 
-export type PaintRecoveryAction = "none" | "invalidate" | "nudge"
+const reportCooldownMs = 4000
 
-const actionCooldownMs = 4000
-const focusedSurfaceCheckMs = 15_000
-
-export function nextPaintRecoveryAction(input: { stallReports: number; visibility: string }): PaintRecoveryAction {
-  if (input.visibility !== "visible") return "none"
-  if (input.stallReports <= 0) return "none"
-  return input.stallReports === 1 ? "invalidate" : "nudge"
-}
 export function parseFrameStallReport(value: unknown): FrameStallReport | undefined {
   if (typeof value !== "object" || value === null) return
   const report = value as Record<string, unknown>
@@ -38,136 +25,83 @@ export function parseFrameStallReport(value: unknown): FrameStallReport | undefi
 type WindowPaintRecovery = {
   reportStall: (report: FrameStallReport) => void
   invalidate: (trigger: string) => void
-  nudge: (trigger: string) => void
 }
 
 const recoveries = new Map<number, WindowPaintRecovery>()
 
-export function createPaintRecovery(
-  win: BrowserWindow,
-  name: string,
-  now: () => number = Date.now,
-  schedule: typeof setInterval = setInterval,
-  cancel: typeof clearInterval = clearInterval,
-) {
-  let stallReports = 0
-  let nudging = false
-  let lastActionAt = 0
-  let focusedSurfaceCheck: ReturnType<typeof setInterval> | undefined
-  let focusedSurfaceChecks = 0
+export function createPaintRecovery(win: BrowserWindow, name: string, now: () => number = () => performance.now()) {
+  let closed = false
+  let stalled = false
+  let lastReportAt: number | undefined
 
   const invalidate = (trigger: string) => {
-    const target = liveWindow(win)
+    if (closed) return
+    const target = paintableWindow(win)
     if (!target) return
-    writeLog("window", "invalidating window surface", { window: name, trigger })
+    write("window", "invalidating window surface", { window: name, trigger })
     target.webContents.invalidate()
   }
 
-  const nudge = (trigger: string) => {
-    const target = liveWindow(win)
-    if (!target || nudging) return
-    nudging = true
-    try {
-      const bounds = target.getBounds()
-      target.setBounds({ ...bounds, x: bounds.x + 1 })
-      target.setBounds(bounds)
-      writeLog("window", "nudged window bounds to force surface repaint", { window: name, trigger, bounds })
-    } finally {
-      nudging = false
-    }
-  }
-
-  const stopFocusedSurfaceCheck = () => {
-    if (focusedSurfaceCheck === undefined) return
-    cancel(focusedSurfaceCheck)
-    focusedSurfaceCheck = undefined
-    focusedSurfaceChecks = 0
-  }
-
-  const startFocusedSurfaceCheck = () => {
-    if (focusedSurfaceCheck !== undefined) return
-    focusedSurfaceCheck = schedule(() => {
-      const target = liveWindow(win)
-      if (!target || !target.isVisible() || !target.isFocused()) {
-        stopFocusedSurfaceCheck()
-        return
-      }
-      // Chromium continues to run requestAnimationFrame while DWM presents a
-      // stale surface, so renderer liveness cannot distinguish this failure.
-      // Invalidate on focus/show, then alternate the resize-equivalent nudge
-      // with a cheap invalidate while the window remains focused.
-      focusedSurfaceChecks += 1
-      if (focusedSurfaceChecks % 2 === 1) {
-        nudge("focused-surface-watchdog")
-        return
-      }
-      invalidate("focused-surface-watchdog")
-    }, focusedSurfaceCheckMs)
-    focusedSurfaceCheck.unref?.()
-  }
-
   const reportStall = (report: FrameStallReport) => {
+    if (closed) return
     if (report.stallMs === 0) {
-      if (stallReports === 0) return
-      stallReports = 0
-      writeLog("window", "renderer frames resumed", { window: name, focused: report.focused })
+      if (!stalled) return
+      stalled = false
+      write("window", "renderer frames resumed", { window: name, focused: report.focused })
       return
     }
-    if (report.visibility !== "visible") return
+    if (report.visibility !== "visible" || !paintableWindow(win)) return
     const current = now()
-    if (current - lastActionAt < actionCooldownMs) return
-    stallReports += 1
-    lastActionAt = current
-    const action = nextPaintRecoveryAction({ stallReports, visibility: report.visibility })
-    writeLog("window", "renderer frame stall reported", { window: name, ...report, stallReports, action }, "error")
-    if (action === "invalidate") return invalidate("frame-stall")
-    if (action === "nudge") return nudge("frame-stall")
+    if (lastReportAt !== undefined && current - lastReportAt < reportCooldownMs) return
+    lastReportAt = current
+    stalled = true
+    write("window", "renderer frame stall reported", { window: name, ...report }, "error")
+    invalidate("frame-stall")
   }
 
-  win.on("show", () => {
-    stallReports = 0
-    invalidate("window-show")
-    if (win.isFocused()) startFocusedSurfaceCheck()
-  })
-  // A stale DWM surface can survive while the renderer and BrowserWindow stay
-  // healthy. Focusing the window is the first native presentation transition
-  // after the user notices the blank surface, so invalidate it immediately and
-  // keep a sparse invalidate-only watchdog while the window remains focused.
-  win.on("focus", () => {
-    invalidate("window-focus")
-    startFocusedSurfaceCheck()
-  })
-  win.on("blur", stopFocusedSurfaceCheck)
-  win.on("restore", () => {
-    stallReports = 0
-    invalidate("window-restore")
-    if (win.isFocused()) startFocusedSurfaceCheck()
-  })
+  const show = () => invalidate("window-show")
+  const focus = () => invalidate("window-focus")
+  const restore = () => invalidate("window-restore")
+  win.on("show", show)
+  win.on("focus", focus)
+  win.on("restore", restore)
   const contentsId = win.webContents.id
   win.once("closed", () => {
-    stopFocusedSurfaceCheck()
+    closed = true
+    win.removeListener("show", show)
+    win.removeListener("focus", focus)
+    win.removeListener("restore", restore)
     recoveries.delete(contentsId)
   })
 
-  const instance = { reportStall, invalidate, nudge }
-  recoveries.set(win.webContents.id, instance)
+  const instance = { reportStall, invalidate }
+  recoveries.set(contentsId, instance)
   return instance
 }
 
 export function reportFrameStallFromRenderer(event: IpcMainEvent, report: FrameStallReport) {
   const recovery = recoveries.get(event.sender.id)
   if (recovery) return recovery.reportStall(report)
-  const win = liveWindow(BrowserWindow.fromWebContents(event.sender))
-  if (win) win.webContents.invalidate()
+  if (report.stallMs <= 0 || report.visibility !== "visible") return
+  const win = paintableWindow(BrowserWindow.fromWebContents(event.sender))
+  win?.webContents.invalidate()
 }
 
 export function invalidateAllWindows(trigger: string) {
   for (const win of BrowserWindow.getAllWindows()) {
-    const recovery = recoveries.get(win.webContents.id)
+    const target = paintableWindow(win)
+    if (!target) continue
+    const recovery = recoveries.get(target.webContents.id)
     if (recovery) {
       recovery.invalidate(trigger)
       continue
     }
-    if (liveWindow(win)) win.webContents.invalidate()
+    target.webContents.invalidate()
   }
+}
+
+function paintableWindow(win: BrowserWindow | null) {
+  const target = liveWindow(win)
+  if (!target || !target.isVisible() || target.isMinimized()) return null
+  return target
 }

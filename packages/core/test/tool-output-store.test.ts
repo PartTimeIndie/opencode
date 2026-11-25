@@ -11,6 +11,8 @@ import { MAX_PERSISTED_CONTENT_PREVIEW_BYTES } from "@opencode-ai/core/content-p
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
+import { toolDetailsMetadata } from "@opencode-ai/core/util/tool-details"
+import { isRecord } from "@opencode-ai/core/util/record"
 import { testEffect } from "./lib/effect"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -90,6 +92,39 @@ const withSharedStore = <A, E, R>(
 const it = testEffect(Layer.empty)
 
 describe("ToolOutputStore", () => {
+  it.live("retains bounded fanout details when large reviewer results become a managed reference", () =>
+    withSharedStore(({ store }) =>
+      Effect.gen(function* () {
+        const structured = {
+          workflow: "review",
+          results: [
+            {
+              reviewer: { model: "configured/reviewer" },
+              sessionID: "ses_actual_child",
+              status: "success",
+              task: { sessionID: "ses_actual_child", state: "completed", text: "report ".repeat(50000) },
+              result: { findings: [], notes: ["report ".repeat(50000)] },
+            },
+          ],
+        }
+        const bound = yield* store.bound({
+          sessionID,
+          toolCallID: "large-fanout",
+          tool: "multi_agent_fanout",
+          output: { structured, content: [{ type: "text", text: JSON.stringify(structured) }] },
+        })
+        expect(bound.output.structured).toHaveProperty("$opencode")
+        const snapshot = isRecord(bound.output.structured) ? bound.output.structured : {}
+        const details = toolDetailsMetadata("multi_agent_fanout", snapshot)
+        expect(details.reviewers).toMatchObject([
+          { model: "configured/reviewer", sessionID: "ses_actual_child", state: "completed" },
+        ])
+        expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThan(ToolOutputStore.MAX_STRUCTURED_BYTES)
+        // A reload reads the same bounded structured snapshot, not the previous live cache.
+        expect(toolDetailsMetadata("multi_agent_fanout", JSON.parse(JSON.stringify(snapshot)))).toEqual(details)
+      }),
+    ),
+  )
   it.live("bounds the provider-facing text channel with one managed file", () =>
     withStore(({ store, fs }) =>
       Effect.gen(function* () {
@@ -279,7 +314,10 @@ describe("ToolOutputStore", () => {
       ({ store }) =>
         Effect.gen(function* () {
           const text = "unlimited-" + "x".repeat(ToolOutputStore.MAX_BYTES * 2)
-          expect(yield* store.limits()).toEqual({ maxLines: Number.POSITIVE_INFINITY, maxBytes: Number.POSITIVE_INFINITY })
+          expect(yield* store.limits()).toEqual({
+            maxLines: Number.POSITIVE_INFINITY,
+            maxBytes: Number.POSITIVE_INFINITY,
+          })
           const result = yield* store.bound({
             sessionID,
             toolCallID: "call-unlimited",
@@ -305,9 +343,7 @@ describe("ToolOutputStore", () => {
             toolCallID: "call-unlimited-duplicate-media",
             output: {
               structured: { content: base64, report: text },
-              content: [
-                { type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png", name: "pixel.png" },
-              ],
+              content: [{ type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png", name: "pixel.png" }],
             },
           })
 
@@ -364,9 +400,7 @@ describe("ToolOutputStore", () => {
         const secondPreview = (materializedSecond.structured as { $opencode: { preview: string } }).$opencode.preview
         expect(firstPreview).toContain("head-")
         expect(firstPreview).toContain("-tail")
-        expect(Buffer.byteLength(firstPreview, "utf8")).toBeLessThanOrEqual(
-          ToolOutputStore.MAX_PROVIDER_PREVIEW_BYTES,
-        )
+        expect(Buffer.byteLength(firstPreview, "utf8")).toBeLessThanOrEqual(ToolOutputStore.MAX_PROVIDER_PREVIEW_BYTES)
         expect(secondPreview).toContain("provider replay budget exhausted")
       }),
     ),

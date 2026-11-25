@@ -84,12 +84,15 @@ const knownCapabilities = new Set([
   "host:tts",
   "host:audio",
   "host:composer",
+  "host:toolbar",
   "host:skills",
   "host:skill-content",
   "host:text-input",
   "host:desktop-services",
   "host:session-policy",
   "host:session-context",
+  "host:session-attention",
+  "host:session-attention-read",
 ])
 
 const privateAssetExtensions = new Set([".jks", ".key", ".keystore", ".p12", ".p8", ".pem", ".pfx", ".ppk"])
@@ -299,7 +302,9 @@ export function appPluginMetadata(pkg: Record<string, unknown> | undefined) {
   const opencode = isRecord(pkg?.opencode) ? pkg.opencode : undefined
   const app = isRecord(opencode?.app) ? opencode.app : undefined
   const capabilities =
-    stringList(app?.capabilities)?.filter((item) => knownCapabilities.has(item) || /^services:[^:]+:[a-zA-Z0-9._-]+$/.test(item)) ?? legacyCapabilities
+    stringList(app?.capabilities)?.filter(
+      (item) => knownCapabilities.has(item) || /^services:[^:]+:[a-zA-Z0-9._-]+$/.test(item),
+    ) ?? legacyCapabilities
   const ai = isRecord(app?.ai) ? app.ai : undefined
   return {
     capabilities,
@@ -395,9 +400,11 @@ export async function clientManifest(directory?: string) {
   }
 }
 
-export async function hostPolicy(id: string, version: string, hash: string) {
-  const plugins = (await Promise.all([...frozen.values()]))
-    .flat()
+export async function hostPolicy(id: string, version: string, hash: string, directory?: string) {
+  // Config or plugin changes can invalidate the manifest cache after the UI has
+  // loaded its caller identity. Rebuild the routed directory before checking it.
+  const list = directory ? await manifests(directory) : (await Promise.all([...frozen.values()])).flat()
+  const plugins = list
     .filter((item) => item.id === id && item.version === version && item.hash === hash)
   const plugin = plugins[0]
   if (!plugin) return

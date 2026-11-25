@@ -63,6 +63,15 @@ export class Info extends Schema.Class<Info>("SkillV2.Info")({
   requestedCapabilities: Schema.Array(Schema.String).pipe(Schema.optional),
   location: AbsolutePath,
   content: Schema.String,
+  /** Server-computed effective policy for a requested agent; absent without one. */
+  effective: Schema.Struct({
+    visible: Schema.Boolean,
+    invocation: Schema.Literals(["allow", "ask", "manual", "deny"]),
+    sources: Schema.Struct({
+      visible: Schema.String,
+      invocation: Schema.String,
+    }),
+  }).pipe(Schema.optional),
 }) {}
 
 export class ResolveInput extends Schema.Class<ResolveInput>("SkillV2.ResolveInput")({
@@ -140,8 +149,10 @@ export function missingTools(skill: Info, agent: AgentV2.Info, policy: AgentV2.I
 }
 
 export function invokedBySlash(skill: Info, text: string) {
-  const name = text.trim().match(/^\/([A-Za-z0-9][A-Za-z0-9._-]*)(?=\s|$)/)?.[1]
-  return name !== undefined && (name === skill.name || skill.aliases?.includes(name) === true)
+  // Composer references can appear after prose or alongside other slash skills.
+  return Array.from(text.matchAll(/(?:^|\s)\/([A-Za-z0-9][A-Za-z0-9._-]*)(?=\s|$)/g)).some(
+    ([, name]) => name === skill.name || skill.aliases?.includes(name) === true,
+  )
 }
 
 const Frontmatter = Schema.Struct({
@@ -187,6 +198,22 @@ export interface Interface {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Skill") {}
+
+/**
+ * Skill names and aliases that compaction uses to detect the still-active
+ * slash-command workflow it must carry across checkpoints. Shared by the runner
+ * and the manual-compaction factory so both paths stay identical.
+ */
+export const commandNamesFrom = (skills: Interface | undefined) =>
+  Effect.gen(function* () {
+    const names = new Set<string>()
+    if (!skills) return names
+    for (const skill of yield* skills.list()) {
+      names.add(skill.name)
+      for (const alias of skill.aliases ?? []) names.add(alias)
+    }
+    return names
+  })
 
 export const layer = Layer.effect(
   Service,
@@ -310,7 +337,7 @@ export const layer = Layer.effect(
       // Apply exact-name restrictions outside the source cache. Unlisted skills
       // retain their own modes, including project-specific exceptions.
       return Array.from(skills.values(), (skill) =>
-        invocation?.manual.includes(skill.name)
+        invocation?.manual?.includes(skill.name)
           ? new Info({ ...skill, disableModelInvocation: true })
           : skill,
       )

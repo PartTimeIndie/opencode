@@ -19,7 +19,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionFileMutation } from "@opencode-ai/core/session/file-mutation"
 import { SessionMessage } from "@opencode-ai/core/session/message"
-import { SessionFileBlobTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionFileBlobTable, SessionFileMutationTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
@@ -119,6 +119,47 @@ function writeAndRecord(input: {
 }
 
 describe("SessionFileMutation", () => {
+  it.live("persists native mode evidence and refuses an external mode-only change", () =>
+    withTmp((directory) => provide(directory, Effect.gen(function* () {
+      const sessionID = SessionV2.ID.make("ses_mode_drift")
+      const userID = SessionMessage.ID.make("msg_mode_drift_user")
+      const assistantID = SessionMessage.ID.make("msg_mode_drift_assistant")
+      yield* setupSession(directory, sessionID, [userMessage(userID), assistantMessage(assistantID)])
+      const target = path.join(directory, "tracked.txt")
+      yield* Effect.promise(() => fs.writeFile(target, "base"))
+      const mode = (yield* Effect.promise(() => fs.stat(target))).mode & 0o777
+      yield* writeAndRecord({ path: "tracked.txt", content: "ours", sessionID, assistantMessageID: assistantID, callID: "mode-write" })
+      const db = (yield* Database.Service).db
+      expect(yield* db.select({ before: SessionFileMutationTable.before_mode, after: SessionFileMutationTable.after_mode }).from(SessionFileMutationTable).all())
+        .toEqual([{ before: mode, after: mode }])
+      yield* Effect.promise(() => fs.chmod(target, 0o444))
+      const result = yield* (yield* SessionFileMutation.Service).revert({ sessionID, revert: { messageID: userID } })
+      expect(result.conflicts).toHaveLength(1)
+      expect(result.conflicts[0]).toMatchObject({ expected: { mode }, actual: { mode: 0o444 } })
+      expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("ours")
+    }))),
+  )
+
+  it.live("restores a deleted file's recorded mode instead of the process default", () =>
+    withTmp((directory) => provide(directory, Effect.gen(function* () {
+      const sessionID = SessionV2.ID.make("ses_mode_restore")
+      const userID = SessionMessage.ID.make("msg_mode_restore_user")
+      const assistantID = SessionMessage.ID.make("msg_mode_restore_assistant")
+      yield* setupSession(directory, sessionID, [userMessage(userID), assistantMessage(assistantID)])
+      const target = { canonical: path.join(directory, "deleted.txt"), resource: "deleted.txt" }
+      yield* Effect.promise(() => fs.writeFile(target.canonical, "before"))
+      yield* Effect.promise(() => fs.chmod(target.canonical, 0o444))
+      const files = yield* FileMutation.Service
+      const journal = yield* SessionFileMutation.Service
+      const removal = yield* files.remove({ target })
+      expect(removal.mutation.before.mode).toBe(0o444)
+      yield* journal.record({ sessionID, assistantMessageID: assistantID, callID: "delete-mode", mutations: [removal.mutation] })
+      expect(yield* journal.revert({ sessionID, revert: { messageID: userID } })).toEqual({ mutations: 1, conflicts: [] })
+      expect(yield* Effect.promise(() => fs.readFile(target.canonical, "utf8"))).toBe("before")
+      expect((yield* Effect.promise(() => fs.stat(target.canonical))).mode & 0o777).toBe(0o444)
+    }))),
+  )
+
   it.live("restores owned file writes for the reverted session range", () =>
     withTmp((directory) =>
       provide(

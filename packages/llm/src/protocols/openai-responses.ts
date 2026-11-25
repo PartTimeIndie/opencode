@@ -23,6 +23,7 @@ import { isContextOverflow } from "../provider-error"
 import { OpenAIOptions } from "./utils/openai-options"
 import { Lifecycle } from "./utils/lifecycle"
 import { ToolStream } from "./utils/tool-stream"
+import { StructuredOutputTransport } from "../structured-output-transport"
 
 const ADAPTER = "openai-responses"
 export const DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -142,6 +143,12 @@ const OpenAIResponsesCoreFields = {
   text: Schema.optional(
     Schema.Struct({
       verbosity: Schema.optional(OpenAIOptions.OpenAITextVerbosity),
+      format: Schema.optional(Schema.Union([
+        Schema.Struct({ type: Schema.Literal("text") }),
+        Schema.Struct({
+          type: Schema.Literal("json_schema"), name: Schema.String, schema: JsonObject, strict: Schema.Boolean,
+        }),
+      ])),
     }),
   ),
   max_output_tokens: Schema.optional(Schema.Number),
@@ -446,6 +453,9 @@ const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (requ
     }
   }
 
+  if (request.runtimeContext?.length)
+    input.push({ role: "system", content: ProviderShared.joinText(request.runtimeContext) })
+
   // With store:false, OpenAI only accepts previous reasoning items when the
   // complete item has encrypted state. Summary blocks for one item may carry
   // that state only on the last block, so filter after they have been joined.
@@ -466,6 +476,9 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
   const mode = OpenAIOptions.reasoningMode(request)
   const include = OpenAIOptions.include(request)
   const verbosity = OpenAIOptions.textVerbosity(request)
+  const format = request.responseFormat?.type === "json"
+    ? { type: "json_schema" as const, name: "structured_output", schema: request.responseFormat.schema, strict: StructuredOutputTransport.strictSchema(request.responseFormat.schema) }
+    : request.responseFormat?.type === "text" ? { type: "text" as const } : undefined
   const instructions = OpenAIOptions.instructions(request)
   const serviceTier = OpenAIOptions.serviceTier(request)
   return {
@@ -474,7 +487,7 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
     ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
     ...(include ? { include } : {}),
     ...(effort || summary || mode ? { reasoning: { effort, summary, mode } } : {}),
-    ...(verbosity ? { text: { verbosity } } : {}),
+    ...(verbosity || format ? { text: { ...(verbosity ? { verbosity } : {}), ...(format ? { format } : {}) } } : {}),
     ...(serviceTier ? { service_tier: serviceTier } : {}),
   }
 })
@@ -990,6 +1003,9 @@ const step = (state: ParserState, event: OpenAIResponsesEvent) => {
  */
 export const protocol = Protocol.make({
   id: ADAPTER,
+  jsonSchema: true,
+  structuredToolChoice: (request) => request.model.provider === "opencode-go" ? "auto" : "named",
+  runtimeContext: "late-system",
   body: {
     schema: OpenAIResponsesBody,
     from: fromRequest,
@@ -1039,15 +1055,33 @@ export const codexRoute = Route.make({
   endpoint: Endpoint.path<OpenAIResponsesBody>(PATH, { baseURL: "https://chatgpt.com/backend-api/codex" }),
   auth,
   transport: {
-    id: "http-json/codex",
+    id: "http-json/codex-affinity-v1",
     prepare: (input) => {
       const { max_output_tokens: _maxOutputTokens, ...body } = input.body
       const { max_output_tokens: _overlayMaxOutputTokens, ...overlay } = input.request.http?.body ?? {}
+      // Codex derives cache routing from `session-id`, not OpenCode's internal
+      // affinity headers. Translate at the transport boundary after plugin
+      // hooks; keep the actual Session identity in host context and metadata.
+      const headers = Object.entries(input.request.http?.headers ?? {})
+      const affinity = headers.find(([name]) => name.toLowerCase() === "x-session-affinity")?.[1]
       return httpTransport.prepare({
         ...input,
         body,
-        request: input.request.http?.body
-          ? LLMRequest.update(input.request, { http: HttpOptions.make({ ...input.request.http, body: overlay }) })
+        request: input.request.http?.body || affinity
+          ? LLMRequest.update(input.request, {
+              http: HttpOptions.make({
+                ...input.request.http,
+                ...(input.request.http?.body ? { body: overlay } : {}),
+                ...(affinity
+                  ? {
+                      headers: {
+                        ...Object.fromEntries(headers.filter(([name]) => name.toLowerCase() !== "session-id")),
+                        "session-id": affinity,
+                      },
+                    }
+                  : {}),
+              }),
+            })
           : input.request,
       })
     },

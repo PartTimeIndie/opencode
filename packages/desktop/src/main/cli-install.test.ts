@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { access, copyFile, mkdir } from "node:fs/promises"
+import { access, copyFile, cp, mkdir } from "node:fs/promises"
 import {
   buildPowerShellScript,
   installCli,
@@ -31,13 +31,14 @@ describe("installCli", () => {
     await writeFile(target, "old")
     let observedExistingTarget = false
     fixture.deps.rename = async (from, to) => {
-      observedExistingTarget = (await readFile(to, "utf8")) === "old"
+      if (to === target) observedExistingTarget = (await readFile(to, "utf8")) === "old"
       return rename(from, to)
     }
 
     expect(await installCli(fixture.deps)).toBe(target)
     expect(observedExistingTarget).toBe(true)
     expect(await readFile(target, "utf8")).toBe("packaged")
+    expect(await readFile(join(fixture.localAppData, "OpenCode", "bin", "plugin-packages", "provider", "release-manifest.json"), "utf8")).toBe("provider")
   })
 
   test("preserves PATH entries and does not duplicate an existing bin directory", async () => {
@@ -81,6 +82,7 @@ describe("refreshManagedCli", () => {
 
     expect(await refreshManagedCli(fixture.deps)).toBe(target)
     expect(await readFile(target, "utf8")).toBe("packaged")
+    expect(await readFile(join(directory, "plugin-packages", "tui", "release-manifest.json"), "utf8")).toBe("tui")
     expect(fixture.userPath.writes).toBe(0)
     expect(fixture.deps.env.Path).toBe("C:\\Process")
   })
@@ -110,6 +112,24 @@ describe("refreshManagedCli", () => {
     await expect(refreshManagedCli(fixture.deps)).rejects.toThrow("copy failed")
     await expect(access(temporary)).rejects.toThrow()
     expect(await readFile(target, "utf8")).toBe("old")
+  })
+
+  test("keeps the previous executable and packages when replacing the executable fails", async () => {
+    const fixture = await createFixture()
+    const directory = join(fixture.localAppData, "OpenCode", "bin")
+    const target = join(directory, "opencode.exe")
+    const manifest = join(directory, "plugin-packages", "provider", "release-manifest.json")
+    await mkdir(join(directory, "plugin-packages", "provider"), { recursive: true })
+    await writeFile(target, "old")
+    await writeFile(manifest, "old-provider")
+    fixture.deps.rename = async (from, to) => {
+      if (to === target) throw new Error("executable busy")
+      return rename(from, to)
+    }
+
+    await expect(refreshManagedCli(fixture.deps)).rejects.toThrow("executable busy")
+    expect(await readFile(target, "utf8")).toBe("old")
+    expect(await readFile(manifest, "utf8")).toBe("old-provider")
   })
 })
 
@@ -186,6 +206,11 @@ async function createFixture(withResource = true) {
   const localAppData = join(root, "local")
   await mkdir(resourcesPath, { recursive: true })
   if (withResource) await writeFile(join(resourcesPath, "opencode-cli.exe"), "packaged")
+  for (const family of ["provider", "tui"]) {
+    const directory = join(resourcesPath, "plugin-packages", family)
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, "release-manifest.json"), family)
+  }
   const userPath = { value: "", writes: 0 }
   const deps: CliInstallDependencies = {
     platform: "win32",
@@ -195,6 +220,7 @@ async function createFixture(withResource = true) {
     access,
     mkdir,
     copyFile,
+    cp,
     rename,
     rm,
     randomUUID: () => "fixture",

@@ -15,6 +15,7 @@ import {
 } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { OpenRouter } from "@opencode-ai/llm/providers"
+import { RequestExecutor } from "@opencode-ai/llm/route"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { PermissionV2 } from "@opencode-ai/core/permission"
@@ -30,13 +31,17 @@ import { ContentStore } from "@opencode-ai/core/content-store"
 import { AttachmentTable, ContentBlobTable } from "@opencode-ai/core/attachment.sql"
 import { ContextSnapshotDecodeError } from "@opencode-ai/core/session/error"
 import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionForkEvent } from "@opencode-ai/core/session/fork-event"
+import { SessionHostContext } from "@opencode-ai/core/session/host-context"
 import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionResume } from "@opencode-ai/core/session/resume"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionToolCancellation } from "@opencode-ai/core/session/tool-cancellation"
 import { SessionTurnContinuation } from "@opencode-ai/core/session/turn-continuation"
 import { FileAttachment, Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution/owner"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
 import { SessionRunCoordinator } from "@opencode-ai/core/session/run-coordinator"
@@ -453,7 +458,23 @@ const runner = SessionRunnerLLM.layer.pipe(
   Layer.provide(config),
   Layer.provide(Layer.mergeAll(compactionCatalog, questions)),
 )
-const coordinator = SessionRunCoordinator.layer.pipe(Layer.provide(runner))
+// The unit execution adapter below skips LocalExecution. Supply its private
+// scope only for explicitly owner-backed structured-correction fixtures.
+const ownedRunner = Layer.effect(SessionRunner.Service, Effect.gen(function* () {
+  const service = yield* SessionRunner.Service
+  const { db } = yield* Database.Service
+  return SessionRunner.Service.of({
+    ...service,
+    run: (input) => Effect.gen(function* () {
+      const activity = yield* db.select().from(SessionActivityTable)
+        .where(eq(SessionActivityTable.id, "structured-test-owner")).get().pipe(Effect.orDie)
+      return yield* activity && activity.session_id === input.sessionID
+        ? SessionExecutionOwner.withOwner({ sessionID: input.sessionID, activityID: activity.id, ownerID: "structured-test-owner" }, service.run(input))
+        : service.run(input)
+    }),
+  })
+})).pipe(Layer.provide(runner), Layer.provide(database))
+const coordinator = SessionRunCoordinator.layer.pipe(Layer.provide(ownedRunner))
 const execution = Layer.effect(
   SessionExecution.Service,
   Effect.gen(function* () {
@@ -481,6 +502,7 @@ const execution = Layer.effect(
 const sessionLocations = Layer.succeed(
   LocationServiceMap,
   LocationServiceMap.of({
+    bindExecution: () => Effect.void,
     get: () => Layer.empty as never,
     invalidate: () => Effect.void,
   }),
@@ -512,6 +534,7 @@ const supportLayer = Layer.mergeAll(registry, echo, capabilityTools, models, sys
 const sessionLayer = Layer.mergeAll(coordinator, execution, sessions)
 const it = testEffect(Layer.mergeAll(baseLayer, supportLayer, runner, sessionLayer))
 const sessionID = SessionV2.ID.make("ses_runner_test")
+const hostContext = SessionHostContext.render({ id: sessionID })
 const otherSessionID = SessionV2.ID.make("ses_runner_other")
 
 const insertSession = (id: SessionV2.ID) =>
@@ -656,7 +679,18 @@ const addActiveQuestionActivity = (id: string) =>
       .pipe(Effect.orDie)
   })
 
-function seedSurfaceRecovery(state: "replied" | "rejected" | "active" | "queued" = "replied", source = false, hosted = false) {
+const withStructuredOwner = <A, E, R>(operation: Effect.Effect<A, E, R>) => Effect.gen(function* () {
+  const ownerID = "structured-test-owner"
+  yield* addActiveQuestionActivity(ownerID)
+  return yield* SessionExecutionOwner.withOwner({ sessionID, activityID: ownerID, ownerID }, operation)
+})
+
+function seedSurfaceRecovery(
+  state: "replied" | "rejected" | "active" | "queued" = "replied",
+  source = false,
+  hosted = false,
+  answerSource: "user" | "main" | "recommended" | null = "user",
+) {
   return Effect.gen(function* () {
     const session = yield* SessionV2.Service
     const events = yield* EventV2.Service
@@ -696,6 +730,7 @@ function seedSurfaceRecovery(state: "replied" | "rejected" | "active" | "queued"
       action_metadata: [], detached: false, allow_concurrent: false,
       assistant_message_id: assistantMessageID, tool_call_id: callID,
       answers: state === "replied" ? [["Continue"]] : null,
+      answer_source: state === "replied" ? answerSource : null,
       receipt: state === "replied" || state === "rejected" ? "receipt_saved_surface" : null,
       time_created: Date.now(), time_updated: Date.now(),
     })
@@ -730,6 +765,29 @@ const detachedQuestionInput = {
   controlID: "review-action",
   controls: [{ id: "open", type: "button" as const, label: "Open" }],
 } as const
+
+const surfaceQuestionTurn = (id: string) => [
+  LLMEvent.stepStart({ index: 0 }),
+  LLMEvent.toolCall({
+    id,
+    name: "surface",
+    input: {
+      mode: "blocking",
+      questions: [
+        {
+          question: "Which color should the banner use?",
+          options: [
+            { id: "blue", label: "Blue", description: "Use the calm blue palette" },
+            { id: "red", label: "Red", description: "Use the alert red palette" },
+          ],
+          allowOther: true,
+        },
+      ],
+    },
+  }),
+  LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  LLMEvent.finish({ reason: "tool-calls" }),
+]
 
 const registerInteractiveSurfaceTool = Effect.gen(function* () {
   const registry = yield* ToolRegistry.Service
@@ -1099,7 +1157,7 @@ describe("SessionRunnerLLM", () => {
       const { db } = yield* Database.Service
       yield* db
         .update(SessionTable)
-        .set({ directory: "C:/PROJECT" })
+        .set({ directory: (yield* Location.Service).directory.toUpperCase() })
         .where(eq(SessionTable.id, sessionID))
         .run()
         .pipe(Effect.orDie)
@@ -1157,6 +1215,9 @@ describe("SessionRunnerLLM", () => {
           agent: AgentV2.ID.make("build"),
           assistantMessageID: expect.stringMatching(/^msg_/),
           toolCallID: "call-application",
+          fileKnowledgeCutoff: 0,
+          progress: expect.any(Function),
+          skillGroupOutputs: [],
         },
       ])
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -1281,6 +1342,151 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
+  it.effect("runs the registered review result shape with bounded confidence", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      requests.length = 0
+      // Portable review plugin contract: keep numeric bounds in the runner path,
+      // not just the collector decoder or an unconstrained fixture schema.
+      const schema = {
+        type: "object",
+        properties: {
+          findings: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                title: { type: "string" }, evidence: { type: "string" },
+                risk: { enum: ["low", "medium", "high"] }, suggestedFix: { type: "string" },
+                testRequirement: { type: "string" }, confidence: { type: "number", minimum: 0, maximum: 1 },
+              },
+              required: ["title", "evidence", "risk", "suggestedFix", "testRequirement", "confidence"],
+              additionalProperties: false,
+            },
+          },
+          notes: { type: "array", items: { type: "string" } },
+        },
+        required: ["findings", "notes"], additionalProperties: false,
+      }
+      const report = {
+        findings: [{ title: "Defect", evidence: "source", risk: "low", suggestedFix: "fix", testRequirement: "test", confidence: 1 }],
+        notes: [],
+      }
+      yield* session.prompt({
+        sessionID,
+        prompt: new Prompt({ text: "Review the change", format: { type: "json_schema", schema } }),
+        resume: false,
+      })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-review-result", name: "StructuredOutput", input: report }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+      yield* session.resume(sessionID)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.tools.find((tool) => tool.name === "StructuredOutput")?.inputSchema).toEqual(schema)
+      const assistant = (yield* session.context(sessionID)).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      expect(assistant?.finish).toBe("stop")
+      expect(assistant?.structured).toEqual(report)
+      // A forced/advisory drain may observe a completed assignment, but must
+      // never ask the model for an extra closure or a replacement report.
+      const rerun = yield* (yield* SessionRunner.Service).run({ sessionID, force: true }).pipe(Effect.exit)
+      expect(rerun._tag).toBe("Failure")
+      expect(requests).toHaveLength(1)
+      expect((yield* session.context(sessionID)).find((message) => message.id === assistant?.id))
+        .toMatchObject({ structured: report, finish: "stop" })
+    }),
+  )
+
+  it.effect("persists the structured attempt before entering the provider stream", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      requests.length = 0
+      yield* session.prompt({
+        sessionID,
+        prompt: new Prompt({ text: "Return structured output", format: {
+          type: "json_schema", schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        } }),
+        resume: false,
+      })
+      responseStreamFactory = () => Stream.unwrap(Effect.gen(function* () {
+        const assistant = (yield* session.context(sessionID).pipe(Effect.orDie)).findLast(
+          (message): message is SessionMessage.Assistant => message.type === "assistant",
+        )
+        expect(assistant?.structuredOutputAttempt).toMatchObject({
+          version: 1, phase: "initial", mode: "tool", model: { id: "fake-model", providerID: "fake" },
+        })
+        return Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-pre-http", name: "StructuredOutput", input: { answer: "yes" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ])
+      }))
+      yield* session.resume(sessionID)
+      expect(requests).toHaveLength(1)
+    }),
+  )
+
+  for (const [index, finishes] of [
+    [],
+    [LLMEvent.stepFinish({ index: 0, reason: "length" })],
+    [LLMEvent.stepFinish({ index: 0, reason: "stop" }), LLMEvent.stepFinish({ index: 1, reason: "stop" })],
+  ].entries()) {
+    it.effect(`refuses structured success without exactly one clean finish (${index})`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* session.prompt({ sessionID, resume: false, prompt: new Prompt({
+          text: "Return an answer", format: { type: "json_schema", schema: {
+            type: "object", properties: { answer: { type: "string" } }, required: ["answer"],
+          }, retryCount: 10 },
+        }) })
+        requests.length = 0
+        response = [LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-finish-contract", name: "StructuredOutput", input: { answer: "yes" } }),
+          ...finishes, LLMEvent.finish({ reason: "stop" })]
+        const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+        expect(exit._tag).toBe("Failure")
+        expect(requests).toHaveLength(1)
+        const assistant = (yield* session.context(sessionID)).findLast(
+          (message): message is SessionMessage.Assistant => message.type === "assistant",
+        )
+        expect(assistant?.structured).toBeUndefined()
+        expect(assistant?.finish).toBe("error")
+      }),
+    )
+  }
+
+  it.effect("rejects unsupported structured-output schema semantics before provider work", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      requests.length = 0
+      yield* session.prompt({
+        sessionID,
+        prompt: new Prompt({ text: "Return an answer", format: {
+          type: "json_schema", schema: { type: "object", not: {} },
+        } }),
+        resume: false,
+      })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-unsupported", name: "StructuredOutput", input: { answer: "yes" } }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      expect(requests).toHaveLength(0)
+    }),
+  )
+
   it.effect("injects one provider-only instruction for an armed incomplete successor without losing its budget", () =>
     Effect.gen(function* () {
       yield* setup
@@ -1336,7 +1542,7 @@ describe("SessionRunnerLLM", () => {
         sessionID,
         prompt: new Prompt({
           text: "Return structured output",
-          format: { type: "json_schema", schema: { type: "object", properties: { answer: { type: "string" } } } },
+          format: { type: "json_schema", schema: { type: "object", properties: { answer: { type: "string" } } }, retryCount: 0 },
         }),
         resume: false,
       })
@@ -1353,6 +1559,7 @@ describe("SessionRunnerLLM", () => {
       expect(assistant?.error).toEqual({ type: "unknown", message: "Model did not produce structured output" })
       expect(assistant?.failure).toMatchObject({
         code: "provider.invalid-response",
+        retryability: "none",
         remediation: "retry",
         cause: { detail: "structured output" },
       })
@@ -1387,6 +1594,7 @@ describe("SessionRunnerLLM", () => {
               required: ["findings"],
               additionalProperties: false,
             },
+            retryCount: 0,
           },
         }),
         resume: false,
@@ -1422,6 +1630,7 @@ describe("SessionRunnerLLM", () => {
       })
       expect(assistant?.failure).toMatchObject({
         code: "provider.invalid-response",
+        retryability: "none",
         remediation: "retry",
         cause: { detail: "structured output" },
       })
@@ -1487,7 +1696,7 @@ describe("SessionRunnerLLM", () => {
       yield* insertSession(excessSessionID)
       yield* session.prompt({
         sessionID: excessSessionID,
-        prompt: new Prompt({ text: "Return structured output", format: { type: "json_schema", schema } }),
+        prompt: new Prompt({ text: "Return structured output", format: { type: "json_schema", schema, retryCount: 0 } }),
         resume: false,
       })
       response = [
@@ -1551,7 +1760,7 @@ describe("SessionRunnerLLM", () => {
       }
       yield* session.prompt({
         sessionID: lifecycleID,
-        prompt: new Prompt({ text: "Return structured output", format: { type: "json_schema", schema } }),
+        prompt: new Prompt({ text: "Return structured output", format: { type: "json_schema", schema, retryCount: 0 } }),
         resume: false,
       })
       requests.length = 0
@@ -1713,12 +1922,12 @@ describe("SessionRunnerLLM", () => {
       }
       yield* session.prompt({
         sessionID,
-        prompt: new Prompt({ text: "Return structured output", format: { type: "json_schema", schema } }),
+        prompt: new Prompt({ text: "Return structured output", format: { type: "json_schema", schema, retryCount: 0 } }),
         resume: false,
       })
       requests.length = 0
-      // A settled local tool must not rescue a schema-invalid StructuredOutput
-      // call in the same provider turn: the typed failure is terminal.
+      // With correction disabled, a settled local tool cannot rescue an
+      // invalid result in the same provider turn.
       response = [
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.toolCall({ id: "call-echo-mixed", name: "echo", input: { text: "kept" } }),
@@ -1767,7 +1976,7 @@ describe("SessionRunnerLLM", () => {
         })
         requests.length = 0
         responses = Array.from({ length: retryCount + 1 }, () => contentStopResponse)
-        const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+        const exit = yield* withStructuredOwner(session.resume(sessionID)).pipe(Effect.exit)
         expect(exit._tag).toBe("Failure")
         expect(requests).toHaveLength(retryCount + 1)
         expect((yield* session.context(sessionID)).findLast((message) => message.type === "assistant")?.finish).toBe(
@@ -1775,6 +1984,50 @@ describe("SessionRunnerLLM", () => {
         )
       }),
     )
+  }
+
+  for (const steps of [undefined, 0]) {
+    for (const retryCount of [1, 10]) {
+      it.effect(`corrects an invalid result once with durable receipts (steps=${steps}, retryCount=${retryCount})`, () =>
+        Effect.gen(function* () {
+          yield* setup
+          if (steps !== undefined) yield* setBuildAgentSteps(steps)
+          const session = yield* SessionV2.Service
+          yield* session.prompt({ sessionID, resume: false, prompt: new Prompt({
+            text: "Return structured output",
+            format: { type: "json_schema", schema: {
+              type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false,
+            }, retryCount },
+          }) })
+          requests.length = 0
+          responses = [
+            [LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "invalid-first", name: "StructuredOutput", input: { answer: 42 } }),
+              LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }), LLMEvent.finish({ reason: "tool-calls" })],
+            [LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "valid-correction", name: "StructuredOutput", input: { answer: "yes" } }),
+              LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }), LLMEvent.finish({ reason: "tool-calls" })],
+          ]
+          yield* withStructuredOwner(session.resume(sessionID))
+          expect(requests).toHaveLength(2)
+          expect(requests[1]?.tools.map((tool) => tool.name)).toEqual(["StructuredOutput"])
+          const assistants = (yield* session.context(sessionID)).filter(
+            (message): message is SessionMessage.Assistant => message.type === "assistant",
+          )
+          expect(assistants.map((message) => message.structuredOutputAttempt?.phase)).toEqual(["initial", "correction"])
+          expect(assistants[0]?.error).toBeUndefined()
+          expect(assistants[0]?.content).toMatchObject([{ type: "tool", state: { status: "error" } }])
+          expect(assistants[1]?.structured).toEqual({ answer: "yes" })
+          expect(assistants[1]?.structuredOutputAttempt).toMatchObject({
+            ...assistants[0]?.structuredOutputAttempt, phase: "correction",
+          })
+          const execution = yield* SessionExecution.Service
+          yield* execution.wake(sessionID)
+          yield* execution.wait(sessionID)
+          expect(requests).toHaveLength(2)
+        }),
+      )
+    }
   }
 
   it.effect("retries a schema-formatted turn when the model initially omits StructuredOutput", () =>
@@ -1804,7 +2057,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* withStructuredOwner(session.resume(sessionID))
 
       expect(requests).toHaveLength(2)
       expect(requests[0]?.tools.map((tool) => tool.name)).toContain("StructuredOutput")
@@ -2617,8 +2870,8 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context"],
-        ["Initial context"],
+        ["Initial context", hostContext],
+        ["Initial context", hostContext],
       ])
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "system"])
       expect(requests[1]?.messages.at(-1)?.content).toEqual([{ type: "text", text: "Changed context" }])
@@ -2654,7 +2907,7 @@ describe("SessionRunnerLLM", () => {
       response = fragmentFixture("text", "text-build", ["Done"]).completeEvents
       yield* session.resume(sessionID)
 
-      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Build agent instructions", "Initial context"])
+      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Build agent instructions", "Initial context", hostContext])
     }),
   )
 
@@ -2748,7 +3001,7 @@ describe("SessionRunnerLLM", () => {
       response = fragmentFixture("text", "text-reviewer", ["Done"]).completeEvents
       yield* session.resume(sessionID)
 
-      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context"])
+      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context", hostContext])
       expect((yield* session.messages({ sessionID }))[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
     }),
   )
@@ -2777,7 +3030,7 @@ describe("SessionRunnerLLM", () => {
       response = fragmentFixture("text", "text-selected", ["Done"]).completeEvents
       yield* session.resume(sessionID)
 
-      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context"])
+      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context", hostContext])
       expect((yield* session.messages({ sessionID }))[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
     }),
   )
@@ -2804,8 +3057,8 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context\n\nBuild skills"],
-        ["Initial context\n\nReviewer skills"],
+        ["Initial context\n\nBuild skills", hostContext],
+        ["Initial context\n\nReviewer skills", hostContext],
       ])
     }),
   )
@@ -2837,7 +3090,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context\n\nReviewer skills"],
+        ["Initial context\n\nReviewer skills", hostContext],
       ])
     }),
   )
@@ -2905,7 +3158,7 @@ describe("SessionRunnerLLM", () => {
       response = contentStopResponse
       yield* session.resume(sessionID)
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context\n\nReviewer skills"],
+        ["Initial context\n\nReviewer skills", hostContext],
       ])
       expect(
         yield* db
@@ -2942,7 +3195,7 @@ describe("SessionRunnerLLM", () => {
       response = contentStopResponse
       yield* session.resume(sessionID)
       expect(requests.map((request) => request.model)).toEqual([replacementModel])
-      expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([["Initial context"]])
+      expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([["Initial context", hostContext]])
     }),
   )
 
@@ -3205,8 +3458,300 @@ describe("SessionRunnerLLM", () => {
       systemUnavailable = false
       yield* session.resume(sessionID)
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context\n\nReviewer skills"],
+        ["Initial context\n\nReviewer skills", hostContext],
       ])
+    }),
+  )
+
+  it.effect("runs imported history under the child agent's own baseline", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* insertSession(otherSessionID)
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const session = yield* SessionV2.Service
+      yield* db.update(SessionTable).set({ parent_id: otherSessionID, agent: "reviewer" })
+        .where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      skillBaselines.set(AgentV2.ID.make("reviewer"), "Reviewer skills")
+      const entries = [
+        { type: "user", text: "Earlier user" },
+        { type: "system", text: "Earlier update" },
+      ] as const
+      let throughSeq = -1
+      for (const [index, entry] of entries.entries()) {
+        const message = Schema.decodeUnknownSync(SessionMessage.Message)({
+          ...entry, id: SessionMessage.ID.make(`msg_child_import_${index}`), time: { created: index + 1 },
+        })
+        const imported = yield* events.publish(SessionForkEvent.MessageImported, {
+          sessionID, sourceSessionID: otherSessionID,
+          sourceMessageID: SessionMessage.ID.make(`msg_source_import_${index}`),
+          timestamp: yield* DateTime.now, message,
+        })
+        if (imported.seq === undefined) throw new Error("Missing imported sequence")
+        throughSeq = imported.seq
+      }
+      yield* events.publish(SessionForkEvent.HistoryBoundaryImported, {
+        sessionID, sourceSessionID: otherSessionID, throughSeq,
+      })
+      requests.length = 0
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Child assignment" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.system.map((part) => part.text)).toEqual([
+        "Initial context\n\nReviewer skills", SessionHostContext.render({ id: sessionID, parentID: otherSessionID }),
+      ])
+      expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "system", "user"])
+      expect(requests[0]?.messages[1]?.content).toEqual([{ type: "text", text: "Earlier update" }])
+    }),
+  )
+
+  for (const name of ["task", "multi_agent_fanout"]) for (const failed of [false, true])
+    it.live(`waits for the provider stream before native dispatch (${name}, failed=${failed})`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        const events = yield* EventV2.Service
+        const session = yield* SessionV2.Service
+        const observed: string[] = []
+        yield* events.listen((event) => Effect.sync(() => {
+          if (event.type === SessionEvent.Text.Ended.type) observed.push("text-ended")
+        }))
+        yield* ToolRegistry.Service.use((registry) => registry.register({
+          [name]: Tool.make({
+            description: "Probe native dispatch start boundary",
+            input: Schema.Struct({}),
+            output: Schema.String,
+            toModelOutput: ({ output }) => [{ type: "text", text: output }],
+            execute: () => Effect.sync(() => {
+              observed.push("dispatch")
+              return "done"
+            }),
+          }),
+        }))
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Delegate after narration settles" }), resume: false })
+        responseStream = Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "dispatch-narration" }),
+          LLMEvent.textDelta({ id: "dispatch-narration", text: "I will delegate this." }),
+          LLMEvent.toolCall({ id: "dispatch-start", name, input: {} }),
+        ).pipe(Stream.concat(Stream.unwrap(Effect.sleep("20 millis").pipe(Effect.as(
+          failed ? Stream.fail(new LLMError({ module: "test", method: "stream",
+            reason: new AuthenticationReason({ message: "Fixture stream refused", kind: "invalid" }) }))
+            : Stream.make(
+                LLMEvent.textEnd({ id: "dispatch-narration" }),
+                LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+                LLMEvent.finish({ reason: "tool-calls" }),
+              ),
+        )))))
+        yield* session.resume(sessionID).pipe(Effect.exit)
+        expect(observed.filter((entry) => entry === "dispatch")).toHaveLength(failed ? 0 : 1)
+        if (!failed) expect(observed.indexOf("text-ended")).toBeLessThan(observed.indexOf("dispatch"))
+      }),
+    )
+
+  it.effect("refuses ordinary questions in a native task child when delegation preferences disable them", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* insertSession(otherSessionID)
+      const { db } = yield* Database.Service
+      yield* db.update(SessionTable).set({
+        parent_id: otherSessionID,
+        agent_policy: {
+          tools: { mode: "explicit", entries: { surface: { visible: true, permission: "allow" } } },
+          permissionLayers: [],
+          source: { type: "task", sessionID: otherSessionID, agent: AgentV2.ID.make("build") },
+        },
+      }).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      yield* db.update(SessionTable).set({
+        metadata: {
+          "opencode.delegation_preferences": {
+            version: 1, revision: 1, session: { ordinaryQuestions: false }, tasks: {},
+          },
+        },
+      }).where(eq(SessionTable.id, otherSessionID)).run().pipe(Effect.orDie)
+      const executions: string[] = []
+      yield* ToolRegistry.Service.use((registry) =>
+        registry.register({
+          surface: Tool.make({
+            description: "Ask the user a blocking question",
+            input: SurfaceTool.Input,
+            output: SurfaceTool.Output,
+            toModelOutput: () => [{ type: "text", text: "question answered" }],
+            execute: (input) =>
+              Effect.sync(() => {
+                executions.push(input.mode)
+                return { mode: "blocking" as const, answers: [["yes"]] }
+              }),
+          }),
+        }),
+      )
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Decide the banner color" }), resume: false })
+      requests.length = 0
+      responses = [surfaceQuestionTurn("call-surface-question"), contentStopResponse]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual([])
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1])).toContain("Ordinary questions are disabled for this delegated task")
+      const messages = yield* db.select({ data: SessionMessageTable.data }).from(SessionMessageTable)
+        .where(eq(SessionMessageTable.session_id, sessionID)).all().pipe(Effect.orDie)
+      expect(JSON.stringify(messages)).toContain("Ordinary questions are disabled for this delegated task")
+      expect(yield* db.select({ id: QuestionTable.id }).from(QuestionTable)
+        .where(eq(QuestionTable.session_id, sessionID)).all().pipe(Effect.orDie)).toHaveLength(0)
+    }),
+  )
+
+  it.effect("keeps ordinary questions reachable without a disabling preference and for non-task children", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* insertSession(otherSessionID)
+      const { db } = yield* Database.Service
+      const executions: string[] = []
+      yield* ToolRegistry.Service.use((registry) =>
+        registry.register({
+          surface: Tool.make({
+            description: "Ask the user a blocking question",
+            input: SurfaceTool.Input,
+            output: SurfaceTool.Output,
+            toModelOutput: () => [{ type: "text", text: "question answered" }],
+            execute: (input) =>
+              Effect.sync(() => {
+                executions.push(input.mode)
+                return { mode: "blocking" as const, answers: [["yes"]] }
+              }),
+          }),
+        }),
+      )
+      const session = yield* SessionV2.Service
+      const childPolicy = (type: "task" | "spawn_agent") => ({
+        tools: { mode: "explicit" as const, entries: { surface: { visible: true, permission: "allow" as const } } },
+        permissionLayers: [],
+        source: { type, sessionID: otherSessionID, agent: AgentV2.ID.make("build") },
+      })
+      yield* db.update(SessionTable).set({ parent_id: otherSessionID, agent_policy: childPolicy("task") })
+        .where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Decide the banner color" }), resume: false })
+      requests.length = 0
+      responses = [surfaceQuestionTurn("call-surface-allowed"), contentStopResponse]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["blocking"])
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1])).not.toContain("Ordinary questions are disabled for this delegated task")
+      expect(JSON.stringify(requests[1])).toContain("question answered")
+
+      // The same disabling preference must not mute a non-task child.
+      yield* db.update(SessionTable).set({
+        metadata: {
+          "opencode.delegation_preferences": {
+            version: 1, revision: 1, session: { ordinaryQuestions: false }, tasks: {},
+          },
+        },
+      }).where(eq(SessionTable.id, otherSessionID)).run().pipe(Effect.orDie)
+      yield* db.update(SessionTable).set({ agent_policy: childPolicy("spawn_agent") })
+        .where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      executions.length = 0
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Decide again" }), resume: false })
+      requests.length = 0
+      responses = [surfaceQuestionTurn("call-surface-spawn"), contentStopResponse]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["blocking"])
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1])).not.toContain("Ordinary questions are disabled for this delegated task")
+    }),
+  )
+
+  it.effect("lets an explicit task preference override the session default for exactly that child", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* insertSession(otherSessionID)
+      const { db } = yield* Database.Service
+      yield* db.update(SessionTable).set({
+        parent_id: otherSessionID,
+        agent_policy: {
+          tools: { mode: "explicit", entries: { surface: { visible: true, permission: "allow" } } },
+          permissionLayers: [],
+          source: { type: "task", sessionID: otherSessionID, agent: AgentV2.ID.make("build") },
+        },
+      }).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+      yield* db.update(SessionTable).set({
+        metadata: {
+          "opencode.delegation_preferences": {
+            version: 1, revision: 1, session: { ordinaryQuestions: true },
+            tasks: { [sessionID]: { ordinaryQuestions: false } },
+          },
+        },
+      }).where(eq(SessionTable.id, otherSessionID)).run().pipe(Effect.orDie)
+      const executions: string[] = []
+      yield* ToolRegistry.Service.use((registry) =>
+        registry.register({
+          surface: Tool.make({
+            description: "Ask the user a blocking question",
+            input: SurfaceTool.Input,
+            output: SurfaceTool.Output,
+            toModelOutput: () => [{ type: "text", text: "question answered" }],
+            execute: (input) =>
+              Effect.sync(() => {
+                executions.push(input.mode)
+                return { mode: "blocking" as const, answers: [["yes"]] }
+              }),
+          }),
+        }),
+      )
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Decide the banner color" }), resume: false })
+      requests.length = 0
+      responses = [surfaceQuestionTurn("call-surface-task-scope"), contentStopResponse]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual([])
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1])).toContain("Ordinary questions are disabled for this delegated task")
+    }),
+  )
+
+  it.effect("adopts and persists the default agent for a session without a saved selection", () =>
+    Effect.gen(function* () {
+      yield* setup
+      // Mirror production: PluginBoot installs the selectable default agents before
+      // the runner resolves a selection for an agent-less session.
+      yield* AgentV2.Service.use((agents) =>
+        agents.update((editor) =>
+          editor.update(AgentV2.ID.make("build"), (agent) => {
+            agent.mode = "primary"
+          }),
+        ),
+      )
+      const session = yield* SessionV2.Service
+      // Scheduled prompts and direct REST sessions arrive without an agent; the
+      // runner must persist the executed default selection so crash recovery can
+      // verify it instead of pausing on a missing saved selection.
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Run without a saved agent" }), resume: false })
+      yield* session.resume(sessionID)
+      const { db } = yield* Database.Service
+      const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get()
+      expect(row?.agent).toBe("build")
+      const switched = yield* db.select().from(EventTable).where(and(
+        eq(EventTable.aggregate_id, sessionID),
+        inArray(EventTable.type, [
+          SessionEvent.AgentSwitched.type,
+          EventV2.versionedType(SessionEvent.AgentSwitched.type, SessionEvent.AgentSwitched.sync?.version ?? 1),
+        ]),
+      )).all()
+      expect(switched).toHaveLength(1)
+      const assistant = yield* db.select().from(SessionMessageTable).where(and(
+        eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant"),
+      )).orderBy(asc(SessionMessageTable.seq)).get()
+      expect(assistant?.type).toBe("assistant")
+      expect(assistant && "agent" in assistant.data ? assistant.data.agent : undefined).toBe("build")
+      // A follow-up turn reuses the persisted selection instead of re-publishing it.
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Second turn" }), resume: false })
+      yield* session.resume(sessionID)
+      const switchedAgain = yield* db.select().from(EventTable).where(and(
+        eq(EventTable.aggregate_id, sessionID),
+        inArray(EventTable.type, [
+          SessionEvent.AgentSwitched.type,
+          EventV2.versionedType(SessionEvent.AgentSwitched.type, SessionEvent.AgentSwitched.sync?.version ?? 1),
+        ]),
+      )).all()
+      expect(switchedAgain).toHaveLength(1)
     }),
   )
 
@@ -3255,9 +3800,9 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context"],
-        ["Initial context"],
-        ["Replacement context"],
+        ["Initial context", hostContext],
+        ["Initial context", hostContext],
+        ["Replacement context", hostContext],
       ])
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "system"])
       expect(requests[2]?.messages.map((message) => message.role)).toEqual([
@@ -3308,9 +3853,9 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context"],
-        ["Initial context"],
-        ["Replacement context"],
+        ["Initial context", hostContext],
+        ["Initial context", hostContext],
+        ["Replacement context", hostContext],
       ])
     }),
   )
@@ -3380,7 +3925,7 @@ describe("SessionRunnerLLM", () => {
 
       expect(invalidations).toBe(4)
       expect(requests).toHaveLength(1)
-      expect(requests[0]?.system.map((part) => part.text)).toEqual(["Changed context"])
+      expect(requests[0]?.system.map((part) => part.text)).toEqual(["Changed context", hostContext])
     }),
   )
 
@@ -3408,7 +3953,7 @@ describe("SessionRunnerLLM", () => {
       systemBaseline = "Replacement context"
       yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Third" }), resume: false })
       yield* session.resume(sessionID)
-      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Replacement context"])
+      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Replacement context", hostContext])
     }),
   )
 
@@ -3442,8 +3987,8 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context"],
-        ["Replacement context"],
+        ["Initial context", hostContext],
+        ["Replacement context", hostContext],
       ])
       yield* replaySessionProjection(sessionID)
       yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Third" }), resume: false })
@@ -3742,6 +4287,26 @@ describe("SessionRunnerLLM", () => {
     )
   }
 
+  it.effect("records a context overflow instead of recompacting an unfit finite-model request", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      currentModel = Model.make({ id: "finite", provider: "fake",
+        route: OpenAIChat.route.with({ limits: { context: 1_000, output: 100 } }) })
+      requests.length = 0
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Preserve oversized work ".repeat(2_000) }), resume: false })
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag === "Failure") expect(Cause.pretty(exit.cause)).not.toContain("Post-compaction provider attempt cannot recover another overflow")
+      expect(requests).toHaveLength(0)
+      const context = yield* session.context(sessionID)
+      expect(context.find((entry) => entry.type === "assistant")).toMatchObject({
+        finish: "error", failure: { code: "provider.context-overflow" },
+      })
+      expect(context.some((entry) => entry.type === "user" && entry.text.includes("Preserve oversized work"))).toBe(true)
+    }),
+  )
+
   it.effect("forces one compaction and retries after provider context overflow", () =>
     Effect.gen(function* () {
       const session = yield* setupOverflowRecovery
@@ -3996,7 +4561,10 @@ describe("SessionRunnerLLM", () => {
         {
           type: "assistant",
           finish: "error",
-          error: { message: expect.stringContaining("Request was not sent") },
+          // The local block names the model it was computed for and is not a provider answer.
+          error: {
+            message: expect.stringMatching(/^Request was not sent to fake\/preflight-impossible: .*local pre-send block, not a provider error/),
+          },
         },
       ])
     }),
@@ -4134,7 +4702,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Third" }), resume: false })
       yield* session.resume(sessionID)
 
-      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Initial context"])
+      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Initial context", hostContext])
       expect(
         requests
           .at(-1)
@@ -4396,7 +4964,10 @@ describe("SessionRunnerLLM", () => {
         "tool",
       ])
       const context = yield* session.context(sessionID)
+      // The first turn of an agent-less session persists its adopted default
+      // selection, mirroring the durable model-switched message.
       expect(context).toMatchObject([
+        { type: "agent-switched", agent: "build" },
         { type: "user", text: "Inspect and summarize" },
         {
           type: "assistant",
@@ -4476,8 +5047,8 @@ describe("SessionRunnerLLM", () => {
 
       expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
-        ["Initial context"],
-        ["Replacement context"],
+        ["Initial context", hostContext],
+        ["Replacement context", hostContext],
       ])
       expect((yield* session.context(sessionID)).filter((message) => message.type === "model-switched")).toContainEqual(
         expect.objectContaining({ model: { id: "replacement", providerID: "fake" } }),
@@ -5380,7 +5951,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("starts queued input after the active activity settles", () =>
+  it.effect("promotes queued input at the next turn boundary while the activity runs", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -5393,14 +5964,6 @@ describe("SessionRunnerLLM", () => {
           LLMEvent.toolCall({ id: "call-echo", name: "echo", input: { text: "hello" } }),
           LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
           LLMEvent.finish({ reason: "tool-calls" }),
-        ],
-        [
-          LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.textStart({ id: "text-auto-stop" }),
-          LLMEvent.textDelta({ id: "text-auto-stop", text: "Done" }),
-          LLMEvent.textEnd({ id: "text-auto-stop" }),
-          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
-          LLMEvent.finish({ reason: "stop" }),
         ],
         [
           LLMEvent.stepStart({ index: 0 }),
@@ -5426,10 +5989,66 @@ describe("SessionRunnerLLM", () => {
       streamGate = undefined
       streamStarted = undefined
 
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[0]!)).toEqual(["Start working"])
+      expect(userTexts(requests[1]!)).toEqual(["Start working", "Wait until the next activity"])
+    }),
+  )
+
+  it.effect("gives steering priority over queued input at the same turn boundary", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Start working" }), resume: false })
+
+      requests.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-echo", name: "echo", input: { text: "hello" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-auto-stop" }),
+          LLMEvent.textDelta({ id: "text-auto-stop", text: "Steered" }),
+          LLMEvent.textEnd({ id: "text-auto-stop" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-auto-stop" }),
+          LLMEvent.textDelta({ id: "text-auto-stop", text: "Done" }),
+          LLMEvent.textEnd({ id: "text-auto-stop" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ],
+      ]
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+
+      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      yield* session.prompt({
+        sessionID,
+        prompt: new Prompt({ text: "Queued correction" }),
+        delivery: "queue",
+      })
+      yield* session.prompt({
+        sessionID,
+        prompt: new Prompt({ text: "Immediate correction" }),
+      })
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Fiber.join(first)
+      streamGate = undefined
+      streamStarted = undefined
+
       expect(requests).toHaveLength(3)
       expect(userTexts(requests[0]!)).toEqual(["Start working"])
-      expect(userTexts(requests[1]!)).toEqual(["Start working"])
-      expect(userTexts(requests[2]!)).toEqual(["Start working", "Wait until the next activity"])
+      expect(userTexts(requests[1]!)).toEqual(["Start working", "Immediate correction"])
+      expect(userTexts(requests[2]!)).toEqual(["Start working", "Immediate correction", "Queued correction"])
     }),
   )
 
@@ -5797,7 +6416,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("advances a model chain once per failed provider without duplicating the prompt", () =>
+  it.effect("retries a failed chain step once before advancing without duplicating the prompt", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -5810,14 +6429,14 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       responses = [
-        [LLMEvent.providerError({ message: "Primary unavailable", retryable: true })],
+        [LLMEvent.providerError({ message: "Primary unavailable", retryable: true, retryAfterMs: 0 })],
+        [LLMEvent.providerError({ message: "Primary unavailable", retryable: true, retryAfterMs: 0 })],
         fragmentFixture("text", "text-chain-fallback", ["Recovered"]).completeEvents,
       ]
       yield* session.resume(sessionID)
 
-      expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
-      expect(userTexts(requests[0]!)).toEqual(["Use the configured chain"])
-      expect(userTexts(requests[1]!)).toEqual(["Use the configured chain"])
+      expect(requests.map((request) => request.model)).toEqual([model, model, replacementModel])
+      expect(requests.map(userTexts)).toEqual(Array.from({ length: 3 }, () => ["Use the configured chain"]))
       expect((yield* session.get(sessionID)).model).toMatchObject({
         id: "replacement",
         providerID: "fake",
@@ -6259,8 +6878,10 @@ describe("SessionRunnerLLM", () => {
       })
 
       requests.length = 0
-      responseStream = Stream.never
-      response = fragmentFixture("text", "text-chain-stall-fallback", ["Recovered"]).completeEvents
+      let stalls = 0
+      responseStreamFactory = () => ++stalls <= 2
+        ? Stream.never
+        : Stream.fromIterable(fragmentFixture("text", "text-chain-stall-fallback", ["Recovered"]).completeEvents)
       const previous = process.env.OPENCODE_PROVIDER_STREAM_IDLE_TIMEOUT_MS
       process.env.OPENCODE_PROVIDER_STREAM_IDLE_TIMEOUT_MS = "10"
       yield* session.resume(sessionID).pipe(
@@ -6272,8 +6893,8 @@ describe("SessionRunnerLLM", () => {
         ),
       )
 
-      expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
-      expect(requests.map(userTexts)).toEqual([["Recover the stalled chain step"], ["Recover the stalled chain step"]])
+      expect(requests.map((request) => request.model)).toEqual([model, model, replacementModel])
+      expect(requests.map(userTexts)).toEqual(Array.from({ length: 3 }, () => ["Recover the stalled chain step"]))
       expect((yield* session.get(sessionID)).model).toMatchObject({
         id: "replacement",
         providerID: "fake",
@@ -6567,22 +7188,23 @@ describe("SessionRunnerLLM", () => {
       })
 
       requests.length = 0
-      responseStream = Stream.fail(
-        new LLMError({
-          module: "SessionRunner",
-          method: "runProviderStream",
-          reason: new TransportReason({
-            message: "Provider stream stalled: no events for 60 seconds",
-            kind: "stream-inactivity",
-            canRetry: true,
-          }),
-        }),
-      )
-      response = fragmentFixture("text", "text-chain-inactivity-fallback", ["Recovered"]).completeEvents
+      let failures = 0
+      responseStreamFactory = () => ++failures <= 2
+        ? Stream.fail(new LLMError({
+            module: "SessionRunner",
+            method: "runProviderStream",
+            reason: new TransportReason({
+              message: "Provider stream stalled: no events for 60 seconds",
+              kind: "stream-inactivity",
+              canRetry: true,
+              retryAfterMs: 0,
+            }),
+          }))
+        : Stream.fromIterable(fragmentFixture("text", "text-chain-inactivity-fallback", ["Recovered"]).completeEvents)
       yield* session.resume(sessionID)
 
-      expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
-      expect(requests.map(userTexts)).toEqual([["Recover the stalled chain step"], ["Recover the stalled chain step"]])
+      expect(requests.map((request) => request.model)).toEqual([model, model, replacementModel])
+      expect(requests.map(userTexts)).toEqual(Array.from({ length: 3 }, () => ["Recover the stalled chain step"]))
       expect((yield* session.get(sessionID)).model).toMatchObject({
         id: "replacement",
         providerID: "fake",
@@ -6632,11 +7254,11 @@ describe("SessionRunnerLLM", () => {
       })
 
       requests.length = 0
-      responses = [[], fragmentFixture("text", "text-chain-empty-fallback", ["Recovered"]).completeEvents]
+      responses = [[], [], fragmentFixture("text", "text-chain-empty-fallback", ["Recovered"]).completeEvents]
       yield* session.resume(sessionID)
 
-      expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
-      expect(requests.map(userTexts)).toEqual([["Recover the empty chain step"], ["Recover the empty chain step"]])
+      expect(requests.map((request) => request.model)).toEqual([model, model, replacementModel])
+      expect(requests.map(userTexts)).toEqual(Array.from({ length: 3 }, () => ["Recover the empty chain step"]))
       expect((yield* session.get(sessionID)).model).toMatchObject({
         id: "replacement",
         providerID: "fake",
@@ -7076,6 +7698,25 @@ describe("SessionRunnerLLM", () => {
       expect(successes).toHaveLength(1)
     }),
   )
+
+  for (const answerSource of ["main", "recommended", null] as const)
+    it.effect(`recovered Surface answers retain ${answerSource ?? "unknown legacy"} provenance`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        const fixture = yield* seedSurfaceRecovery("replied", false, false, answerSource)
+        requests.length = 0
+        yield* SessionV2.Service.use((session) => session.resume(sessionID))
+        const history = yield* SessionV2.Service.use((session) => session.context(sessionID))
+        expect(history.find((message) => message.id === fixture.assistantMessageID)).toMatchObject({
+          content: [{ type: "tool", state: { status: "completed", structured: { answerSource } } }],
+        })
+        expect(requests).toHaveLength(1)
+        const messages = JSON.stringify(requests[0]?.messages)
+        expect(messages).toContain(`Answer source: ${answerSource ?? "unknown"}`)
+        expect(messages).not.toContain("User has answered your questions")
+        expect(executions).toEqual([])
+      }),
+    )
 
   it.live("controlled Surface reply reaches the real runner with its durable answer after a crashed waiter", () =>
     Effect.gen(function* () {
@@ -8198,6 +8839,7 @@ describe("SessionRunnerLLM", () => {
                     format: {
                       type: "json_schema" as const,
                       schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+                      retryCount: 0,
                     },
                   }
                 : {}),
@@ -8261,7 +8903,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("fails malformed StructuredOutput on the final bounded provider turn", () =>
+  it.effect("fails malformed StructuredOutput on the final bounded provider turn when correction is disabled", () =>
     Effect.gen(function* () {
       yield* setup
       yield* setBuildAgentSteps(1)
@@ -8274,7 +8916,7 @@ describe("SessionRunnerLLM", () => {
       }
       yield* session.prompt({
         sessionID,
-        prompt: new Prompt({ text: "Inspect once, then answer", format: { type: "json_schema", schema } }),
+        prompt: new Prompt({ text: "Inspect once, then answer", format: { type: "json_schema", schema, retryCount: 0 } }),
         resume: false,
       })
 
@@ -8506,7 +9148,9 @@ describe("SessionRunnerLLM", () => {
 
       expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
       yield* replaySessionProjection(sessionID)
-      expect(requests).toHaveLength(6)
+      // One request plus every throttle retry: a short-term 429 keeps the
+      // patient rate-limit budget until the raw failure settles the activity.
+      expect(requests).toHaveLength(1 + SessionResume.THROTTLE_RETRY_ATTEMPTS)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail with the authoritative error" },
         {
@@ -8814,6 +9458,70 @@ describe("SessionRunnerLLM", () => {
       ])
     }),
   )
+
+  for (const code of [1302, 1308, 1310]) {
+    it.live(`handles native Z.AI HTTP 429 code ${code} on the selected direct model`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        const native = yield* Effect.service(LLMClient.Service).pipe(
+          Effect.provide(LLMClient.layer.pipe(Layer.provide(RequestExecutor.defaultLayer))),
+        )
+        let requestsOnWire = 0
+        const server = yield* Effect.acquireRelease(
+          Effect.sync(() => Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
+            if (++requestsOnWire > 1) {
+              return new Response(
+                'data: {"id":"chat","model":"glm-5.4","created":0,"choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+                { headers: { "content-type": "text/event-stream" } },
+              )
+            }
+            // The business code must win over the generic quota wording used by some gateways.
+            return Response.json({ error: { code: String(code), message: code === 1302 ? "Request rate quota reached" : "Usage limit reached" } }, {
+              status: 429, headers: { "retry-after": "0" },
+            })
+          } })),
+          (server) => Effect.promise(() => server.stop(true)),
+        )
+        currentModel = Model.make({
+          id: "glm-5.4", provider: "zhipuai-coding-plan",
+          route: OpenAIChat.route.with({ endpoint: { baseURL: `http://127.0.0.1:${server.port}` } }),
+        })
+        const observed: Array<{ type: string; data: unknown }> = []
+        const events = yield* EventV2.Service
+        const unsubscribe = yield* events.listen((event) => Effect.sync(() => { observed.push(event) }))
+        yield* Effect.addFinalizer(() => unsubscribe)
+        responseStreamFactory = (request) => native.stream(request)
+        const session = yield* SessionV2.Service
+        yield* session.prompt({
+          sessionID, prompt: new Prompt({ text: "Answer on this model" }), resume: false,
+          model: ModelV2.Ref.make({ id: ModelV2.ID.make("glm-5.4"), providerID: ProviderV2.ID.make("zhipuai-coding-plan") }),
+        })
+        const result = yield* session.resume(sessionID).pipe(Effect.exit)
+        const retries = observed.filter((event) => event.type === SessionEvent.Retried.type)
+        if (code === 1302) {
+          expect(result._tag).toBe("Success")
+          expect(requestsOnWire).toBe(2)
+          expect(retries).toMatchObject([{ data: {
+            attempt: 1, provider: "zhipuai-coding-plan", code: "provider.rate-limit",
+            error: { statusCode: 429, responseBody: expect.stringContaining("1302") },
+          } }])
+          expect((yield* session.context(sessionID)).slice(-2)).toMatchObject([
+            { type: "user" }, { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
+          ])
+          return
+        }
+        expect(result._tag).toBe("Failure")
+        expect(requestsOnWire).toBe(1)
+        expect(retries).toEqual([])
+        expect(observed.filter((event) => event.type === SessionEvent.Step.Failed.type)).toMatchObject([{ data: {
+          failure: {
+            code: "provider.rate-limit", retryability: "none", httpStatus: 429,
+            providerRef: "zhipuai-coding-plan/glm-5.4", cause: { raw: expect.stringContaining(String(code)) },
+          },
+        } }])
+      }),
+    )
+  }
 
   it.live("continues a partial raw transport failure without replaying the failed request", () =>
     Effect.gen(function* () {
@@ -9517,4 +10225,523 @@ describe("SessionRunnerLLM", () => {
       )
     }),
   )
+
+  describe("implementation-task chain lane", () => {
+    // Native `task` children advance their chain on every eligible provider failure
+    // and get one full second pass; every other session keeps the same-model retry first.
+    const taskChildPolicy = (
+      type: "task" | "spawn_agent" | "orchestrator" = "task",
+      entries: Record<string, { visible: true; permission: "allow" }> = { echo: { visible: true, permission: "allow" } },
+    ) => ({
+      tools: { mode: "explicit" as const, entries },
+      permissionLayers: [],
+      source: { type, sessionID: otherSessionID, agent: AgentV2.ID.make("build") },
+    })
+    const asTaskChild = (input: { readonly policy?: ReturnType<typeof taskChildPolicy>; readonly agent?: "review" } = {}) =>
+      Effect.gen(function* () {
+        yield* insertSession(otherSessionID)
+        const { db } = yield* Database.Service
+        yield* db
+          .update(SessionTable)
+          .set({
+            parent_id: otherSessionID,
+            agent_policy: input.policy ?? taskChildPolicy(),
+            ...(input.agent === undefined ? {} : { agent: input.agent }),
+          })
+          .where(eq(SessionTable.id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+      })
+    const clearTaskChild = Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .update(SessionTable)
+        .set({ parent_id: null, agent_policy: null, agent: null })
+        .where(eq(SessionTable.id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+    })
+    const rateLimited = (retryAfterMs: number) =>
+      new LLMError({
+        module: "test",
+        method: "stream",
+        reason: new RateLimitReason({ message: "Too many requests", retryAfterMs }),
+      })
+    const collectRetries = Effect.gen(function* () {
+      const attempts: number[] = []
+      const events = yield* EventV2.Service
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type === SessionEvent.Retried.type) attempts.push((event.data as { attempt: number }).attempt)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      return attempts
+    })
+    const failingStreams = (factory: (attempt: number) => Stream.Stream<LLMEvent, LLMError>) => {
+      let attempt = 0
+      responseStreamFactory = () => factory(++attempt)
+      return Effect.addFinalizer(() => Effect.sync(() => (responseStreamFactory = undefined)))
+    }
+    const lastAssistant = (context: ReadonlyArray<SessionMessage.Message>) => {
+      const last = context.at(-1)
+      return last?.type === "assistant" ? last : undefined
+    }
+
+    it.effect("advances to the next chain model at once without a same-model retry", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Task chain work" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        responses = [
+          [LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 })],
+          fragmentFixture("text", "text-task-chain-fallback", ["Recovered"]).completeEvents,
+        ]
+        const retried = yield* collectRetries
+        yield* session.resume(sessionID)
+
+        expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
+        expect(retried).toEqual([])
+        expect((yield* session.get(sessionID)).model).toMatchObject({
+          id: "replacement",
+          chain: { id: "standard", active: 1 },
+        })
+        const assistants = (yield* session.context(sessionID)).filter((message) => message.type === "assistant")
+        expect(assistants).toMatchObject([{ finish: "stop" }])
+      }),
+    )
+
+    it.effect("runs exactly one new full pass after the chain is exhausted, then fails visibly with structured details", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Exhaust the task chain" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        yield* failingStreams(() => Stream.fail(rateLimited(1_500)))
+        const retried = yield* collectRetries
+        const run = yield* session.resume(sessionID).pipe(Effect.flip, Effect.forkChild)
+        while (requests.length < 2) yield* Effect.yieldNow
+        // The second pass honors the Retry-After of the first pass before it starts.
+        yield* TestClock.adjust(1_499)
+        expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
+        yield* TestClock.adjust(1)
+        const failure = yield* Fiber.join(run)
+
+        expect(requests.map((request) => request.model)).toEqual([
+          model,
+          replacementModel,
+          model,
+          replacementModel,
+        ])
+        expect(retried).toEqual([2])
+        expect(failure).toBeInstanceOf(LLMError)
+        expect(failure.message).toContain("Task model chain exhausted after 2 passes")
+        const context = yield* session.context(sessionID)
+        const last = lastAssistant(context)
+        expect(last).toMatchObject({ type: "assistant", finish: "error" })
+        expect(last?.error?.message).toContain(
+          "fake/fake-model:provider.rate-limit, fake/replacement:provider.rate-limit, fake/fake-model:provider.rate-limit, fake/replacement:provider.rate-limit",
+        )
+        expect(last?.error?.message).toContain(`task_id ${sessionID}`)
+        expect(last?.failure).toMatchObject({
+          code: "provider.rate-limit",
+          providerRef: "fake/replacement",
+          retryability: "none",
+          remediation: "retry",
+        })
+        expect(last?.failure?.cause?.detail).toBe(
+          "task-chain-exhausted;passes=2;attempts=fake/fake-model:provider.rate-limit,fake/replacement:provider.rate-limit,fake/fake-model:provider.rate-limit,fake/replacement:provider.rate-limit",
+        )
+        expect(
+          context
+            .filter((message) => message.type === "model-switched")
+            .map((message) => (message.type === "model-switched" ? message.model.chain?.active : undefined)),
+        ).toEqual([0, 1, 0, 1])
+      }),
+    )
+
+    it.effect("treats a single configured model as a one-step chain with one second pass", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "One step task" }), resume: false })
+
+        requests.length = 0
+        yield* failingStreams((attempt) =>
+          attempt === 1
+            ? Stream.fail(rateLimited(2_000))
+            : Stream.fromIterable(fragmentFixture("text", "text-task-one-step", ["Recovered"]).completeEvents),
+        )
+        const retried = yield* collectRetries
+        const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+        while (requests.length < 1) yield* Effect.yieldNow
+        yield* TestClock.adjust(1_999)
+        expect(requests).toHaveLength(1)
+        yield* TestClock.adjust(1)
+        yield* Fiber.join(run)
+
+        expect(requests.map((request) => request.model)).toEqual([model, model])
+        expect(retried).toEqual([1])
+        expect((yield* session.context(sessionID)).filter((message) => message.type === "model-switched")).toEqual([])
+      }),
+    )
+
+    it.effect("does not restart a mixed task chain through a model with exhausted quota", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Respect quota across passes" }),
+          model: chainModelRef(), resume: false })
+
+        requests.length = 0
+        yield* failingStreams((attempt) => attempt === 1 ? Stream.fail(quotaExceeded()) : Stream.fail(rateLimited(0)))
+        const failed = yield* session.resume(sessionID).pipe(Effect.flip)
+
+        expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
+        expect(failed.message).toContain("after 1 pass")
+      }),
+    )
+
+    it.effect("never retries early when Retry-After exceeds the automatic wait limit and reports the earliest retry time", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Deferred task" }), resume: false })
+
+        requests.length = 0
+        const before = Date.now()
+        const retryAfterMs = SessionResume.MAX_AUTO_RETRY_WAIT_MS + 1
+        yield* failingStreams(() => Stream.fail(rateLimited(retryAfterMs)))
+        const retried = yield* collectRetries
+        const failure = yield* session.resume(sessionID).pipe(Effect.flip)
+
+        expect(requests.map((request) => request.model)).toEqual([model])
+        expect(retried).toEqual([])
+        expect(failure.message).toContain(
+          `Retry-After ${retryAfterMs} ms exceeds the ${SessionResume.MAX_AUTO_RETRY_WAIT_MS} ms automatic wait limit`,
+        )
+        const last = lastAssistant(yield* session.context(sessionID))
+        expect(last).toMatchObject({ type: "assistant", finish: "error" })
+        expect(last?.failure).toMatchObject({
+          code: "provider.rate-limit",
+          retryability: "none",
+          remediation: "retry",
+          providerRef: "fake/fake-model",
+          retryAfterMs,
+          resetAt: expect.any(Number),
+        })
+        const displayedRetryAt = last?.error?.message.match(/Earliest retry time: (\S+)\./)?.[1]
+        expect(Date.parse(displayedRetryAt ?? "")).toBeGreaterThanOrEqual(before + retryAfterMs)
+        expect(last?.error?.message).toContain("Earliest retry time:")
+        expect(last?.error?.message).toContain("Task model chain exhausted after 1 pass")
+      }),
+    )
+
+    it.effect("never re-runs a turn that already executed a tool call", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Tool before failure" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        const executionCount = executions.length
+        responses = [
+          [
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolCall({ id: "call-task-before-failure", name: "echo", input: { text: "settled once" } }),
+            LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 }),
+          ],
+          fragmentFixture("text", "text-task-after-tool", ["Recovered"]).completeEvents,
+        ]
+        const retried = yield* collectRetries
+        const failure = yield* session.resume(sessionID).pipe(Effect.flip)
+        expect(failure.message).toContain("Too many requests")
+
+        // The failed request is not replayed after the tool ran.
+        expect(executions.slice(executionCount)).toEqual(["settled once"])
+        expect(requests.map((request) => request.model)).toEqual([model])
+        expect(
+          (yield* session.context(sessionID)).filter((message) => message.type === "assistant"),
+        ).toMatchObject([
+          { finish: "error", content: [{ type: "tool", id: "call-task-before-failure" }] },
+        ])
+        expect(retried).toEqual([])
+      }),
+    )
+
+    it.effect("never retries or restarts for a non-retryable authentication failure", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Authentication failure" }), resume: false })
+
+        requests.length = 0
+        yield* failingStreams(() =>
+          Stream.fail(
+            new LLMError({
+              module: "test",
+              method: "stream",
+              reason: new AuthenticationReason({ message: "invalid_api_key", kind: "invalid" }),
+            }),
+          ),
+        )
+        const retried = yield* collectRetries
+        const failure = yield* session.resume(sessionID).pipe(Effect.flip)
+
+        expect(requests.map((request) => request.model)).toEqual([model])
+        expect(retried).toEqual([])
+        expect(failure.message).toContain("invalid_api_key")
+        const last = lastAssistant(yield* session.context(sessionID))
+        expect(last).toMatchObject({ type: "assistant", finish: "error" })
+        expect(last?.failure?.code).toBe("provider.auth")
+      }),
+    )
+
+    it.effect("moves to a different configured model for an account quota without retrying the failed step", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Quota then fallback" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        yield* failingStreams((attempt) =>
+          attempt === 1
+            ? Stream.fail(quotaExceeded())
+            : Stream.fromIterable(fragmentFixture("text", "text-task-quota-fallback", ["Recovered"]).completeEvents),
+        )
+        const retried = yield* collectRetries
+        yield* session.resume(sessionID)
+
+        expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
+        expect(retried).toEqual([])
+      }),
+    )
+
+    it.effect("never retries or restarts after a user interruption", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Interrupt the task" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        responseStream = Stream.never
+        yield* Effect.addFinalizer(() => Effect.sync(() => (responseStream = undefined)))
+        const retried = yield* collectRetries
+        const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+        while (requests.length === 0) yield* Effect.yieldNow
+        yield* session.interrupt(sessionID)
+        const exit = yield* Fiber.await(run)
+
+        expect(exit._tag === "Failure" && Cause.hasInterrupts(exit.cause)).toBe(true)
+        expect(requests.map((request) => request.model)).toEqual([model])
+        expect(retried).toEqual([])
+        yield* (yield* SessionRunCoordinator.Service).awaitIdle(sessionID)
+      }),
+    )
+
+    it.effect("never retries or restarts when a permission is declined", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        const registry = yield* ToolRegistry.Service
+        yield* registry.register({
+          declined: Tool.make({
+            description: "Fail because the user declined approval",
+            input: Schema.Struct({}),
+            output: Schema.Struct({}),
+            execute: () => Effect.die(new PermissionV2.DeclinedError()),
+          }),
+        })
+        yield* asTaskChild({ policy: taskChildPolicy("task", { declined: { visible: true, permission: "allow" } }) })
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Call declined" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        responses = [
+          [
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolCall({ id: "call-task-declined", name: "declined", input: {} }),
+            LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 }),
+          ],
+          fragmentFixture("text", "text-never-reached", ["Never"]).completeEvents,
+        ]
+        const retried = yield* collectRetries
+        const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+
+        expect(exit._tag).toBe("Failure")
+        if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(requests.map((request) => request.model)).toEqual([model])
+        expect(retried).toEqual([])
+      }),
+    )
+
+    it.effect("never restarts the chain over a model selection that changed during the wait", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild()
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({ sessionID, prompt: new Prompt({ text: "Switch during the wait" }), resume: false })
+
+        requests.length = 0
+        yield* failingStreams((attempt) =>
+          attempt === 1
+            ? Stream.fail(rateLimited(5_000))
+            : Stream.fromIterable(fragmentFixture("text", "text-after-switch", ["Recovered"]).completeEvents),
+        )
+        const retryScheduled = yield* Deferred.make<void>()
+        const events = yield* EventV2.Service
+        const unsubscribe = yield* events.listen((event) => {
+          if (event.type === SessionEvent.Retried.type) Deferred.doneUnsafe(retryScheduled, Effect.void)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => unsubscribe)
+        const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+        yield* Deferred.await(retryScheduled)
+        expect(requests).toHaveLength(1)
+
+        // A different persisted selection is a new binding: the old chain is not restarted over it.
+        const { db } = yield* Database.Service
+        yield* db
+          .update(SessionTable)
+          .set({ model: { id: "replacement", providerID: "fake", variant: "medium" } })
+          .where(eq(SessionTable.id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+        yield* TestClock.adjust(5_000)
+        yield* Fiber.join(run)
+
+        expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
+        expect((yield* session.context(sessionID)).filter((message) => message.type === "model-switched")).toEqual([])
+        expect((yield* session.context(sessionID)).at(-1)).toMatchObject({ type: "assistant", finish: "stop" })
+      }),
+    )
+
+    it.effect("keeps the same-model retry before advancing for non-task children", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        yield* asTaskChild({ policy: taskChildPolicy("spawn_agent") })
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Spawned child chain" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        responses = [
+          [LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 })],
+          [LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 })],
+          fragmentFixture("text", "text-spawned-fallback", ["Recovered"]).completeEvents,
+        ]
+        const retried = yield* collectRetries
+        yield* session.resume(sessionID)
+
+        expect(requests.map((request) => request.model)).toEqual([model, model, replacementModel])
+        expect(retried).toEqual([1])
+      }),
+    )
+
+    it.effect("keeps today's recovery order for registered fanout and reviewer workers", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        // A reviewer worker runs the `review` agent even when it inherits a chain.
+        yield* asTaskChild({ agent: "review" })
+        yield* Effect.addFinalizer(() => clearTaskChild)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Reviewer with chain" }),
+          model: chainModelRef(),
+          resume: false,
+        })
+
+        requests.length = 0
+        responses = [
+          [LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 })],
+          [LLMEvent.providerError({ message: "Too many requests", retryable: true, retryAfterMs: 0 })],
+          fragmentFixture("text", "text-reviewer-fallback", ["Recovered"]).completeEvents,
+        ]
+        yield* session.resume(sessionID)
+        expect(requests.map((request) => request.model)).toEqual([model, model, replacementModel])
+
+        // A workflow worker's direct model (`chain: null`) keeps same-model retries and never gets a second pass.
+        const { db } = yield* Database.Service
+        yield* db.update(SessionTable).set({ agent: null }).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+        yield* session.prompt({
+          sessionID,
+          prompt: new Prompt({ text: "Direct worker model" }),
+          model: ModelV2.Ref.make({
+            id: ModelV2.ID.make("fake-model"),
+            providerID: ProviderV2.ID.make("fake"),
+            chain: null,
+          }),
+          resume: false,
+        })
+        requests.length = 0
+        yield* failingStreams((attempt) =>
+          attempt <= 3
+            ? Stream.fail(rateLimited(0))
+            : Stream.fromIterable(fragmentFixture("text", "text-direct-worker", ["Recovered"]).completeEvents),
+        )
+        yield* session.resume(sessionID)
+        expect(requests.map((request) => request.model)).toEqual([model, model, model, model])
+        const switches = (yield* session.context(sessionID)).filter((message) => message.type === "model-switched")
+        expect(switches.at(-1)?.model.chain).toBeNull()
+        expect(switches.filter((message) => message.model.chain?.active === 1)).toHaveLength(1)
+      }),
+    )
+  })
 })

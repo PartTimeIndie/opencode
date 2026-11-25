@@ -50,6 +50,7 @@ async function main() {
     }
     delete env.OPENCODE_CONFIG_CONTENT
     delete env.OPENCODE_CONFIG_DIR
+    delete env.OPENCODE_PURE
     Object.assign(env, {
       PATH: root,
       XDG_DATA_HOME: join(root, "data"),
@@ -118,12 +119,19 @@ async function main() {
     const manifest = await phase(fetch(`${base}/app/plugins?directory=${encodeURIComponent(root)}`, { headers }).then(response => response.json()), "Plugin manifest", 10_000)
     const caller = manifest.plugins.find(plugin => plugin.id === "service-caller")
     if (!caller) throw new Error("Neutral app plugin did not load")
-    const response = await phase(fetch(`${base}/plugins/neutral-service/services/echo?directory=${encodeURIComponent(root)}`, {
-      method: "POST", headers,
-      body: JSON.stringify({ caller: { id: caller.id, version: caller.version, hash: caller.hash }, version: 1, input: "node-service-probe" }),
-      signal: AbortSignal.timeout(10_000),
-    }), "Plugin Services request", 10_000)
-    const body = await response.json()
+    const requestDeadline = Date.now() + 10_000
+    let response
+    let body
+    for (;;) {
+      response = await phase(fetch(`${base}/plugins/neutral-service/services/echo?directory=${encodeURIComponent(root)}`, {
+        method: "POST", headers,
+        body: JSON.stringify({ caller: { id: caller.id, version: caller.version, hash: caller.hash }, version: 1, input: "node-service-probe" }),
+        signal: AbortSignal.timeout(10_000),
+      }), "Plugin Services request", 10_000)
+      body = await response.json()
+      if (response.status !== 503 || Date.now() >= requestDeadline) break
+      await delay(250)
+    }
     if (response.status !== 200) throw new Error(`Plugin Services smoke returned HTTP ${response.status}: ${JSON.stringify(body)}`)
     if (
       body?.ok !== true

@@ -115,6 +115,18 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
         if (!isV2Api) delete operation.requestBody.required
         const body = operation.requestBody.content?.["application/json"]
         if (body?.schema) body.schema = stripOptionalNull(structuredClone(body.schema))
+        if (path === "/session/{sessionID}/delegation-preferences" && method === "patch") {
+          // New CAS endpoints have no legacy optional-body contract. These three
+          // nulls clear saved values; they are not Schema.optional artifacts.
+          operation.requestBody.required = true
+          const fields = body?.schema?.properties?.patch?.properties
+          if (!fields) throw new Error("Delegation preferences OpenAPI patch schema changed")
+          for (const name of ["ordinaryQuestions", "preferences", "rules"]) {
+            const field = fields[name]
+            if (!field) throw new Error(`Delegation preferences OpenAPI field is missing: ${name}`)
+            fields[name] = nullable(field)
+          }
+        }
         if (path === "/experimental/workspace" && method === "post") {
           // Workspace creation fields `branch` and `extra` are Schema.NullOr —
           // genuinely nullable, not just optional. Re-add the null that the

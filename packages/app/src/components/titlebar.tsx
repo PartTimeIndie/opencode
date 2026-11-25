@@ -47,6 +47,7 @@ import { SessionFavoriteButton } from "@/components/session-favorite-button"
 import { useSessionRoute } from "@/context/session-route"
 import { useGlobal } from "@/context/global"
 import { sessionFavoriteFromSession, useSessionFavorites } from "@/context/session-favorites"
+import { useSessionAttention } from "@/context/session-attention"
 import { decode64 } from "@/utils/base64"
 import { ServerConnection, useServer } from "@/context/server"
 import {
@@ -906,6 +907,11 @@ function TabNavItem(props: {
   const language = useLanguage()
   const dialog = useDialog()
   const sessionFavorites = useSessionFavorites()
+  const attention = useSessionAttention()
+  const important = () => props.activeServer && attention.enabled() &&
+    attention.current({ directory: props.directory, sessionID: props.sessionId })?.enabled
+  const unseen = () => props.activeServer && attention.enabled() &&
+    attention.current({ directory: props.directory, sessionID: props.sessionId })?.count
   const [menuOpen, setMenuOpen] = createSignal(false)
   const serverCtx = createMemo(() => {
     const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
@@ -1092,6 +1098,7 @@ function TabNavItem(props: {
               />
             </span>
             <span class="min-w-0 flex-1">{displayName({ worktree: props.directory })}</span>
+            <Show when={important()}><span aria-label={language.t(unseen() ? "session.attention.unseen" : "session.attention.marked")} classList={{ "text-text-warning-base font-bold": !!unseen() }}>✦</span></Show>
           </a>
         }
       >
@@ -1120,6 +1127,7 @@ function TabNavItem(props: {
                 />
               </span>
               <span class="min-w-0 flex-1">{sessionTabDisplayTitle(session())}</span>
+              <Show when={important()}><span aria-label={language.t(unseen() ? "session.attention.unseen" : "session.attention.marked")} classList={{ "text-text-warning-base font-bold": !!unseen() }}>✦</span></Show>
             </a>
           )
         }}
@@ -1219,7 +1227,7 @@ function TabNavItem(props: {
               >
                 {language.t("common.delete")}
               </MenuV2.Item>
-              <PluginSlotOutlet slot={UI_SLOT_IDS.sessionTabMenu} class="contents" />
+              <PluginSlotOutlet slot={UI_SLOT_IDS.sessionTabMenu} class="contents" target={props.sessionId ? { directory: props.directory, sessionID: props.sessionId } : undefined} />
             </MenuV2.Content>
           </MenuV2.Portal>
         </MenuV2>
@@ -1258,7 +1266,7 @@ function ProjectTabAvatar(props: {
     <ProjectAvatar
       fallback={displayName(props.project ?? { worktree: props.directory })}
       src={getProjectAvatarSource(props.project?.id, props.project?.icon)}
-      monochrome={getProjectAvatarMonochrome(props.project?.id)}
+      monochrome={getProjectAvatarMonochrome(props.project?.id, props.project?.icon)}
       variant={getProjectAvatarVariant(props.project?.icon?.color)}
       unread={state.unread()}
       loading={state.loading()}

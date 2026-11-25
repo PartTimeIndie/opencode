@@ -2,7 +2,7 @@ export * as Config from "./config"
 
 import path from "path"
 import { type ParseError, parse } from "jsonc-parser"
-import { Context, Effect, Layer, Option, Schema } from "effect"
+import { Context, Effect, Layer, Option, Schema, Semaphore } from "effect"
 import { FSUtil } from "./fs-util"
 import { Global } from "./global"
 import { Location } from "./location"
@@ -24,6 +24,7 @@ import { ConfigMaintenance } from "./config/maintenance"
 import { ConfigMCP } from "./config/mcp"
 import { ConfigModelChain } from "./config/model-chain"
 import { ConfigMultiAgent } from "./config/multi-agent"
+import { ConfigDelegation } from "./config/delegation"
 import { ConfigOptimization } from "./config/optimization"
 import { ConfigPlugin } from "./config/plugin"
 import { ConfigProvider } from "./config/provider"
@@ -148,6 +149,9 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   maintenance: ConfigMaintenance.Info.pipe(Schema.optional).annotate({
     description: "Settlement watchdog and bounded growth maintenance controls",
   }),
+  delegation: ConfigDelegation.Info.pipe(Schema.optional).annotate({
+    description: "Scoped delegation advice and binding rules; never permissions, workspace or cache grants",
+  }),
   multi_agent: ConfigMultiAgent.Info.pipe(Schema.optional).annotate({
     description: "Multi-agent skill reviewer configuration; set unlimited to remove local workflow caps",
   }),
@@ -197,7 +201,15 @@ export function globalLatest<K extends keyof Info>(entries: readonly Entry[], ke
 export interface Interface {
   /** Returns location config documents and supplemental directories from lowest to highest priority. */
   readonly entries: (input?: { readonly refresh?: boolean }) => Effect.Effect<Entry[]>
+  /**
+   * Documents that exist but could not be parsed or decoded, keyed by path.
+   * Missing optional files are not issues. Skill invocation policy reads this
+   * to fail closed instead of treating unreadable policy as absence.
+   */
+  readonly issues?: () => Effect.Effect<ReadonlyArray<ConfigIssue>>
 }
+
+export type ConfigIssue = { path: string; message: string }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Config") {}
 
@@ -212,22 +224,28 @@ export const layer = Layer.effect(
     const decodeOptions = { errors: "all", onExcessProperty: "ignore", propertyOrder: "original" } as const
     const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
     const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, decodeOptions)
+    const issues = new Map<string, ConfigIssue>()
 
     const loadText = Effect.fnUntraced(function* (filepath: string, text: string) {
       const errors: ParseError[] = []
       const input: unknown = parse(text, errors, { allowTrailingComma: true })
-      if (errors.length) return
+      if (errors.length) {
+        issues.set(filepath, { path: filepath, message: "invalid JSON/JSONC syntax" })
+        return
+      }
 
-      const info = Option.getOrUndefined(
-        ConfigMigrateV1.isV1(input)
-          ? decodeV1Info(input).pipe(
-              Option.map((info) => mergeHybridConfig(input, ConfigMigrateV1.migrate(info))),
-              Option.flatMap(decodeInfo),
-            )
-          : decodeInfo(input),
-      )
-      if (!info) return
-      return new Document({ type: "document", path: filepath, info })
+      const decoded = ConfigMigrateV1.isV1(input)
+        ? decodeV1Info(input).pipe(
+            Option.map((info) => mergeHybridConfig(input, ConfigMigrateV1.migrate(info))),
+            Option.flatMap(decodeInfo),
+          )
+        : decodeInfo(input)
+      if (Option.isNone(decoded)) {
+        issues.set(filepath, { path: filepath, message: "configuration does not match the schema" })
+        return
+      }
+      issues.delete(filepath)
+      return new Document({ type: "document", path: filepath, info: decoded.value })
     })
 
     const loadFile = Effect.fnUntraced(function* (filepath: string) {
@@ -310,10 +328,27 @@ export const layer = Layer.effect(
         .findLast((config) => config.info.maintenance !== undefined)?.info.maintenance,
     )
 
+    // A refresh must replace the published generation, not only return a fresh
+    // copy: consumers mixing a refreshed result with the stale published one
+    // would evaluate new agent overrides against outdated global defaults.
+    // Refreshes serialize so a slower earlier refresh cannot be overwritten by
+    // a later one that finished first.
+    const refreshLock = Semaphore.makeUnsafe(1)
+    let current = configs
+
     return Service.of({
       entries: Effect.fn("Config.entries")(function* (input?: { readonly refresh?: boolean }) {
-        if (input?.refresh) return yield* loadEntries()
-        return configs
+        if (!input?.refresh) return current
+        return yield* refreshLock.withPermits(1)(
+          Effect.gen(function* () {
+            const fresh = yield* loadEntries()
+            current = fresh
+            return fresh
+          }),
+        )
+      }),
+      issues: Effect.fn("Config.issues")(function* () {
+        return [...issues.values()]
       }),
     })
   }),

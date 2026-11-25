@@ -13,6 +13,9 @@ export class Skill extends Schema.Class<Skill>("ConfigV2.MultiAgent.Skill")({
   reviewers: Schema.Array(Reviewer).pipe(Schema.optional).annotate({
     description: "Ordered reviewer models for this multi-agent skill.",
   }),
+  result_recovery: Schema.Boolean.pipe(Schema.optional).annotate({
+    description: "Allow review-only salvage and one format repair (default true). Set false to retain strict results.",
+  }),
 }) {}
 
 export const Info = Schema.StructWithRest(Schema.Struct({

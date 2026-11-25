@@ -79,6 +79,7 @@ export type RunDescriptor = {
   approvedClose: boolean
   forceCloseApproved: boolean
   restart: boolean
+  agentRetry?: boolean
   pinnedBuildID?: string
   phase: string
   launchToken?: string
@@ -136,6 +137,8 @@ export function parseRunDescriptor(value: unknown): RunDescriptor {
   for (const key of ["approvedClose", "forceCloseApproved", "restart"] as const) {
     if (typeof record[key] !== "boolean") throw new Error(`automatic run descriptor is missing ${key}`)
   }
+  if (record.agentRetry !== undefined && typeof record.agentRetry !== "boolean")
+    throw new Error("automatic run descriptor has an invalid agent retry mode")
   if (record.pinnedBuildID !== undefined && typeof record.pinnedBuildID !== "string") throw new Error("automatic run descriptor has an invalid pinned build")
   if (record.launchToken !== undefined && typeof record.launchToken !== "string") throw new Error("automatic run descriptor has an invalid launch token")
   if (record.consumed !== undefined && typeof record.consumed !== "boolean") throw new Error("automatic run descriptor has an invalid handoff state")
@@ -260,6 +263,7 @@ export function parseAutomaticHandoffRequest(value: unknown): AutomaticHandoffRe
 export type RecoveryChoice = "opencode" | "codex" | "previous-app" | "restore-backup" | "abort"
 
 export function parseRecoveryChoice(value: string | undefined): RecoveryChoice {
+  value = value?.trim()
   if (value === "1" || value === "opencode") return "opencode"
   if (value === "2" || value === "codex") return "codex"
   if (value === "3" || value === "previous-app") return "previous-app"
@@ -274,17 +278,23 @@ export type RecoverySpawn = {
   cwd: string
 }
 
-export function opencodeRecoverySpawn(input: { cli: string; repoRoot: string; contextPath: string }): RecoverySpawn {
+export function opencodeRecoverySpawn(input: { cli: string; repoRoot: string; contextPath: string; prompt: string; interactive?: boolean }): RecoverySpawn {
   assertAutomaticRepoRoot(input.repoRoot)
   if (!input.cli) throw new Error("OpenCode recovery CLI is unavailable")
   if (!input.contextPath) throw new Error("OpenCode recovery context is missing")
-  return { command: input.cli, args: ["run", "--interactive", "--dir", input.repoRoot, "--file", input.contextPath], cwd: input.repoRoot }
+  if (!input.prompt) throw new Error("OpenCode recovery prompt is missing")
+  return {
+    command: input.cli,
+    args: ["run", "--pure", ...(input.interactive === false ? [] : ["--interactive"]), "--dir", input.repoRoot, input.prompt],
+    cwd: input.repoRoot,
+  }
 }
 
-export function codexRecoverySpawn(input: { cli: string; repoRoot: string }): RecoverySpawn {
+export function codexRecoverySpawn(input: { cli: string; repoRoot: string; prompt: string }): RecoverySpawn {
   assertAutomaticRepoRoot(input.repoRoot)
   if (!input.cli) throw new Error("Codex recovery CLI is unavailable")
-  return { command: input.cli, args: [], cwd: input.repoRoot }
+  if (!input.prompt) throw new Error("Codex recovery prompt is missing")
+  return { command: input.cli, args: [input.prompt], cwd: input.repoRoot }
 }
 
 export function backupPrefixForInstall(installPath = installDir) {
@@ -341,10 +351,11 @@ async function main() {
   if (command === automaticCommandName) return automatic()
   if (command === automaticWorkerCommandName) return automaticWorker()
   if (command === "status") return printStatus()
+  if (command === "recover") return recoverFailedRun()
   if (command === "discard") return discard()
   if (command === "clean-stages") return cleanStagesCommand()
   fail(
-    `usage: bun run desktop:deploy <prepare|launch|worker|${automaticCommandName}|${automaticWorkerCommandName}|status|discard|clean-stages>`,
+    `usage: bun run desktop:deploy <prepare|launch|worker|${automaticCommandName}|${automaticWorkerCommandName}|status|recover|discard|clean-stages>`,
   )
 }
 
@@ -630,10 +641,11 @@ async function worker() {
 
 async function automatic() {
   if (process.platform !== "win32") fail("the installed Desktop deploy pipeline currently supports Windows only")
-  if (process.argv.includes("--detach")) return automaticDetach()
+  if (process.argv.includes("--prompt-stale-cancel") && (await promptStaleAutomaticCancellation())) return
   const approvedClose = process.argv.includes("--approved-close")
   const forceCloseApproved = process.argv.includes("--force-close-approved")
   const restart = !process.argv.includes("--no-restart")
+  const agentRetry = process.argv.includes("--agent-retry")
   if ((!approvedClose || !forceCloseApproved) && !process.stdin.isTTY) {
     fail("automatic requires --approved-close and --force-close-approved when no interactive console is available")
   }
@@ -660,12 +672,19 @@ async function automatic() {
     approvedClose: approvals.approvedClose,
     forceCloseApproved: approvals.forceCloseApproved,
     restart: approvals.restart,
+    agentRetry,
     phase: "automatic-handoff",
     launchToken,
   }
   try {
     writeRunDescriptor(descriptor)
-    writeStatus({ status: "automatic-handoff", runID, phase: descriptor.phase, restart: approvals.restart, forceCloseApproved: approvals.forceCloseApproved })
+    writeStatus({
+      status: "automatic-handoff",
+      runID,
+      phase: descriptor.phase,
+      restart: approvals.restart,
+      forceCloseApproved: approvals.forceCloseApproved,
+    })
   } catch (error) {
     releaseLock()
     throw error
@@ -676,21 +695,29 @@ async function automatic() {
   releaseLock()
   const workerArgs = [scriptPath(), automaticWorkerCommandName, "--run-id", runID, "--launch-token", launchToken]
   const launcher = path.join(stateRoot, `automatic-${runID}.ps1`)
+  const consolePath = path.join(stateRoot, `automatic-${runID}.cmd`)
+  fs.writeFileSync(consolePath, automaticConsoleCommand([process.execPath, ...workerArgs], repoRoot), "utf8")
   fs.writeFileSync(
     launcher,
     [
       "$ErrorActionPreference = 'Stop'",
-      `Start-Process -FilePath '${ps(process.execPath)}' -ArgumentList @(${workerArgs.map((value) => `'${ps(value)}'`).join(", ")}) -WorkingDirectory '${ps(path.dirname(scriptPath()))}'`,
+      `Start-Process -FilePath $env:ComSpec -ArgumentList '${ps(`/d /${agentRetry ? "c" : "k"} ""${consolePath}""`)}' -WorkingDirectory '${ps(repoRoot)}' -WindowStyle ${agentRetry ? "Hidden" : "Normal"}`,
     ].join("\r\n"),
     "utf8",
   )
-  const result = Bun.spawnSync(["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher], {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
+  const result = Bun.spawnSync(
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher],
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  )
   if (result.exitCode !== 0) {
-    cancelAutomaticHandoff(runID, `could not start detached automatic worker: ${result.stderr.toString().trim() || `exit ${result.exitCode}`}`)
+    cancelAutomaticHandoff(
+      runID,
+      `could not start detached automatic worker: ${result.stderr.toString().trim() || `exit ${result.exitCode}`}`,
+    )
     fail(`could not start detached automatic worker: ${result.stderr.toString().trim() || `exit ${result.exitCode}`}`)
   }
   const started = await waitFor(() => {
@@ -709,25 +736,63 @@ async function automatic() {
   console.log(`STATUS  : ${statusPath}`)
 }
 
-function automaticDetach() {
-  const args = [scriptPath(), automaticCommandName, ...process.argv.slice(3).filter((value) => value !== "--detach")]
-  const launcher = path.join(stateRoot, `automatic-detach-${timestamp()}-${randomUUID().slice(0, 8)}.ps1`)
-  fs.writeFileSync(
-    launcher,
-    [
-      "$ErrorActionPreference = 'Stop'",
-      `Start-Process -FilePath '${ps(process.execPath)}' -ArgumentList @(${args.map((value) => `'${ps(value)}'`).join(", ")}) -WorkingDirectory '${ps(path.dirname(scriptPath()))}'`,
-    ].join("\r\n"),
-    "utf8",
+async function promptStaleAutomaticCancellation() {
+  const previous = readDeployStatusStrict()
+  if (!previous || !isAutomaticRunInFlight(previous)) return false
+  if (!previous.runID) throw new Error(`deployment status ${previous.status} has no automatic run to cancel`)
+  if (!process.stdin.isTTY || !process.stdout.isTTY)
+    throw new Error(`automatic run ${previous.runID} is still in flight; cancellation needs a visible interactive console`)
+  console.log(`Deployment ${previous.runID} is still in flight (status: ${previous.status}).`)
+  const answer = await promptLine("Willst du den verwaisten Lauf abbrechen? Ja/Nein [Nein] ")
+  if (!/^(ja|j|yes|y)$/i.test(answer.trim())) {
+    console.log("Abbruch abgelehnt; der vorhandene Lauf bleibt unverändert.")
+    return true
+  }
+  const releaseLock = acquireLock()
+  try {
+    const current = readDeployStatusStrict()
+    if (!current || current.runID !== previous.runID || current.updatedAt !== previous.updatedAt || !isAutomaticRunInFlight(current))
+      throw new Error("deployment status changed while awaiting cancellation; inspect the current console")
+    if (automaticWorkerRunning(current.runID))
+      throw new Error(`automatic run ${current.runID} still has an active worker; use its visible console to abort safely`)
+    if (current.status === "automatic-handoff") {
+      const cancelled = cancelAutomaticHandoff(current.runID, "cancelled in the visible CMD console")
+      if (cancelled?.phase !== "automatic-cancelled")
+        throw new Error(`automatic handoff ${current.runID} was claimed while awaiting cancellation`)
+    } else {
+      writeStatus({ ...current, status: "automatic-cancelled", phase: "automatic-cancelled", error: "cancelled in the visible CMD console" })
+    }
+    console.log(`Verwaister Lauf ${current.runID} abgebrochen. Starte das CMD-Werkzeug erneut für einen neuen Deploy.`)
+    return true
+  } finally {
+    releaseLock()
+  }
+}
+
+function automaticWorkerRunning(runID: string) {
+  const result = Bun.spawnSync(
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", "Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -match '^(bun|node)(\\.exe)?$' -and $_.CommandLine -match 'desktop-prod-deploy' } | Select-Object -ExpandProperty CommandLine"],
+    { stdout: "pipe", stderr: "pipe" },
   )
-  const result = Bun.spawnSync(["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher], {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  if (result.exitCode !== 0) fail(`could not start detached automatic console: ${result.stderr.toString().trim() || `exit ${result.exitCode}`}`)
-  console.log(`AUTOMATIC : detached console started`)
-  console.log(`STATUS  : ${statusPath}`)
+  if (result.exitCode !== 0) throw new Error("could not verify whether the automatic worker is still running")
+  return result.stdout.toString().split(/\r?\n/).some((line) => line.includes("automatic-worker") && line.includes(runID))
+}
+
+export function automaticConsoleCommand(args: string[], directory: string) {
+  const quote = (value: string) => {
+    if (/["\r\n]/.test(value)) throw new Error("invalid automatic console argument")
+    return `"${value.replace(/%/g, "%%")}"`
+  }
+  return [
+    "@echo off",
+    "setlocal DisableDelayedExpansion",
+    "title OpenCode Build and Deploy",
+    `cd /d ${quote(directory)}`,
+    "if errorlevel 1 exit /b 1",
+    args.map(quote).join(" "),
+    "exit /b %ERRORLEVEL%",
+    "",
+  ].join("\r\n")
 }
 
 async function resolveAutomaticApprovals(input: { approvedClose: boolean; forceCloseApproved: boolean; restart: boolean }) {
@@ -750,6 +815,7 @@ function promptLine(question: string): Promise<string> {
       answer += chunk
       if (answer.includes("\n")) {
         process.stdin.off("data", onData)
+        process.stdin.pause()
         resolve(answer.trim())
       }
     }
@@ -766,13 +832,17 @@ async function automaticWorker() {
     writeStatus({ status: "automatic-failed", runID, phase: "automatic-failed", error: `automatic run root mismatch: ${claimed.repoRoot}` })
     fail(`automatic run root mismatch: ${claimed.repoRoot}`)
   }
+  // Give the plugin host time to receive the claimed worker acknowledgement before shutdown.
+  await Bun.sleep(5_000)
   const logPath = path.join(stateRoot, `automatic-${runID}.log`)
   writeBuildLogHeader(logPath, runID)
+  let pausedDevServer: ProcessEntry | undefined
   try {
     const workerStatus = (status: string, extra: Record<string, unknown> = {}) =>
       writeStatus({ status, runID, phase: status, restart: claimed.restart, forceCloseApproved: claimed.forceCloseApproved, logPath, ...extra })
     workerStatus("automatic-closing-app")
     await closeOpenCodeInventoried(claimed.forceCloseApproved)
+    pausedDevServer = await pauseOwnedViteDevServer(repoRoot)
     workerStatus("automatic-building")
     const prepared = await buildAutomaticPackage(runID)
     workerStatus("automatic-deploying", { buildID: prepared.buildID })
@@ -812,6 +882,11 @@ async function automaticWorker() {
       error: message,
     })
     console.error(`AUTOMATIC FAILED: ${message}`)
+    if (claimed.agentRetry) {
+      console.error(`Repair agent owns this failure. Log: ${prepared?.logPath ?? logPath}`)
+      process.exitCode = 1
+      return
+    }
     try {
       await runAutomaticRecovery({
         runID,
@@ -822,10 +897,20 @@ async function automaticWorker() {
       })
     } catch (recoveryError) {
       const recoveryMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
-      writeStatus({ status: "automatic-failed", runID, phase: "automatic-failed", logPath: prepared?.logPath ?? logPath, error: `${message}; recovery failed: ${recoveryMessage}` })
+      if (readStatus().runID === runID)
+        writeStatus({ status: "automatic-failed", runID, phase: "automatic-failed", logPath: prepared?.logPath ?? logPath, error: `${message}; recovery failed: ${recoveryMessage}` })
       throw recoveryError
     }
     process.exitCode = 1
+  } finally {
+    if (pausedDevServer) {
+      try {
+        restartOwnedViteDevServer(repoRoot, pausedDevServer)
+      } catch (error) {
+        console.error(`Could not restart the paused Vite dev server: ${error instanceof Error ? error.message : error}`)
+        process.exitCode = 1
+      }
+    }
   }
 }
 
@@ -844,7 +929,7 @@ async function buildAutomaticPackage(runID: string): Promise<PreparedAutomaticBu
   await prepare({ runID, internal: true })
   const status = readStatus()
   if (status.status !== "ready" || !status.buildID || !status.stagePath) {
-    throw new Error(`automatic build did not report READY (status: ${status.status})`)
+    throw new Error(`automatic build did not report READY (status: ${status.status})${status.error ? `: ${status.error}` : ""}`)
   }
   if (status.runID !== runID) throw new Error(`automatic build ${runID} lost ownership (status owner: ${status.runID ?? "none"})`)
   verifyPrepared(status)
@@ -937,7 +1022,15 @@ async function runAutomaticRecovery(input: {
     console.error(`\nAutomatic build/deploy failed: ${input.message}`)
     console.error(`Full log: ${input.logPath}`)
     console.error(`\n1 OpenCode CLI repair (stored default chain)\n2 Codex CLI repair (its own settings)\n3 Start previous app\n4 Restore verified backup and start\n0 Abort without action`)
-    const choice = parseRecoveryChoice(await promptLine("Recovery choice [0-4] "))
+    let choice: RecoveryChoice
+    for (;;) {
+      try {
+        choice = parseRecoveryChoice(await promptLine("Recovery choice [0-4] "))
+        break
+      } catch {
+        console.error("Bitte 0, 1, 2, 3 oder 4 eingeben.")
+      }
+    }
     if (choice === "abort") {
       writeStatus({ status: "automatic-failed", runID: input.runID, phase: "automatic-failed", logPath: input.logPath, error: input.message, recovery: "aborted" })
       return
@@ -948,23 +1041,41 @@ async function runAutomaticRecovery(input: {
     return runBackupRestoreRecovery(input)
   } catch (error) {
     const recoveryMessage = error instanceof Error ? error.message : String(error)
-    writeStatus({ status: "automatic-failed", runID: input.runID, phase: "automatic-failed", logPath: input.logPath, error: `${input.message}; recovery failed: ${recoveryMessage}` })
+    if (readStatus().runID === input.runID)
+      writeStatus({ status: "automatic-failed", runID: input.runID, phase: "automatic-failed", logPath: input.logPath, error: `${input.message}; recovery failed: ${recoveryMessage}` })
     throw error
   }
 }
 
-async function runOpenCodeRecovery(input: { runID: string; repoRoot: string; logPath: string; message: string }) {
+export function recoveryPrompt(input: { runID: string; repoRoot: string; logPath: string; message: string }) {
+  return `Repair the failed OpenCode desktop deploy in ${input.repoRoot}. Read ${input.logPath}; failure: ${input.message}. Preserve unrelated work. Find and fix the actual cause, then run the relevant check. You may close and restart OpenCode.exe, build, and install. When ready, run "bun run desktop:deploy automatic --approved-close --force-close-approved --agent-retry" from the repo root. Its worker stays hidden and returns failures through "bun run desktop:deploy status"; follow each run until it completes or fails. If it fails, inspect the new log, fix the new cause, and retry only after new evidence or a change. Stay in this CLI. If you cannot resolve a concrete blocker, ask the user here what to do and wait for the answer. Do not commit, push, or launch another repair CLI.`
+}
+
+async function recoverFailedRun() {
+  const status = readStatus()
+  if (!["automatic-failed", "automatic-cancelled"].includes(status.status) || !status.runID || !status.logPath || !status.error)
+    throw new Error("recover requires a recorded failed or cancelled automatic build with a log")
+  const choice = parseRecoveryChoice(process.argv[3])
+  if (choice !== "opencode" && choice !== "codex") throw new Error("recover requires opencode or codex")
+  const input = { runID: status.runID, repoRoot, logPath: status.logPath, message: status.error }
+  if (choice === "opencode") return runOpenCodeRecovery(input, process.argv.includes("--non-interactive"))
+  if (process.argv.includes("--non-interactive")) throw new Error("non-interactive recovery is only supported for OpenCode")
+  return runCodexRecovery(input)
+}
+
+async function runOpenCodeRecovery(input: { runID: string; repoRoot: string; logPath: string; message: string }, nonInteractive = false) {
   const cli = process.env.OPENCODE_CLI ?? "opencode"
   const contextPath = path.join(stateRoot, `automatic-${input.runID}-recovery.md`)
+  const prompt = recoveryPrompt(input)
   fs.writeFileSync(
     contextPath,
-    `# Automatic deploy recovery\n\nRun: ${input.runID}\nRepo: ${input.repoRoot}\nLog: ${input.logPath}\n\nFailure: ${input.message}\n\nTask: isolate the failure, repair the affected code and tests, run the relevant tests, report the result, then stop. Do not start a new build or deploy, commit, or push.\n`,
+    `# Automatic deploy recovery\n\n${prompt}\n`,
     "utf8",
   )
-  const spawn = opencodeRecoverySpawn({ cli, repoRoot: input.repoRoot, contextPath })
+  const spawn = opencodeRecoverySpawn({ cli, repoRoot: input.repoRoot, contextPath, prompt, interactive: !nonInteractive })
   console.log(`Starting OpenCode repair with the stored default chain. No model override is passed; check the effective chain in the session.`)
-  await runInteractiveChild(spawn)
   writeStatus({ status: "automatic-failed", runID: input.runID, phase: "automatic-failed", logPath: input.logPath, error: input.message, recovery: "opencode-repair" })
+  await runInteractiveChild(spawn)
 }
 
 async function runCodexRecovery(input: { runID: string; repoRoot: string; logPath: string; message: string }) {
@@ -975,10 +1086,10 @@ async function runCodexRecovery(input: { runID: string; repoRoot: string; logPat
     writeStatus({ status: "automatic-failed", runID: input.runID, phase: "automatic-failed", logPath: input.logPath, error: input.message, recovery: "codex-unavailable" })
     return
   }
-  const spawn = codexRecoverySpawn({ cli, repoRoot: input.repoRoot })
-  console.log(`Starting Codex with its own settings. No OpenCode chain applies. Repair and test, then stop without deploying.`)
-  await runInteractiveChild(spawn)
+  const spawn = codexRecoverySpawn({ cli, repoRoot: input.repoRoot, prompt: recoveryPrompt(input) })
+  console.log(`Starting Codex with its own settings. No OpenCode chain applies.`)
   writeStatus({ status: "automatic-failed", runID: input.runID, phase: "automatic-failed", logPath: input.logPath, error: input.message, recovery: "codex-repair" })
+  await runInteractiveChild(spawn)
 }
 
 async function runPreviousAppRecovery(input: { runID: string; logPath: string; message: string }) {
@@ -1074,9 +1185,10 @@ export async function restoreVerifiedBackupTransaction(
   }
 }
 
-async function runInteractiveChild(spawn: { command: string; args: string[]; cwd: string }) {
+async function runInteractiveChild(spawn: RecoverySpawn) {
   const child = Bun.spawn([spawn.command, ...spawn.args], { cwd: spawn.cwd, stdin: "inherit", stdout: "inherit", stderr: "inherit" })
-  await child.exited
+  const exit = await child.exited
+  if (exit !== 0) throw new Error(`${spawn.command} repair exited ${exit}`)
 }
 
 function printStatus() {
@@ -1300,7 +1412,7 @@ function sourceTreeFingerprint() {
       "package.json",
       "bun.lock",
     ],
-    { cwd: repoRoot, stdout: "pipe", stderr: "pipe" },
+    { cwd: repoRoot, stdout: "pipe", stderr: "pipe", env: sourceFingerprintGitEnvironment(process.env) },
   )
   if (result.exitCode !== 0) throw new Error(`could not enumerate deployable source: ${result.stderr.toString()}`)
   const files = result.stdout
@@ -1310,6 +1422,12 @@ function sourceTreeFingerprint() {
     .filter(isDeployableSourceFile)
     .sort()
   return fingerprintSourceFiles(repoRoot, files)
+}
+
+export function sourceFingerprintGitEnvironment(env: NodeJS.ProcessEnv) {
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => !/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)),
+  )
 }
 
 export function isDeployableSourceFile(file: string): boolean {
@@ -1357,14 +1475,22 @@ export function writeBuildLogHeader(logPath: string, buildID: string) {
   fs.writeFileSync(logPath, header, { flag: "a" })
 }
 
-export async function runLogged(command: string[], cwd: string, logPath: string, timeout: number) {
-  fs.appendFileSync(logPath, `\n> ${command.join(" ")}\n`, "utf8")
-  const env: NodeJS.ProcessEnv = { ...process.env, OPENCODE_CHANNEL: "prod" }
+export function deployBuildEnv(source: NodeJS.ProcessEnv = process.env) {
+  const env: NodeJS.ProcessEnv = { ...source, OPENCODE_CHANNEL: "prod" }
   // The in-app button runs through the desktop sidecar, which defers database
   // startup work for its live server. Build verifiers use isolated databases
   // and must not inherit those runtime-only deferrals.
   delete env.OPENCODE_DEFER_DB_STARTUP_REPAIRS
   delete env.OPENCODE_DEFER_BACKGROUND_STARTUP
+  // Repair CLIs use --pure for their own session. Their child build still
+  // needs plugins enabled so the production smoke checks exercise them.
+  delete env.OPENCODE_PURE
+  return env
+}
+
+export async function runLogged(command: string[], cwd: string, logPath: string, timeout: number) {
+  fs.appendFileSync(logPath, `\n> ${command.join(" ")}\n`, "utf8")
+  const env = deployBuildEnv()
   const child = Bun.spawn(command, {
     cwd,
     env,
@@ -1461,7 +1587,15 @@ export function listOpenCodeProcesses(excludePids: number[] = []): OpenCodeProce
     { stdout: "pipe", stderr: "ignore" },
   )
   if (result.exitCode !== 0) throw new Error("could not inventory OpenCode processes; refusing to close fail-closed")
-  return filterAutomaticShutdownTargets(parseOpenCodeInventory(result.stdout.toString()), excludePids)
+  return filterAutomaticShutdownTargets(
+    desktopShutdownTargets(parseOpenCodeInventory(result.stdout.toString()), path.join(installDir, "OpenCode.exe")),
+    excludePids,
+  )
+}
+
+export function desktopShutdownTargets(processes: OpenCodeProcess[], executable: string) {
+  const target = path.resolve(executable).toLowerCase()
+  return processes.filter((entry) => entry.executablePath && path.resolve(entry.executablePath).toLowerCase() === target)
 }
 
 export type ShutdownDependencies = {
@@ -1523,7 +1657,11 @@ export async function requestDesktopQuit(
 function startOpenCode() {
   const executable = path.join(installDir, "OpenCode.exe")
   if (!fs.existsSync(executable)) throw new Error(`deployed executable is missing: ${executable}`)
-  Bun.spawn([executable], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref()
+  const env = { ...process.env }
+  // A repair CLI can use --pure for its own session. Do not launch the
+  // installed Desktop with that CLI-only restriction inherited.
+  delete env.OPENCODE_PURE
+  Bun.spawn([executable], { env, detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref()
 }
 
 function isOpenCodeRunning() {
@@ -1543,7 +1681,7 @@ async function waitForStableOpenCode() {
   }
   const tokenFile = path.join(process.env.APPDATA ?? "", "ai.opencode.desktop", "desktop-testing.json")
   if (!fs.existsSync(tokenFile)) return isOpenCodeRunning()
-  const runtimeDeadline = Date.now() + 60_000
+  const runtimeDeadline = Date.now() + 120_000
   while (Date.now() < runtimeDeadline) {
     if (!isOpenCodeRunning()) return false
     if (await probeDesktopRuntime(tokenFile)) return true
@@ -1754,7 +1892,7 @@ export function assertFreeMemoryForBuild(freeBytes: number, minBytes = minBuildF
   )
 }
 
-export type ProcessEntry = { pid: number; name: string; commandLine: string }
+export type ProcessEntry = { pid: number; parentPid?: number; name: string; commandLine: string; devArgs?: string[] }
 
 const competingWriterNames = /^(bun|node|npm|npx|git|tsc|vite|electron|python)(\.exe)?$/i
 
@@ -1781,6 +1919,59 @@ export function assertNoCompetingWriters(entries: ProcessEntry[], root: string, 
   )
 }
 
+export function ownedViteDevServer(entries: ProcessEntry[], root: string): ProcessEntry | undefined {
+  const vitePath = path.join(root, "packages", "app", "node_modules", ".bin", "vite.exe").toLowerCase()
+  const vite = entries.filter((entry) => entry.name.toLowerCase() === "vite.exe" &&
+    entry.commandLine.trim().replaceAll('"', "").toLowerCase().startsWith(vitePath))
+  if (vite.length !== 1) return undefined
+  const viteCommand = vite[0]!.commandLine.trim().replaceAll('"', "")
+  const viteOptions = viteCommand.slice(vitePath.length).trim()
+  const optionMatch = viteOptions.match(/^(?:--host (?:127\.0\.0\.1|localhost) --port ([1-9]\d{0,4}) --strictPort)?$/i)
+  if (!viteCommand.toLowerCase().startsWith(vitePath) || !optionMatch || (optionMatch[1] && Number(optionMatch[1]) > 65535)) return undefined
+  const owner = entries.find((entry) => entry.pid === vite[0]!.parentPid)
+  const ownerMatch = owner?.commandLine.trim().match(/(?:^|[/\\])bun(?:\.exe)?"?\s+run\s+dev(?:\s+(.*))?$/i)
+  if (!owner || !/^bun(?:\.exe)?$/i.test(owner.name) || !ownerMatch || (ownerMatch[1] ?? "") !== viteOptions) return undefined
+  const descendants = entries.filter((entry) => entry.parentPid === vite[0]!.pid)
+  if (descendants.some((entry) => {
+    if (entry.name.toLowerCase() === "conhost.exe")
+      return !/^\\\?\?\\[a-z]:\\windows\\system32\\conhost\.exe\s/i.test(entry.commandLine)
+    const nodeCommand = entry.commandLine.trim().replaceAll('"', "")
+    const nodePath = path.join(root, "packages", "app", "node_modules", "vite", "bin", "vite.js").toLowerCase()
+    return !/^node(?:\.exe)?$/i.test(entry.name) || nodeCommand.toLowerCase() !== `node ${nodePath}${viteOptions ? ` ${viteOptions.toLowerCase()}` : ""}`
+  })) return undefined
+  return { ...owner, devArgs: viteOptions ? viteOptions.split(" ") : [] }
+}
+
+async function pauseOwnedViteDevServer(root: string) {
+  const owner = ownedViteDevServer(listLocalProcesses(), root)
+  if (!owner || ownedViteDevServer(listLocalProcesses(), root)?.pid !== owner.pid) return undefined
+  const result = Bun.spawnSync(["taskkill.exe", "/PID", String(owner.pid), "/T", "/F"], { stdout: "pipe", stderr: "pipe" })
+  if (result.exitCode !== 0) throw new Error(`could not pause the verified Vite dev server: ${result.stderr.toString().trim()}`)
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (!listLocalProcesses().some((entry) => entry.pid === owner.pid)) return owner
+    await Bun.sleep(250)
+  }
+  throw new Error(`Vite dev server PID ${owner.pid} remained after shutdown`)
+}
+
+export function viteDevServerLaunch(root: string, owner?: ProcessEntry) {
+  return { command: [process.execPath, "run", "dev", ...(owner?.devArgs ?? [])], cwd: path.join(root, "packages", "app") }
+}
+
+function restartOwnedViteDevServer(root: string, owner: ProcessEntry) {
+  const launch = viteDevServerLaunch(root, owner)
+  const child = Bun.spawn(launch.command, {
+    cwd: launch.cwd,
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    windowsHide: true,
+    detached: true,
+  })
+  child.unref()
+  console.log(`Restarted paused Vite dev server as PID ${child.pid}`)
+}
+
 export function listLocalProcesses(): ProcessEntry[] {
   if (process.platform !== "win32") return []
   const result = Bun.spawnSync(
@@ -1789,7 +1980,7 @@ export function listLocalProcesses(): ProcessEntry[] {
       "-NoLogo",
       "-NoProfile",
       "-Command",
-      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.Name)`t$($_.CommandLine)\" }",
+      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.Name)`t$($_.CommandLine)\" }",
     ],
     { stdout: "pipe", stderr: "ignore" },
   )
@@ -1800,10 +1991,12 @@ export function listLocalProcesses(): ProcessEntry[] {
     .flatMap((line): ProcessEntry[] => {
       const first = line.indexOf("\t")
       const second = line.indexOf("\t", first + 1)
+      const third = line.indexOf("\t", second + 1)
       const pid = Number(first > 0 ? line.slice(0, first) : Number.NaN)
-      const name = first > 0 && second > first ? line.slice(first + 1, second) : ""
+      const parentPid = Number(second > first ? line.slice(first + 1, second) : Number.NaN)
+      const name = third > second ? line.slice(second + 1, third) : ""
       if (!Number.isInteger(pid) || !name) return []
-      return [{ pid, name, commandLine: line.slice(second + 1) }]
+      return [{ pid, ...(Number.isInteger(parentPid) ? { parentPid } : {}), name, commandLine: line.slice(third + 1) }]
     })
 }
 

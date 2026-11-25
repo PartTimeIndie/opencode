@@ -296,14 +296,14 @@ describe("WriteTool", () => {
     ),
   )
 
-  it.live("approves an explicit external absolute path before edit", () =>
+  it.live("approves the canonical directory before writing through an external relative path", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
       ([active, outside]) => {
         reset()
         const target = path.join(outside.path, "external.txt")
         return withTool(active.path, (registry) =>
-          settleTool(registry, call({ path: target, content: "external" })),
+          settleTool(registry, call({ path: path.relative(active.path, target), content: "external" })),
         ).pipe(
           Effect.andThen((settled) =>
             Effect.gen(function* () {
@@ -330,6 +330,40 @@ describe("WriteTool", () => {
         Effect.promise(() =>
           Promise.all([active[Symbol.asyncDispose](), outside[Symbol.asyncDispose]()]).then(() => undefined),
         ),
+    ),
+  )
+
+  it.live("does not touch a junction target without external approval or read evidence", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
+      ([active, outside]) => Effect.gen(function* () {
+        const target = path.join(outside.path, "existing.txt")
+        const alias = path.join("linked", "existing.txt")
+        yield* Effect.promise(async () => {
+          await fs.writeFile(target, "original")
+          await fs.symlink(outside.path, path.join(active.path, "linked"), process.platform === "win32" ? "junction" : "dir")
+        })
+        reset()
+        denyAction = "external_directory"
+        const rejected = yield* withTool(active.path, (registry) =>
+          executeTool(registry, call({ path: alias, content: "blocked" })),
+        )
+        expect(rejected.type).toBe("error")
+        expect(assertions.map((input) => input.action)).toEqual(["external_directory"])
+
+        reset()
+        const noRead = yield* withTool(active.path, (registry) =>
+          executeTool(registry, call({ path: alias, content: "blocked" })),
+        )
+        expect(noRead).toMatchObject({ type: "error", value: expect.stringContaining("Read required") })
+        expect(assertions.map((input) => input.action)).toEqual(["external_directory", "edit"])
+        const root = yield* Effect.promise(() => fs.realpath(outside.path))
+        expect(assertions[0]?.resources).toEqual([path.join(root, "*").replaceAll("\\", "/")])
+        expect(assertions[1]?.resources).toEqual([path.join(root, "existing.txt").replaceAll("\\", "/")])
+        expect(writes).toEqual([])
+        expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("original")
+      }),
+      (dirs) => Effect.promise(() => Promise.all(dirs.map((dir) => dir[Symbol.asyncDispose]())).then(() => undefined)),
     ),
   )
 

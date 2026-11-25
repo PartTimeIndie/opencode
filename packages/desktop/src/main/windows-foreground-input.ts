@@ -1,7 +1,13 @@
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
 const maximumOutputBytes = 64 * 1024
 const operationTimeoutMs = 10_000
+type HelperResult = { ok: true; stdout: string; stderr: string } | { ok: false; error: string }
+type SpawnHelper = (
+  executable: string,
+  args: string[],
+  options: { windowsHide: boolean; stdio: ["pipe", "pipe", "pipe"] },
+) => ChildProcessWithoutNullStreams
 
 export type ForegroundWindowTarget = {
   handle: string
@@ -13,11 +19,14 @@ export type ForegroundWindowTarget = {
 
 export async function captureForegroundWindow() {
   if (process.platform !== "win32") return { ok: false as const, error: "External text insertion is only available on Windows." }
-  const result = await runPowerShell(captureScript)
+  const result = await runPowerShell(helperScripts.capture)
   if (!result.ok) return result
   const value = await parseResult(result.stdout)
   if (!value || value.ok !== true || !validTarget(value.target)) {
-    return { ok: false as const, error: result.stderr || "The foreground Windows application could not be identified." }
+    return {
+      ok: false as const,
+      error: structuredError(value) ?? helperErrorMessage(result.stderr, "The foreground Windows application could not be identified."),
+    }
   }
   return { ok: true as const, target: value.target }
 }
@@ -25,16 +34,54 @@ export async function captureForegroundWindow() {
 export async function insertForegroundText(target: ForegroundWindowTarget, text: string, signal?: AbortSignal) {
   if (process.platform !== "win32") return { ok: false as const, error: "External text insertion is only available on Windows." }
   if (!validTarget(target)) return { ok: false as const, error: "The captured target is invalid." }
-  const result = await runPowerShell(insertScript, JSON.stringify({ target, text }), signal)
+  const result = await runPowerShell(helperScripts.insert, JSON.stringify({ target, text }), signal)
   if (!result.ok) return result
   const value = await parseResult(result.stdout)
   if (!value || value.ok !== true) {
-    return {
-      ok: false as const,
-      error: typeof value?.error === "string" ? value.error : result.stderr || "Windows rejected the text insertion.",
-    }
+    return { ok: false as const, error: structuredError(value) ?? helperErrorMessage(result.stderr, "Windows rejected the text insertion.") }
   }
   return { ok: true as const }
+}
+
+function structuredError(value: Record<string, unknown> | undefined) {
+  return typeof value?.error === "string" && value.error.trim() ? value.error.trim() : undefined
+}
+
+/**
+ * PowerShell 5.1 serializes its error stream as CLIXML once stderr is
+ * redirected, so the raw stream only ever shows "#< CLIXML". Decode the error
+ * strings and drop PowerShell's position noise; anything unreadable falls
+ * back to the caller's own description.
+ */
+export function helperErrorMessage(stderr: string, fallback: string) {
+  const marker = /^\s*#<\s*CLIXML\s*/i.exec(stderr)
+  const body = marker ? decodeClixml(stderr.slice(marker[0].length)) : unescapeXml(stderr)
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !powershellNoise.test(line))
+  return lines.length ? lines.join("\n") : fallback
+}
+
+// "At file.ps1:3 char:1" (English) / "Bei datei.ps1:3 Zeichen:1" (German),
+// echoed source lines and the CategoryInfo/FullyQualifiedErrorId trailer.
+const powershellNoise = /^(At|Bei)\s+\S.*:\d+\s+\S+\s*:\d+|^\+(\s|$)|^(CategoryInfo|FullyQualifiedErrorId)\s*:/i
+
+function decodeClixml(xml: string) {
+  const strings = [...xml.matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map((match) => match[1]!)
+  return unescapeXml(strings.length ? strings.join("\n") : xml.replace(/<[^>]+>/g, "\n"))
+}
+
+function unescapeXml(value: string) {
+  return value
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/&#x([0-9A-Fa-f]+);/g, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(Number.parseInt(dec, 10)))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
 }
 
 function validTarget(value: unknown): value is ForegroundWindowTarget {
@@ -58,12 +105,12 @@ function parseResult(value: string) {
     .catch(() => undefined)
 }
 
-async function runPowerShell(script: string, input?: string, signal?: AbortSignal) {
+export async function runPowerShell(script: string, input?: string, signal?: AbortSignal, spawnHelper: SpawnHelper = spawn) {
   if (signal?.aborted) return { ok: false as const, error: "The Windows input helper was cancelled." }
   const executable = process.env.SystemRoot ? `${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe` : "powershell.exe"
   const encoded = Buffer.from(script, "utf16le").toString("base64")
-  return new Promise<{ ok: true; stdout: string; stderr: string } | { ok: false; error: string }>((resolve) => {
-    const child = spawn(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], {
+  return new Promise<HelperResult>((resolve) => {
+    const child = spawnHelper(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -76,7 +123,7 @@ async function runPowerShell(script: string, input?: string, signal?: AbortSigna
       child.kill()
       finish({ ok: false, error: "The Windows input helper was cancelled." })
     }
-    const finish = (result: { ok: true; stdout: string; stderr: string } | { ok: false; error: string }) => {
+    const finish = (result: HelperResult) => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
@@ -96,9 +143,11 @@ async function runPowerShell(script: string, input?: string, signal?: AbortSigna
       child.kill()
       finish({ ok: false, error: "The Windows input helper timed out." })
     }, operationTimeoutMs)
-    child.once("exit", (code) => {
+    // `exit` can fire before the stdio pipes are drained and truncate stdout;
+    // `close` only fires once every stream ended.
+    child.once("close", (code) => {
       if (oversized) return finish({ ok: false, error: "The Windows input helper returned too much output." })
-      if (code !== 0) return finish({ ok: false, error: stderr.trim() || `The Windows input helper exited with code ${code}.` })
+      if (code !== 0) return finish({ ok: false, error: helperErrorMessage(stderr, `The Windows input helper exited with code ${code}.`) })
       finish({ ok: true, stdout, stderr })
     })
     signal?.addEventListener("abort", abort, { once: true })
@@ -186,9 +235,13 @@ public static class OpenCodeDesktopInput {
 }
 `
 
+// Failures leave as structured JSON on stdout: PowerShell otherwise serializes
+// its error stream as CLIXML on stderr, which users cannot read.
 const captureScript = String.raw`
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+try {
 Add-Type -TypeDefinition @'
 ${nativeTypes}
 '@
@@ -200,12 +253,17 @@ $process = Get-Process -Id $processID -ErrorAction Stop
 $bounds = New-Object OpenCodeDesktopInput+Rect
 [void][OpenCodeDesktopInput]::GetWindowRect($window, [ref]$bounds)
 @{ ok = $true; target = @{ handle = $window.ToInt64().ToString(); processID = [int]$processID; processStartedAt = $process.StartTime.ToUniversalTime().Ticks.ToString(); application = $process.ProcessName; bounds = @{ x = $bounds.Left; y = $bounds.Top; width = $bounds.Right - $bounds.Left; height = $bounds.Bottom - $bounds.Top } } } | ConvertTo-Json -Compress -Depth 4
+} catch {
+@{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+}
 `
 
 const insertScript = String.raw`
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+try {
 Add-Type -TypeDefinition @'
 ${nativeTypes}
 '@
@@ -228,4 +286,9 @@ $expected = ([string]$request.text).Length * 2
 $inserted = [OpenCodeDesktopInput]::Insert([string]$request.text)
 if ($inserted -ne $expected) { throw "Windows accepted $inserted of $expected keyboard events." }
 @{ ok = $true } | ConvertTo-Json -Compress
+} catch {
+@{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+}
 `
+
+export const helperScripts = { capture: captureScript, insert: insertScript } as const

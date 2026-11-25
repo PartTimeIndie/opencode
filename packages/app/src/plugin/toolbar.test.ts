@@ -219,13 +219,11 @@ describe("progressive plan builder toolbar registration", () => {
 
     expect(config).toContain("./plugins/progressive-plan-builder-app")
     expect(source).toContain('id: "progressivePlanBuilder"')
-    expect(source).toContain("COMPOSER_TOOLBAR_ORDER = 51")
+    expect(source).toContain("order: 51")
     expect(source).toContain('placement: "composer"')
     expect(source).toContain('align: "right"')
-    expect(source).toContain('kind: "mount"')
-    expect(source).toContain("api.host.composer.beforeSubmit(context.context, onBeforeSubmit)")
-    expect(source).toContain('detail.mode !== "normal"')
-    expect(source).toContain("detail.appendText(SKILL_REFERENCE)")
+    expect(source).toContain("appendOnSubmit: true")
+    expect(source).toContain('name: "progressive-plan-builder"')
     expect(source).not.toContain("enabled:")
     expect(source).not.toContain("visible:")
   })
@@ -292,11 +290,9 @@ describe("visual qa toolbar registration", () => {
       new URL("../../../../.opencode/plugins/visual-qa-app/assets/visual-qa.svg", import.meta.url),
     ).text()
 
-    expect(source).toContain("const toolbarContext = mountContext.context ?? {}")
-    expect(source).toContain("COMPOSER_TOOLBAR_ORDER = 10")
-    expect(source).toContain("mountContext.element.replaceChildren(button)")
-    expect(source).toContain("api.host.composer.beforeSubmit(toolbarContext, onBeforeSubmit)")
-    expect(source).toContain("previous?.composerID === toolbarContext.composerID")
+    expect(source).toContain("order: 10")
+    expect(source).toContain("appendOnSubmit: true")
+    expect(source).toContain('name: "visual-qa-testing"')
     expect(source).not.toContain("api.kv")
     expect(source).not.toContain("ACTIVE_KEY")
     expect(icon).not.toContain('color="white"')
@@ -333,15 +329,11 @@ describe("multi-agent review toolbar registration", () => {
     expect(config).toContain("./plugins/multi-agent-review-app")
     expect(source).toContain('id: "multiAgentReview"')
     expect(source).toContain('SKILL_REFERENCE = "/multi-agent-review"')
-    expect(source).toContain("COMPOSER_TOOLBAR_ORDER = 30")
+    expect(source).toContain("order: 30")
     expect(source).toContain('placement: "composer"')
     expect(source).toContain('align: "right"')
-    expect(source).toContain('kind: "mount"')
-    expect(source).toContain("detail.appendText(SKILL_REFERENCE)")
-    expect(source).toContain("const toolbarContext = mountContext.context ?? {}")
-    expect(source).toContain("mountContext.element.replaceChildren(button)")
-    expect(source).toContain("api.host.composer.beforeSubmit(toolbarContext, onBeforeSubmit)")
-    expect(source).toContain("previous?.composerID === toolbarContext.composerID")
+    expect(source).toContain("appendOnSubmit: true")
+    expect(source).toContain('name: "multi-agent-review"')
     expect(source).not.toContain("api.kv")
     expect(source).not.toContain("ACTIVE_KEY")
     expect(
@@ -454,7 +446,7 @@ test("next-message toolbar toggles preserve active state across remounts", async
   }
 
   await Promise.all(
-    ["visual-qa-app", "multi-agent-review-app", "multi-agent-problem-solver-app"].map(async (id) => {
+    ["multi-agent-problem-solver-app"].map(async (id) => {
       const source = new URL(`../../../../.opencode/plugin-sources/${id}/index.js`, import.meta.url)
       const registrations: Registration[] = []
       const plugin = (await import(source.href)) as {
@@ -518,7 +510,7 @@ test("next-message toolbar toggles preserve active state across remounts", async
 })
 
 test("generated plugin runtime parity after coordinated plugin release", async () => {
-  for (const id of ["visual-qa-app", "multi-agent-review-app", "multi-agent-problem-solver-app"]) {
+  for (const id of ["visual-qa-app", "multi-agent-review-app", "progressive-plan-builder-app", "multi-agent-problem-solver-app"]) {
     const runtime = new URL(`../../../../.opencode/plugins/${id}/index.js`, import.meta.url)
     const source = new URL(`../../../../.opencode/plugin-sources/${id}/index.js`, import.meta.url)
     expect((await Bun.file(runtime).text()).replaceAll("\r\n", "\n")).toBe(

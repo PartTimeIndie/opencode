@@ -26,13 +26,13 @@ test("disabling idle timeouts still normalizes remote aborts at the runner bound
   expect(failure).toMatchObject({ reason: { kind: "stream-aborted", canRetry: true, message: aborted.message } })
 })
 
-test("provider stream inactivity defaults to one minute and preserves explicit overrides", () => {
-  expect(providerStreamIdleTimeoutMs(undefined)).toBe(60_000)
+test("provider stream initial inactivity defaults to ninety seconds and preserves explicit overrides", () => {
+  expect(providerStreamIdleTimeoutMs(undefined)).toBe(90_000)
   expect(providerStreamIdleTimeoutMs("2500")).toBe(2_500)
   expect(providerStreamIdleTimeoutMs("0")).toBe(false)
-  expect(providerStreamIdleTimeoutMs("invalid")).toBe(60_000)
-  expect(providerStreamIdleTimeoutMs("")).toBe(60_000)
-  expect(providerStreamIdleTimeoutMs("  ")).toBe(60_000)
+  expect(providerStreamIdleTimeoutMs("invalid")).toBe(90_000)
+  expect(providerStreamIdleTimeoutMs("")).toBe(90_000)
+  expect(providerStreamIdleTimeoutMs("  ")).toBe(90_000)
 })
 
 test("provider error events do not grant a longer progress deadline", async () => {
@@ -53,9 +53,9 @@ test.each([
   ["zhipuai-coding-plan", "glm-5.3"],
   ["zhipuai-coding-plan", "glm-4.6"],
   ["openrouter", "glm-4.5-air"],
-])("GLM model %s/%s keeps the first-event timeout and the longer progress phase", (provider, id) => {
+])("GLM model %s/%s uses the common ninety-second initial and four-minute progress phases", (provider, id) => {
   expect(providerStreamIdleTimeouts({ provider, id })).toEqual({
-    initialMs: 60_000,
+    initialMs: 90_000,
     afterProgressMs: 240_000,
   })
 })
@@ -63,19 +63,25 @@ test.each([
 test.each([
   ["openai", "gpt-6-luna"],
   ["openai", "gpt-6.1-sol"],
-])("OpenAI GPT-6 model %s/%s keeps the longer progress phase for legitimate thinking", (provider, id) => {
+])("OpenAI GPT-6 model %s/%s uses the common ninety-second initial and four-minute progress phases", (provider, id) => {
   expect(providerStreamIdleTimeouts({ provider, id })).toEqual({
-    initialMs: 60_000,
+    initialMs: 90_000,
     afterProgressMs: 240_000,
   })
 })
 
-test.each([["openai", "gpt-60"], ["openai", "gpt-6luna"], ["openai", "gpt-5.5"], ["anthropic", "claude-sonnet-4-5"]])(
-  "non-reasoning model %s/%s keeps the one-minute idle bound for both phases",
+test.each([
+  ["tensorfold", "bonsai-2-27b"],
+  ["openai", "gpt-60"],
+  ["openai", "gpt-6luna"],
+  ["openai", "gpt-5.5"],
+  ["anthropic", "claude-sonnet-4-5"],
+])(
+  "other model %s/%s uses the same ninety-second initial and four-minute progress phases",
   (provider, id) => {
     expect(providerStreamIdleTimeouts({ provider, id })).toEqual({
-      initialMs: 60_000,
-      afterProgressMs: 60_000,
+      initialMs: 90_000,
+      afterProgressMs: 240_000,
     })
   },
 )
@@ -141,6 +147,49 @@ test("provider stream failures pass through the idle guard immediately", async (
   )
 
   expect(observed).toBe(failure)
+})
+
+test("completed opaque Codex reasoning grants the bounded progress phase without summary text", async () => {
+  const reasoning = LLMEvent.reasoningEnd({
+    id: "opaque-reasoning",
+    providerMetadata: { openai: { reasoningEncryptedContent: "opaque-fixture" } },
+  })
+  const finish = LLMEvent.finish({ reason: "stop" })
+  const stream = Stream.concat(
+    Stream.succeed(reasoning),
+    Stream.fromEffect(Effect.sleep(40).pipe(Effect.as(finish))),
+  )
+  expect(await Effect.runPromise(Stream.runCollect(withProviderStreamIdleTimeout(stream, 20, 150)))).toEqual([
+    reasoning,
+    finish,
+  ])
+})
+
+test.each([undefined, null, "", "  "])("empty reasoning completion %j does not extend the initial deadline", async (encrypted) => {
+  const reasoning = LLMEvent.reasoningEnd({
+    id: "empty-reasoning",
+    providerMetadata: { openai: { reasoningEncryptedContent: encrypted } },
+  })
+  const stream = Stream.concat(Stream.succeed(reasoning), Stream.never)
+  const failure = await Effect.runPromise(
+    withProviderStreamIdleTimeout(stream, 10, 1_000).pipe(Stream.runDrain, Effect.flip),
+  )
+  expect(failure.reason).toMatchObject({ kind: "stream-inactivity", message: expect.stringContaining("0 seconds") })
+})
+
+test("repeated opaque reasoning completion cannot keep a stalled provider alive", async () => {
+  const reasoning = LLMEvent.reasoningEnd({
+    id: "same-reasoning",
+    providerMetadata: { openai: { reasoningEncryptedContent: "opaque-fixture" } },
+  })
+  const failure = await Effect.runPromise(
+    withProviderStreamIdleTimeout(
+      Stream.fromEffectRepeat(Effect.sleep(2).pipe(Effect.as(reasoning))),
+      20,
+      40,
+    ).pipe(Stream.runDrain, Effect.flip),
+  )
+  expect(failure.reason).toMatchObject({ kind: "stream-inactivity", canRetry: true })
 })
 
 test("local event processing cannot stall a healthy provider or its normal completion", async () => {

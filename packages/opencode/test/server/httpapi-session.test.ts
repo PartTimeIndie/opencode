@@ -62,6 +62,21 @@ const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const commandHookPlugin = pathToFileURL(path.join(import.meta.dir, "..", "fixture", "command-hook-plugin.ts")).href
 const goalCommandObserver = pathToFileURL(path.join(import.meta.dir, "..", "fixture", "goal-command-observer.ts")).href
 
+// Machine-readable bindings are part of the admission contract: run IDs must be
+// backtick-quoted list fields and every accepted item needs separate - itemId /
+// - approvalId fields under an accepted heading. A readable prose snapshot would
+// pass the visual handoff but fail admission.
+const dailyReviewPlanMarkdown = [
+  "# Daily Review",
+  "- runId: `morning-run`",
+  "- runDate: `2026-10-05`",
+  "- planId: `plan-1`",
+  "- morningRunId: `morning-run`",
+  "## Angenommene Punkte",
+  "### itemId `item-1`",
+  `- approvalId: \`${"a".repeat(64)}\``,
+  "autoApply=false",
+].join("\n")
 function dailyReviewSurface(plan: SessionPlanDocument.Info) {
   return {
     version: 1,
@@ -334,6 +349,58 @@ afterEach(async () => {
 })
 
 describe("session HttpApi", () => {
+  it.instance("shares scoped delegation preferences with durable Session CAS and rejects stale HTTP saves", () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const parent = yield* createSession({ title: "Scoped preferences" })
+      const endpoint = pathFor(SessionPaths.delegationPreferences, { sessionID: parent.id })
+      const headers = { "x-opencode-directory": instance.directory, "content-type": "application/json" }
+      const initial = yield* requestJson<{ scope: string; revision: number; value: unknown }>(endpoint, { headers })
+      expect(initial).toEqual({ scope: "session", revision: 0, value: {} })
+      const saved = yield* requestJson<{ scope: string; revision: number; value: unknown }>(endpoint, {
+        method: "PATCH", headers, body: JSON.stringify({ expectedRevision: 0, patch: { ordinaryQuestions: false } }),
+      })
+      expect(saved).toEqual({ scope: "session", revision: 1, value: { ordinaryQuestions: false } })
+      const stale = yield* request(endpoint, { method: "PATCH", headers,
+        body: JSON.stringify({ expectedRevision: 0, patch: { ordinaryQuestions: true } }) })
+      expect(stale.status).toBe(409)
+      expect(yield* requestJson(endpoint, { headers })).toEqual(saved)
+      const missingVersion = yield* request(endpoint, { method: "PATCH", headers,
+        body: JSON.stringify({ scope: "project", patch: { ordinaryQuestions: true } }) })
+      expect(missingVersion.status).toBe(400)
+      const invalidTask = yield* request(`${endpoint}?scope=task&taskID=${parent.id}`, { headers })
+      expect(invalidTask.status).toBe(400)
+      const projectBefore = yield* requestJson<{ scope: string; version: string; value: unknown }>(`${endpoint}?scope=project`, { headers })
+      const projectSaved = yield* requestJson<{ scope: string; version: string; value: unknown }>(endpoint, {
+        method: "PATCH", headers, body: JSON.stringify({ scope: "project", expectedVersion: projectBefore.version,
+          patch: { preferences: [{ topic: "review", selections: [{ agent: "build" }] }] } }),
+      })
+      expect(projectSaved.scope).toBe("project")
+      expect(projectSaved.version).not.toBe(projectBefore.version)
+      expect(projectSaved.value).toEqual({ preferences: [{ topic: "review", selections: [{ agent: "build" }] }] })
+      expect(yield* requestJson(`${endpoint}?scope=project`, { headers })).toEqual({
+        scope: "project", version: projectSaved.version, value: projectSaved.value,
+      })
+      const projectStale = yield* request(endpoint, { method: "PATCH", headers, body: JSON.stringify({ scope: "project",
+        expectedVersion: projectBefore.version, patch: { ordinaryQuestions: true } }) })
+      expect(projectStale.status).toBe(409)
+      const cleared = yield* requestJson<{ scope: string; version: string; value: unknown }>(endpoint, {
+        method: "PATCH", headers, body: JSON.stringify({ scope: "project", expectedVersion: projectSaved.version,
+          patch: { ordinaryQuestions: null, preferences: null, rules: null } }),
+      })
+      expect(cleared.value).toEqual({})
+      expect(cleared.version).not.toBe(projectSaved.version)
+      expect(yield* requestJson(endpoint, { headers })).toEqual(saved)
+      const foreignDirectory = yield* tmpdirScoped({ git: true })
+      // Session routing deliberately uses the stored Session location, not a
+      // stale client directory header. It must still return only this ID's state.
+      expect(yield* requestJson(endpoint, { headers: { "x-opencode-directory": foreignDirectory } })).toEqual(saved)
+      const other = yield* requestJson<Session.Info>(SessionPaths.create, { method: "POST",
+        headers: { "x-opencode-directory": foreignDirectory, "content-type": "application/json" }, body: JSON.stringify({ title: "Other Session" }) })
+      expect(yield* requestJson(pathFor(SessionPaths.delegationPreferences, { sessionID: other.id }), { headers }))
+        .toEqual({ scope: "session", revision: 0, value: {} })
+    }),
+  )
   it.live("bootstraps the local instance before serving V2 session requests", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true })
@@ -1673,7 +1740,7 @@ describe("session HttpApi", () => {
           const current = yield* requestJson<{ data: { metadata?: Record<string, unknown> } }>(
             `/api/session/${created.data.id}`, { headers },
           )
-          expect(current.data.metadata).toEqual({ "opencode.session.goal": "original goal" })
+          expect(current.data.metadata).toEqual({ "opencode.session.goal": "original goal", "opencode.session.goal_run": expect.any(String) })
         }
       }),
     {
@@ -1711,22 +1778,31 @@ describe("session HttpApi", () => {
           requestJson<{ data: { metadata?: Record<string, unknown> } }>(sessionPath, { headers })
 
         expect((yield* sendGoalCommand("msg_goal_set", "set ship it")).status).toBe(200)
-        expect((yield* sessionInfo()).data.metadata).toEqual({ "opencode.session.goal": "ship it" })
+        const firstGoal = (yield* sessionInfo()).data.metadata
+        expect(firstGoal).toEqual({ "opencode.session.goal": "ship it", "opencode.session.goal_run": expect.any(String) })
+        expect((yield* sendGoalCommand("msg_goal_set", "set ship it")).status).toBe(200)
+        expect((yield* sessionInfo()).data.metadata).toEqual(firstGoal)
 
         expect((yield* sendGoalCommand("msg_goal_set_again", "set ship it")).status).toBe(200)
-        expect((yield* sessionInfo()).data.metadata).toEqual({ "opencode.session.goal": "ship it" })
+        const secondGoal = (yield* sessionInfo()).data.metadata
+        expect(secondGoal).toEqual({ "opencode.session.goal": "ship it", "opencode.session.goal_run": expect.any(String) })
+        expect(secondGoal?.["opencode.session.goal_run"]).not.toBe(firstGoal?.["opencode.session.goal_run"])
+        expect((yield* sendGoalCommand("msg_goal_set", "set ship it")).status).toBe(200)
+        expect((yield* sessionInfo()).data.metadata).toEqual(secondGoal)
+        expect((yield* sendGoalCommand("msg_goal_set", "set different")).status).toBe(409)
+        expect((yield* sessionInfo()).data.metadata).toEqual(secondGoal)
 
         expect((yield* sendGoalCommand("msg_goal_status", "status")).status).toBe(200)
-        expect((yield* sessionInfo()).data.metadata).toEqual({ "opencode.session.goal": "ship it" })
+        expect((yield* sessionInfo()).data.metadata).toEqual(secondGoal)
 
         expect((yield* sendGoalCommand("msg_goal_edit", "edit updated goal")).status).toBe(200)
-        expect((yield* sessionInfo()).data.metadata).toEqual({ "opencode.session.goal": "ship it" })
+        expect((yield* sessionInfo()).data.metadata).toEqual(secondGoal)
 
         expect((yield* sendGoalCommand("msg_goal_add", "add final goal")).status).toBe(200)
-        expect((yield* sessionInfo()).data.metadata).toEqual({ "opencode.session.goal": "ship it" })
+        expect((yield* sessionInfo()).data.metadata).toEqual(secondGoal)
 
         expect((yield* sendGoalCommand("msg_goal_focus", "focus now")).status).toBe(200)
-        expect((yield* sessionInfo()).data.metadata).toEqual({ "opencode.session.goal": "ship it" })
+        expect((yield* sessionInfo()).data.metadata).toEqual(secondGoal)
 
         expect((yield* sendGoalCommand("msg_goal_clear", "clear")).status).toBe(200)
         expect((yield* sessionInfo()).data.metadata).toEqual({})
@@ -1926,10 +2002,19 @@ await server.connect(new StdioServerTransport())`
           git: true,
           config: {
             ...testProviderConfig(llm.url),
+            permission: { task: "allow" },
             command: {
               delegate: { template: "Delegate $ARGUMENTS", subtask: true },
             },
           },
+          // The private mirror copies tracked files only. This fixture's local
+          // provider configuration is deliberately part of its repository.
+          init: (directory) => Effect.promise(async () => {
+            const child = Bun.spawn(["git", "add", "--", "opencode.json"], {
+              cwd: directory, stdout: "ignore", stderr: "pipe",
+            })
+            if (await child.exited !== 0) throw new Error("Could not index fixture provider config")
+          }),
         })
         const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
         const created = yield* requestJson<{ data: { id: string } }>("/api/session", {
@@ -1938,21 +2023,17 @@ await server.connect(new StdioServerTransport())`
           body: JSON.stringify({ agent: "build", location: { directory } }),
         })
 
+        const commandBody = JSON.stringify({
+          id: SessionMessage.ID.create(), command: "delegate", arguments: "real work",
+          model: { providerID: "test", id: "test-model" },
+        })
         const response = yield* request(`/api/session/${created.data.id}/command`, {
           method: "POST",
           headers,
-          body: JSON.stringify({
-            command: "delegate",
-            arguments: "real work",
-            model: { providerID: "test", id: "test-model" },
-          }),
+          body: commandBody,
         })
         const responseText = yield* response.text
         expect(response.status, responseText).toBe(200)
-        yield* llm.wait(1)
-
-        const inputs = yield* llm.inputs
-        expect(JSON.stringify(inputs)).toContain("Delegate real work")
 
         const completed = yield* pollWithTimeout(
           Effect.gen(function* () {
@@ -1966,17 +2047,120 @@ await server.connect(new StdioServerTransport())`
             const tool = assistant?.content.find(
               (part): part is SessionMessage.AssistantTool => part.type === "tool" && part.name === "task",
             )
-            return tool?.state.status === "completed" ? tool.state : undefined
+            return tool?.state.status === "completed" || tool?.state.status === "error" ? tool.state : undefined
           }),
-          "v2 subtask command did not produce a completed task tool",
+          "v2 subtask command did not produce a terminal task tool",
           "5 seconds",
         )
+        expect(completed.status, JSON.stringify(completed)).toBe("completed")
         expect(completed.structured).toMatchObject({ state: "completed", text: "child subtask done" })
+        yield* llm.wait(1)
+        const inputs = yield* llm.inputs
+        expect(JSON.stringify(inputs)).toContain("Delegate real work")
         expect(completed.content.some((part) => part.type === "text" && part.text.includes("child subtask done"))).toBe(
           true,
         )
+        expect((yield* request(`/api/session/${created.data.id}/wait`, { method: "POST", headers })).status).toBe(204)
+        const retried = yield* request(`/api/session/${created.data.id}/command`, {
+          method: "POST", headers, body: commandBody,
+        })
+        expect(retried.status).toBe(200)
+        expect((yield* request(`/api/session/${created.data.id}/wait`, { method: "POST", headers })).status).toBe(204)
+        expect(yield* llm.inputs).toHaveLength(1)
+        const children = yield* requestJson<Session.Info[]>(pathFor(SessionPaths.children, { sessionID: created.data.id }), { headers })
+        expect(children).toHaveLength(1)
+        expect(children[0]?.directory).not.toBe(directory)
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer)),
-    10_000,
+    // Includes mirror setup, complete settlement, exact retry and both runtimes' cleanup.
+    20_000,
+  )
+
+  it.live("refuses denied subtask commands without child or provider work", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({ git: true, config: {
+        ...testProviderConfig(llm.url), permission: { task: "deny" },
+        command: { delegate: { template: "Delegate $ARGUMENTS", subtask: true } },
+      } })
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const created = yield* requestJson<{ data: { id: string } }>("/api/session", {
+        method: "POST", headers, body: JSON.stringify({ agent: "build", location: { directory } }),
+      })
+      const response = yield* request(`/api/session/${created.data.id}/command`, {
+        method: "POST", headers, body: JSON.stringify({ command: "delegate", arguments: "denied work",
+          model: { providerID: "test", id: "test-model" } }),
+      })
+      expect(response.status).toBe(200)
+      expect((yield* request(`/api/session/${created.data.id}/wait`, { method: "POST", headers })).status).toBe(204)
+      const messages = yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${created.data.id}/message`, { headers })
+      const assistant = messages.data.find((message): message is SessionMessage.Assistant => message.type === "assistant")
+      const tool = assistant?.content.find((part): part is SessionMessage.AssistantTool => part.type === "tool" && part.name === "task")
+      expect(tool?.state.status).toBe("error")
+      expect(yield* llm.inputs).toHaveLength(0)
+      expect(yield* requestJson<Session.Info[]>(pathFor(SessionPaths.children, { sessionID: created.data.id }), { headers })).toHaveLength(0)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer)), 10_000,
+  )
+
+  it.instance(
+    "denies skill command and synthetic injection before shell expansion",
+    () => Effect.gen(function* () {
+      const test = yield* TestInstance
+      const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+      const created = yield* requestJson<{ data: { id: string } }>("/api/session", {
+        method: "POST", headers, body: JSON.stringify({ agent: "build", location: { directory: test.directory } }),
+      })
+      const list = yield* requestJson<{ data: { name: string; effective?: { invocation: string; visible: boolean } }[] }>("/api/skill", { headers })
+      expect(list.data.find((skill) => skill.name === "blocked")?.effective).toMatchObject({ invocation: "manual", visible: false })
+      for (const [endpoint, body] of [
+        ["command", { command: "blocked", resume: false }],
+        ["skill", { skill: "blocked" }],
+      ] as const) {
+        const response = yield* request(`/api/session/${created.data.id}/${endpoint}`, {
+          method: "POST", headers, body: JSON.stringify(body),
+        })
+        expect(response.status).toBe(400)
+      }
+      expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, "skill-side-effect.txt")).exists())).toBe(false)
+      const messages = yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${created.data.id}/message`, { headers })
+      expect(messages.data.some((message) => message.type === "synthetic")).toBe(false)
+    }),
+    {
+      git: true,
+      config: { formatter: false, lsp: false, permission: { skill: { blocked: "deny" } } },
+      init: (directory) => Effect.promise(async () => {
+        const skill = path.join(directory, ".agents", "skills", "blocked")
+        await mkdir(skill, { recursive: true })
+        await Bun.write(path.join(skill, "SKILL.md"), "---\nname: blocked\ndescription: blocked skill\ndisable-model-invocation: true\n---\n!`echo unsafe > skill-side-effect.txt`\n")
+      }),
+    },
+    30_000,
+  )
+
+  it.instance(
+    "requires bash permission before expanding an allowed skill command",
+    () => Effect.gen(function* () {
+      const test = yield* TestInstance
+      const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+      const created = yield* requestJson<{ data: { id: string } }>("/api/session", {
+        method: "POST", headers, body: JSON.stringify({ agent: "build", location: { directory: test.directory } }),
+      })
+      const response = yield* request(`/api/session/${created.data.id}/command`, {
+        method: "POST", headers, body: JSON.stringify({ command: "shell-skill", resume: false }),
+      })
+      expect(response.status).toBe(400)
+      expect(yield* response.text).toContain("Skill shell expansion denied")
+      expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, "skill-side-effect.txt")).exists())).toBe(false)
+    }),
+    {
+      git: true,
+      config: { formatter: false, lsp: false, permission: { skill: "allow", bash: "deny" } },
+      init: (directory) => Effect.promise(async () => {
+        const skill = path.join(directory, ".agents", "skills", "shell-skill")
+        await mkdir(skill, { recursive: true })
+        await Bun.write(path.join(skill, "SKILL.md"), "---\nname: shell-skill\ndescription: shell skill\n---\n!`echo unsafe > skill-side-effect.txt`\n")
+      }),
+    },
+    30_000,
   )
 
   it.instance(
@@ -2161,7 +2345,7 @@ await server.connect(new StdioServerTransport())`
         const session = yield* createSession({ title: "v2 confirmed handoff", agent: currentAgent })
         const planDocument = yield* Database.Service.use((database) =>
           SessionPlanDocument.Service.use((service) =>
-            service.replace({ sessionID: SessionSchema.ID.make(session.id), markdown: "Daily Review" }),
+            service.replace({ sessionID: SessionSchema.ID.make(session.id), markdown: dailyReviewPlanMarkdown }),
           ).pipe(
             Effect.provide(SessionPlanDocument.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))),
           ),
@@ -2224,7 +2408,7 @@ await server.connect(new StdioServerTransport())`
               tool: expect.objectContaining({
                 purpose: "daily_review_implementation",
                 authorizationScope: "accepted-items-in-plan-snapshot",
-                planDocument: expect.objectContaining({ revision: planDocument.revision, markdown: "Daily Review" }),
+                planDocument: expect.objectContaining({ revision: planDocument.revision, markdown: dailyReviewPlanMarkdown }),
               }),
             }),
           }),
@@ -2262,7 +2446,7 @@ await server.connect(new StdioServerTransport())`
         const session = yield* createSession({ title: "v2 stale Daily Review handoff", agent: "plan" })
         const original = yield* Database.Service.use((database) =>
           SessionPlanDocument.Service.use((service) =>
-            service.replace({ sessionID: SessionSchema.ID.make(session.id), markdown: "Original Daily Review" }),
+            service.replace({ sessionID: SessionSchema.ID.make(session.id), markdown: dailyReviewPlanMarkdown }),
           ).pipe(
             Effect.provide(SessionPlanDocument.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))),
           ),
@@ -2540,7 +2724,7 @@ await server.connect(new StdioServerTransport())`
       expect(wait.status).toBe(204)
       const messages = yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${sessionID}/message`, { headers })
       expect(messages.data.some((message) => message.type === "user" && message.text.includes("Preserve original oversized history"))).toBeTrue()
-      expect(messages.data.find((message) => message.type === "assistant")).toMatchObject({
+      expect(messages.data.find((message) => message.type === "assistant"), JSON.stringify(settled)).toMatchObject({
         finish: "error", failure: { code: "provider.context-overflow" },
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer)),

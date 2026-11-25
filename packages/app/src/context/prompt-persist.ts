@@ -38,6 +38,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function persistedImagePart(part: ImageAttachmentPart): ImageAttachmentPart | undefined {
+  if (part.annotation) return { type: "image", id: part.id, filename: part.filename, mime: "image/png", annotation: { ...part.annotation } }
   if (part.sourcePath) {
     return {
       type: "image",
@@ -45,6 +46,7 @@ function persistedImagePart(part: ImageAttachmentPart): ImageAttachmentPart | un
       filename: part.filename,
       sourcePath: part.sourcePath,
       mime: part.mime,
+      ...(part.unpack ? { unpack: true } : {}),
     }
   }
   if (!part.dataUrl || dataUrlSize(part.dataUrl) > MAX_PROMPT_INLINE_DATA_URL_BYTES) return

@@ -16,6 +16,12 @@ declare module "virtual:opencode-server" {
     export type Info = import("../../../opencode/dist/types/src/node").Config.Info
   }
   export const bootstrap: typeof import("../../../opencode/dist/types/src/node").bootstrap
+  export namespace DesktopRecovery {
+    export const configure: (input: { ownerID: string; previousOwners: readonly string[] }, onOwner: (ownerID: string) => void) => void
+  }
+  export namespace CrashActivity {
+    export const configure: (sink: (update: import("./sidecar-diagnostics").SidecarActivityUpdate) => void) => void
+  }
   export namespace StorageWorker {
     export const run: (args: ReadonlyArray<string>) => Promise<void>
   }

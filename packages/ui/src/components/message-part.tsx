@@ -58,12 +58,13 @@ import { TextShimmer } from "./text-shimmer"
 import { AnimatedCountList } from "./tool-count-summary"
 import { ToolStatusTitle } from "./tool-status-title"
 import { patchFiles } from "./apply-patch-file"
-import { animate } from "motion"
+import { ShellSubmessage } from "./shell-submessage"
 import { useLocation } from "@solidjs/router"
 import { attached, contentUrl, inline, kind } from "./message-file"
 import { MessageAttachmentImage } from "./message-attachment-image"
 import { readPartText } from "./message-part-text"
 import { findSlashCommandRanges } from "@opencode-ai/core/util/slash-command"
+import { reviewerDetails } from "@opencode-ai/core/util/tool-details"
 
 async function writeClipboard(text: string): Promise<boolean> {
   const body = typeof document === "undefined" ? undefined : document.body
@@ -86,39 +87,6 @@ async function writeClipboard(text: string): Promise<boolean> {
   return clipboard.writeText(text).then(
     () => true,
     () => false,
-  )
-}
-
-function ShellSubmessage(props: { text: string; animate?: boolean }) {
-  let widthRef: HTMLSpanElement | undefined
-  let valueRef: HTMLSpanElement | undefined
-
-  onMount(() => {
-    if (!props.animate) return
-    requestAnimationFrame(() => {
-      if (widthRef) {
-        animate(widthRef, { width: "auto" }, { type: "spring", visualDuration: 0.25, bounce: 0 })
-      }
-      if (valueRef) {
-        animate(valueRef, { opacity: 1, filter: "blur(0px)" }, { duration: 0.32, ease: [0.16, 1, 0.3, 1] })
-      }
-    })
-  })
-
-  return (
-    <span data-component="shell-submessage">
-      <span ref={widthRef} data-slot="shell-submessage-width" style={{ width: props.animate ? "0px" : undefined }}>
-        <span data-slot="basic-tool-tool-subtitle">
-          <span
-            ref={valueRef}
-            data-slot="shell-submessage-value"
-            style={props.animate ? { opacity: 0, filter: "blur(2px)" } : undefined}
-          >
-            {props.text}
-          </span>
-        </span>
-      </span>
-    </span>
   )
 }
 
@@ -150,7 +118,10 @@ function getDiagnostics(diagnosticsByFile: unknown, filePath: string | undefined
   if (!filePath) return []
   const diagnostics = record(diagnosticsByFile)?.[filePath]
   if (!Array.isArray(diagnostics)) return []
-  return diagnostics.filter(diagnostic).filter((d) => d.severity === 1).slice(0, 3)
+  return diagnostics
+    .filter(diagnostic)
+    .filter((d) => d.severity === 1)
+    .slice(0, 3)
 }
 
 function DiagnosticsDisplay(props: { diagnostics: Diagnostic[] }): JSX.Element {
@@ -596,11 +567,7 @@ function taskSessionID(metadata: Record<string, unknown>) {
   if (typeof value === "string" && value) return value
 }
 
-function taskSession(
-  input: Record<string, unknown>,
-  parentID: string | undefined,
-  sessions: Session[] | undefined,
-) {
+function taskSession(input: Record<string, unknown>, parentID: string | undefined, sessions: Session[] | undefined) {
   if (!parentID) return
   const description = typeof input.description === "string" ? input.description : ""
   const agent = typeof input.subagent_type === "string" ? input.subagent_type.toLowerCase() : ""
@@ -1302,7 +1269,7 @@ export function UserMessageDisplay(props: {
 
   const openImagePreview = (part: FilePart, alt?: string) => {
     void Promise.resolve(data.resolveMediaUrl?.(part, "content") ?? contentUrl(part)).then((url) => {
-      dialog.show(() => <ImagePreview src={url} alt={alt} />)
+      dialog.show(() => <ImagePreview src={url} alt={alt} annotateLabel={data.annotateImageLabel} onAnnotate={data.onAnnotateImage && !proofAttachmentUrl(part.url) && /^image\/(png|jpeg|webp)$/.test(part.mime) ? () => { dialog.close(); data.onAnnotateImage?.(part) } : undefined} />)
     })
   }
 
@@ -1556,10 +1523,7 @@ PART_MAPPING["file"] = function FilePartDisplay(props) {
   const fileKind = () => kind(part())
   const name = () => part().filename ?? i18n.t("ui.message.attachment.alt")
   const proof = () => proofAttachmentUrl(part().url)
-  const [url] = createResource(
-    part,
-    (value) => data.resolveMediaUrl?.(value, "content") ?? contentUrl(value),
-  )
+  const [url] = createResource(part, (value) => data.resolveMediaUrl?.(value, "content") ?? contentUrl(value))
   const [open, setOpen] = createSignal(false)
 
   return (
@@ -1629,6 +1593,7 @@ PART_MAPPING["file"] = function FilePartDisplay(props) {
               </svg>
             </button>
             <Show when={fileKind() === "image"}>
+              <Show when={data.onAnnotateImage && !proof() && /^image\/(png|jpeg|webp)$/.test(part().mime)}><button type="button" data-action="annotate-copy" class="absolute left-4 top-4 rounded-md bg-surface-raised-stronger px-3 py-2" onClick={(event) => { event.stopPropagation(); setOpen(false); data.onAnnotateImage?.(part()) }}>{data.annotateImageLabel ?? "Edit as new copy"}</button></Show>
               <ZoomableImage
                 src={url() ?? ""}
                 alt={name()}
@@ -1886,6 +1851,7 @@ export interface ToolProps {
   sessionID?: string
   callID?: string
   output?: string
+  error?: string
   status?: string
   attachments?: ToolAttachment[]
   hideDetails?: boolean
@@ -1928,6 +1894,7 @@ export const ToolRegistry = {
 ToolRegistry.register({
   name: "attach",
   render(props) {
+    const data = useData()
     // Prefer the durable result attachment. Normal attachments are data URLs;
     // proof attachments are same-origin artifact URLs that stay out of model context.
     const resultAttachment = createMemo(() => props.attachments?.[0])
@@ -1947,14 +1914,21 @@ ToolRegistry.register({
     const description = createMemo(() => attachString(props.input.description))
     const kind = createMemo(() => attachToolKind(mime()))
     const proof = createMemo(() => proofToolInput(props.input, url()))
-    const fallbackInput = createMemo(() => (proofInput() && !inputPreview() ? redactedProofToolInput(props.input) : props.input))
+    const fallbackInput = createMemo(() =>
+      proofInput() && !inputPreview() ? redactedProofToolInput(props.input) : props.input,
+    )
     const [open, setOpen] = createSignal(false)
 
     return (
       <Show
         when={url()}
         fallback={
-          <GenericTool tool={props.tool} status={props.status} hideDetails={props.hideDetails} input={fallbackInput()} />
+          <GenericTool
+            tool={props.tool}
+            status={props.status}
+            hideDetails={props.hideDetails}
+            input={fallbackInput()}
+          />
         }
       >
         {(source) => (
@@ -2027,6 +2001,7 @@ ToolRegistry.register({
                     </svg>
                   </button>
                   <Show when={kind() === "image"}>
+                    <Show when={data.onAnnotateImage && !proof() && !inputPreview() && props.sessionID && /^image\/(png|jpeg|webp)$/.test(mime())}><button type="button" data-action="annotate-copy" class="absolute left-4 top-4 rounded-md bg-surface-raised-stronger px-3 py-2" onClick={(event) => { event.stopPropagation(); setOpen(false); data.onAnnotateImage?.({ type: "file", id: props.callID ?? "attachment", messageID: "", sessionID: props.sessionID!, url: source(), mime: mime(), filename: name() }) }}>{data.annotateImageLabel ?? "Edit as new copy"}</button></Show>
                     <ZoomableImage
                       src={source()}
                       alt={name()}
@@ -2168,71 +2143,72 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   return (
     <div data-component="tool-part-wrapper" data-timeline-part-id={part().id}>
       <Switch>
-          <Match when={questionStatus()}>
-            {(status) => (
-              <div
-                data-component="question-tool-status"
-                data-status={part().state.status}
-                role="status"
-                aria-live="polite"
-              >
-                <Spinner />
-                <span>{status()}</span>
-              </div>
-            )}
-          </Match>
-          <Match when={error()}>
-            {(error) => {
-              const cleaned = error().replace("Error: ", "")
-              if (part().tool === "question" && cleaned.includes("dismissed this question")) {
-                return (
-                  <div style="width: 100%; display: flex; justify-content: flex-end;">
-                    <span class="text-13-regular text-text-weak cursor-default">
-                      {i18n.t("ui.messagePart.questions.dismissed")}
-                    </span>
-                  </div>
-                )
-              }
+        <Match when={questionStatus()}>
+          {(status) => (
+            <div
+              data-component="question-tool-status"
+              data-status={part().state.status}
+              role="status"
+              aria-live="polite"
+            >
+              <Spinner />
+              <span>{status()}</span>
+            </div>
+          )}
+        </Match>
+        <Match when={part().tool !== "bash" && part().tool !== "multi_agent_fanout" ? error() : undefined}>
+          {(error) => {
+            const cleaned = error().replace("Error: ", "")
+            if (part().tool === "question" && cleaned.includes("dismissed this question")) {
               return (
-                <ToolErrorCard
-                  tool={part().tool}
-                  error={error()}
-                  title={part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider) : undefined}
-                  defaultOpen={props.defaultOpen}
-                  open={controlledOpen()}
-                  onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
-                  subtitle={taskSubtitle()}
-                  href={data.navigateToSession ? undefined : taskHref()}
-                  onSubtitleClick={data.navigateToSession ? openTaskSession : undefined}
-                  onSubtitleAuxClick={data.navigateToSession ? openTaskSession : undefined}
-                />
+                <div style="width: 100%; display: flex; justify-content: flex-end;">
+                  <span class="text-13-regular text-text-weak cursor-default">
+                    {i18n.t("ui.messagePart.questions.dismissed")}
+                  </span>
+                </div>
               )
-            }}
-          </Match>
-          <Match when={true}>
-            <Dynamic
-              component={render()}
-              input={input()}
-              tool={part().tool}
-              sessionID={part().sessionID}
-              callID={part().callID || part().id}
-              metadata={partMetadata()}
-              // @ts-expect-error
-              output={part().state.output}
-              status={part().state.status}
-              // @ts-expect-error — attachments only exist on completed tool state
-              attachments={part().state.attachments}
-              hideDetails={props.hideDetails}
-              defaultOpen={props.defaultOpen}
-              open={controlledOpen()}
-              onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
-              deferContent={props.deferToolContent}
-              virtualizeDiff={props.virtualizeDiff}
-              onContentRendered={props.onContentRendered}
-              action={action()}
-              hoverTitle={hoverTitle()}
-            />
-          </Match>
+            }
+            return (
+              <ToolErrorCard
+                tool={part().tool}
+                error={error()}
+                title={part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider) : undefined}
+                defaultOpen={props.defaultOpen}
+                open={controlledOpen()}
+                onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
+                subtitle={taskSubtitle()}
+                href={data.navigateToSession ? undefined : taskHref()}
+                onSubtitleClick={data.navigateToSession ? openTaskSession : undefined}
+                onSubtitleAuxClick={data.navigateToSession ? openTaskSession : undefined}
+              />
+            )
+          }}
+        </Match>
+        <Match when={true}>
+          <Dynamic
+            component={render()}
+            input={input()}
+            tool={part().tool}
+            sessionID={part().sessionID}
+            callID={part().callID || part().id}
+            metadata={partMetadata()}
+            // @ts-expect-error
+            output={part().state.output}
+            status={part().state.status}
+            error={error()}
+            // @ts-expect-error — attachments only exist on completed tool state
+            attachments={part().state.attachments}
+            hideDetails={props.hideDetails}
+            defaultOpen={props.defaultOpen}
+            open={controlledOpen()}
+            onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
+            deferContent={props.deferToolContent}
+            virtualizeDiff={props.virtualizeDiff}
+            onContentRendered={props.onContentRendered}
+            action={action()}
+            hoverTitle={hoverTitle()}
+          />
+        </Match>
       </Switch>
     </div>
   )
@@ -2379,7 +2355,13 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
           <Show
             when={streaming()}
             fallback={
-              <Markdown text={text()} cacheKey={part().id} streaming={false} resolveImageSrc={resolveImageSrc()} readFile={props.readFile} />
+              <Markdown
+                text={text()}
+                cacheKey={part().id}
+                streaming={false}
+                resolveImageSrc={resolveImageSrc()}
+                readFile={props.readFile}
+              />
             }
           >
             <PacedMarkdown
@@ -2450,7 +2432,9 @@ PART_MAPPING["custom"] = function CustomPartDisplay(props) {
                 {(title) => <div class="mb-1 text-13-medium text-text-strong">{title()}</div>}
               </Show>
               <Show when={part().fallback} fallback={<span>{part().kind}</span>}>
-                {(fallback) => <Markdown text={fallback()} cacheKey={part().id} streaming={false} readFile={props.readFile} />}
+                {(fallback) => (
+                  <Markdown text={fallback()} cacheKey={part().id} streaming={false} readFile={props.readFile} />
+                )}
               </Show>
             </div>
           }
@@ -2473,7 +2457,10 @@ PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
   return (
     <Show when={text()}>
       <div data-component="reasoning-part" data-timeline-part-id={part().id}>
-        <Show when={streaming()} fallback={<Markdown text={text()} cacheKey={part().id} streaming={false} readFile={props.readFile} />}>
+        <Show
+          when={streaming()}
+          fallback={<Markdown text={text()} cacheKey={part().id} streaming={false} readFile={props.readFile} />}
+        >
           <PacedMarkdown text={text()} cacheKey={part().id} streaming={streaming()} readFile={props.readFile} />
         </Show>
       </div>
@@ -2760,15 +2747,134 @@ ToolRegistry.register({
 })
 
 ToolRegistry.register({
+  name: "multi_agent_fanout",
+  render(props) {
+    const i18n = useI18n()
+    const data = useData()
+    const location = useLocation()
+    const reviewers = createMemo(() => reviewerDetails(props.metadata))
+    const labels = () => ({
+      queued: i18n.t("ui.tool.details.queued"),
+      starting: i18n.t("ui.tool.details.starting"),
+      running: i18n.t("ui.tool.details.running"),
+      completed: i18n.t("ui.tool.details.completed"),
+      repaired: i18n.t("ui.tool.details.repaired"),
+      partial: i18n.t("ui.tool.details.partial"),
+      error: i18n.t("ui.tool.details.failed"),
+      unknown: i18n.t("ui.tool.details.unknown"),
+    })
+    return (
+      <BasicTool
+        {...props}
+        icon="brain"
+        inspectWhileRunning
+        defer={props.deferContent}
+        trigger={{ title: i18n.t("ui.tool.details.fanout"), subtitle: stringField(props.input, "workflow") }}
+      >
+        <div data-component="fanout-details">
+          <Show when={stringField(props.input, "prompt")}>
+            {(prompt) => <pre data-slot="fanout-prompt">{prompt()}</pre>}
+          </Show>
+          <Index each={reviewers()}>
+            {(reviewer) => (
+              <section data-slot="fanout-reviewer" data-status={reviewer().state}>
+                <div data-slot="fanout-reviewer-heading">
+                  <strong>
+                    {reviewer().model}
+                    {reviewer().variant ? ` · ${reviewer().variant}` : ""}
+                  </strong>
+                  <span role="status">{labels()[reviewer().state]}</span>
+                </div>
+                <Show when={reviewer().sessionID}>
+                  {(id) => (
+                    <a
+                      href={sessionLink(id(), location.pathname, data.sessionHref)}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (
+                          event.button !== 0 ||
+                          event.ctrlKey ||
+                          event.metaKey ||
+                          event.shiftKey ||
+                          event.altKey ||
+                          !data.navigateToSession
+                        )
+                          return
+                        event.preventDefault()
+                        data.navigateToSession(id())
+                      }}
+                    >
+                      {i18n.t("ui.tool.details.openSession")}
+                    </a>
+                  )}
+                </Show>
+                <Show when={reviewer().text}>
+                  <pre data-slot="fanout-result">{reviewer().text}</pre>
+                </Show>
+                <Show when={reviewer().recovery}>
+                  {(recovery) => (
+                    <div data-slot="fanout-recovery">
+                      <Show when={recovery().issues.length}>
+                        <details><summary>{i18n.t("ui.tool.details.issues")}</summary>
+                          <pre>{recovery().issues.join("\n")}</pre>
+                        </details>
+                      </Show>
+                      <details><summary>{i18n.t("ui.tool.details.original")}</summary>
+                        <pre data-slot="fanout-original">{recovery().original}</pre>
+                      </details>
+                      <Show when={recovery().repaired}>
+                         {(text) => <details><summary>{i18n.t(recovery().repairStatus === "success" ? "ui.tool.details.repair" : "ui.tool.details.repairFailed")}</summary><pre>{text()}</pre></details>}
+                      </Show>
+                    </div>
+                  )}
+                </Show>
+                <Show when={reviewer().state === "unknown"}>
+                  <p data-slot="fanout-reviewer-unknown">{i18n.t("ui.tool.details.unknownReason")}</p>
+                </Show>
+              </section>
+            )}
+          </Index>
+          <Show when={reviewers().length === 0}>
+            <p data-slot="tool-detail-meta">{i18n.t("ui.tool.details.waitingReviewers")}</p>
+            <Show when={props.output}>
+              <pre data-slot="fanout-result">{props.output}</pre>
+            </Show>
+          </Show>
+          <Show when={props.error}>
+            <p role="alert">{props.error}</p>
+          </Show>
+        </div>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
   name: "bash",
   render(props) {
     const i18n = useI18n()
+    const capture = createMemo(() => record(props.metadata.capture))
+    const captureUrl = createMemo(() => {
+      const uri = capture()?.uri
+      if (typeof uri !== "string" || !uri.startsWith("attachment://") || !props.sessionID) return
+      return contentUrl({
+        id: "shell-capture",
+        messageID: "shell-capture",
+        sessionID: props.sessionID,
+        type: "file",
+        mime: "text/plain",
+        url: uri,
+      })
+    })
     const pending = () => props.status === "pending" || props.status === "running"
     const sawPending = pending()
     const text = createMemo(() => {
       const cmd = stringField(props.input, "command") ?? stringField(props.metadata, "command") ?? ""
-      const out = stripAnsi(props.output || stringField(props.metadata, "output") || "").replace(/\r\n?/g, "\n")
-      return `$ ${cmd}${out ? "\n\n" + out : ""}`
+      const out = stripAnsi(stringField(props.metadata, "output") || props.output || "").replace(/\r\n?/g, "\n")
+      const warnings = Array.isArray(props.metadata.warnings)
+        ? props.metadata.warnings.filter((value): value is string => typeof value === "string")
+        : []
+      return `$ ${cmd || i18n.t("ui.tool.details.preparing")}${out ? "\n\n" + out : ""}${warnings.length ? "\n\n" + warnings.join("\n") : ""}${props.error ? "\n\n" + props.error : ""}`
     })
     const description = createMemo(() => stringField(props.input, "description"))
     const [copied, setCopied] = createSignal(false)
@@ -2786,6 +2892,8 @@ ToolRegistry.register({
       <BasicTool
         {...props}
         icon="console"
+        inspectWhileRunning
+        defer={props.deferContent}
         trigger={
           <div data-slot="basic-tool-tool-info-structured">
             <div data-slot="basic-tool-tool-info-main">
@@ -2817,9 +2925,35 @@ ToolRegistry.register({
             </Tooltip>
           </div>
           <div data-slot="bash-scroll" data-scrollable>
+            <Show when={stringField(props.metadata, "cwd") ?? stringField(props.input, "workdir")}>
+              {(cwd) => <p data-slot="tool-detail-meta">{cwd()}</p>}
+            </Show>
             <pre data-slot="bash-pre">
               <code>{text()}</code>
             </pre>
+            <Show when={pending() && !stringField(props.metadata, "output")}>
+              <p data-slot="tool-detail-meta">{i18n.t("ui.tool.details.waitingOutput")}</p>
+            </Show>
+            <Show when={props.metadata.truncated === true}>
+              <p data-slot="tool-detail-meta">{i18n.t("ui.tool.details.truncated")}</p>
+            </Show>
+            <Show when={captureUrl()}>
+              {(url) => (
+                <a href={url()} target="_blank" rel="noopener noreferrer">
+                  {i18n.t(
+                    capture()?.complete === true ? "ui.tool.details.fullCapture" : "ui.tool.details.partialCapture",
+                  )}
+                </a>
+              )}
+            </Show>
+            <Show when={typeof props.metadata.exitCode === "number"}>
+              <p data-slot="tool-detail-meta">
+                {i18n.t("ui.tool.details.exitCode", { code: String(props.metadata.exitCode) })}
+              </p>
+            </Show>
+            <Show when={props.metadata.timedOut === true}>
+              <p data-slot="tool-detail-meta">{i18n.t("ui.tool.details.timedOut")}</p>
+            </Show>
           </div>
         </div>
       </BasicTool>
@@ -2902,9 +3036,7 @@ ToolRegistry.register({
                 </Show>
               </div>
               <div data-slot="message-part-actions">
-                <Show when={!pending() && changes()}>
-                  {(value) => <DiffChanges changes={value()} />}
-                </Show>
+                <Show when={!pending() && changes()}>{(value) => <DiffChanges changes={value()} />}</Show>
               </div>
             </div>
           }
@@ -2912,11 +3044,7 @@ ToolRegistry.register({
           <Show when={path()}>
             <ToolFileAccordion
               path={path()}
-              actions={
-                <Show when={!pending() && changes()}>
-                  {(value) => <DiffChanges changes={value()} />}
-                </Show>
-              }
+              actions={<Show when={!pending() && changes()}>{(value) => <DiffChanges changes={value()} />}</Show>}
             >
               <div data-component="edit-content">
                 <Dynamic

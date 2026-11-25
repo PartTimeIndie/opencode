@@ -140,7 +140,7 @@ describe("createServerProjects", () => {
         projects: {
           local: [
             { worktree: "C:\\GitRepros\\opencode", expanded: true },
-            { worktree: "c:/gitrepros/opencode/", expanded: true },
+            { worktree: "c:/gitrepros/opencode/./", expanded: true },
           ],
         },
         lastProject: {},
@@ -149,12 +149,13 @@ describe("createServerProjects", () => {
 
       expect(projects.list()).toEqual([{ worktree: "C:\\GitRepros\\opencode", expanded: true }])
 
-      projects.open("C:/GITREPROS/OPENCODE")
-      expect(projects.list()).toHaveLength(1)
+      projects.open("C:/GITREPROS/OPENCODE/./")
+      projects.open("D:/GITREPROS/OPENCODE")
+      expect(projects.list()).toHaveLength(2)
 
       projects.close("c:/GitRepros/OpenCode")
-      expect(projects.list()).toEqual([])
-      expect(store.projects.local).toEqual([])
+      expect(projects.list()).toEqual([{ worktree: "D:/GITREPROS/OPENCODE", expanded: true }])
+      expect(store.projects.local).toEqual(projects.list())
       dispose()
     })
   })

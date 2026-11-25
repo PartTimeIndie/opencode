@@ -81,3 +81,57 @@ describe("session browser dock URL handling", () => {
     expect(crashedWebviewAction("clean-exit")).toBe("ignore")
   })
 })
+
+describe("destroyed webview guest recovery", () => {
+  // Electron throws "Object has been destroyed" once a webview guest is gone
+  // (for example a background eviction). The dock status must report the
+  // destroyed marker instead of throwing, so the controller can rebuild the
+  // frame and the automation bridge keeps working.
+  test("reports a destroyed webview as loading with the destroyed marker", () => {
+    const webview = {
+      getAttribute: (name: string) => (name === "src" ? "https://example.com/" : null),
+      getWebContentsId: () => {
+        throw new Error("Object has been destroyed")
+      },
+    }
+
+    expect(readBrowserWebviewStatus(webview, "https://fallback.test/", true)).toEqual({
+      actualURL: "https://example.com/",
+      loading: true,
+      destroyed: true,
+    })
+  })
+
+  test("does not surface the destroyed marker for a live webview", () => {
+    const webview = {
+      getAttribute: (name: string) => (name === "src" ? "https://example.com/" : null),
+      getURL: () => "https://example.com/live",
+      isLoading: () => false,
+      getWebContentsId: () => 7,
+    }
+
+    const status = readBrowserWebviewStatus(webview, "https://fallback.test/", true)
+    expect(status).toEqual({
+      actualURL: "https://example.com/live",
+      loading: false,
+      webContentsID: 7,
+    })
+    expect("destroyed" in status).toBe(false)
+  })
+
+  test("recovers when any native webview method hits the destroyed guest", () => {
+    const webview = {
+      getAttribute: (name: string) => (name === "src" ? "https://example.com/" : null),
+      getWebContentsId: () => 42,
+      getURL: () => {
+        throw new Error("Object has been destroyed")
+      },
+    }
+
+    expect(readBrowserWebviewStatus(webview, "https://fallback.test/", true)).toEqual({
+      actualURL: "https://example.com/",
+      loading: true,
+      destroyed: true,
+    })
+  })
+})

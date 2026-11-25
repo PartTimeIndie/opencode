@@ -1,5 +1,6 @@
 import type { AppPluginApi } from "@opencode-ai/plugin/app"
 import { composerRegistry } from "./composer-registry"
+import { composerSendIntents } from "./composer-send-intent"
 
 type Composer = AppPluginApi["host"]["composer"]
 
@@ -14,6 +15,10 @@ export function createComposerApi(input: {
 }, registry = composerRegistry): Composer {
   const available = () => input.active() && !input.signal.aborted && input.serverID === input.currentServer()
   return {
+    registerSendPreparation(target, preparation) {
+      if (!available()) return () => {}
+      return input.track(composerSendIntents.register({ ...target, serverID: input.serverID }, preparation, input.signal))
+    },
     read(target) {
       if (!available()) return
       return registry.read({ ...target, serverID: input.serverID })

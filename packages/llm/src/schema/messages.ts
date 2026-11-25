@@ -295,6 +295,8 @@ export class LLMRequest extends Schema.Class<LLMRequest>("LLM.Request")({
   id: Schema.optional(Schema.String),
   model: ModelSchema,
   system: Schema.Array(SystemPart),
+  // Trusted caller context, privileged and after history. Never a chronological operator update.
+  runtimeContext: Schema.optional(Schema.Array(SystemPart)),
   messages: Schema.Array(Message),
   tools: Schema.Array(ToolDefinition),
   toolChoice: Schema.optional(ToolChoice),
@@ -314,6 +316,7 @@ export namespace LLMRequest {
     id: request.id,
     model: request.model,
     system: request.system,
+    runtimeContext: request.runtimeContext,
     messages: request.messages,
     tools: request.tools,
     toolChoice: request.toolChoice,

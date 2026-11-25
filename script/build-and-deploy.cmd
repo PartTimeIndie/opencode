@@ -8,5 +8,5 @@ if errorlevel 1 (
   exit /b 1
 )
 cd /d "%REPO_ROOT%"
-bun run desktop:deploy automatic %*
+bun run desktop:deploy automatic --prompt-stale-cancel %*
 exit /b %ERRORLEVEL%

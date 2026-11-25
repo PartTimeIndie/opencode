@@ -236,7 +236,11 @@ describe("ToolRegistry", () => {
       const definitions = yield* toolDefinitions(service)
       expect(definitions[0]?.description).toBe("Hooked echo")
       expect(definitions[0]?.inputSchema).toMatchObject({ description: "hooked schema" })
+      const catalog = yield* service.catalog()
+      expect(catalog[0]?.description).toBe("Hooked echo")
+      expect(catalog[0]?.parameters).toEqual(definitions[0]?.inputSchema)
       yield* plugin.remove(id)
+      expect((yield* service.catalog())[0]?.description).toBe("Echo text")
     }),
   )
 

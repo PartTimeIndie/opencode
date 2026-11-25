@@ -19,3 +19,22 @@ matching `packages/opencode` CLI flow.
    worker.
 6. A successful deploy report must include the prod marker path, backup path,
    and deployed ASAR version, represented by the staged artifact SHA-256.
+
+## Native storage-worker verification failures
+
+The storage verifier runs a real Electron-as-Node worker and a nested session
+worker against a temporary database. Run `bun run verify:storage-worker-sidecar`
+from `packages/desktop` to investigate it without deploying, restarting the
+installed app or opening the production database. Keep the original failed log
+and distinguish the outer verifier from the nested worker named in its stack.
+
+A native `InitializeBundledRootCertificates` / X509 assertion is not a database
+migration validation error. Check the exact Electron/Node versions, inherited
+TLS-related environment variable names (never secret values), and available
+memory before attributing a cause. A separate local `node:tls` root-certificate
+initialization probe needs no network connection. Passing current probes or a
+later isolated migration does not establish the historical cause or prove a fix.
+Do not disable certificate validation, add automatic retries, skip the verifier
+or relabel an old failed/recovering deployment as successful. Run relevant
+worker/migration contracts and package typechecks before the next authorized
+build; deployed readiness still requires that build's own complete verification.

@@ -1,5 +1,7 @@
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
+import { toolDetailsMetadata } from "@opencode-ai/core/util/tool-details"
 import { latestMessage } from "@/utils/message-order"
+import { recoveryNotice } from "./recovery-notice"
 
 type StreamEvent = {
   id?: string
@@ -60,6 +62,7 @@ export function createSessionLiveProjection() {
 
 const LIVE_EVENT_TYPES = new Set([
   "session.next.prompt.promoted",
+  "session.next.context.updated",
   "session.next.shell.started",
   "session.next.shell.ended",
   "session.next.step.started",
@@ -135,6 +138,14 @@ function project(
   assistants: Map<string, EventEvidence>,
 ): LiveProjectionAction | undefined {
   const sessionID = data.sessionID as string
+  if (type === "session.next.context.updated") {
+    if (typeof data.messageID !== "string" || !data.messageID.startsWith("msg_crash_") ||
+      typeof data.timestamp !== "number" || typeof data.text !== "string") return
+    const parent = latestMessage((store.message[sessionID] ?? []).filter((message) => message.role === "user"))
+    if (!parent) return
+    const notice = recoveryNotice(sessionID, { id: data.messageID, text: data.text, time: { created: data.timestamp } }, parent.id)
+    return { kind: "message", sessionID, ...notice }
+  }
   if (type === "session.next.prompt.promoted") return projectPromotedPrompt(sessionID, data, store)
   if (type === "session.next.step.started") return startAssistant(sessionID, data, store)
   if (type === "session.next.step.ended" || type === "session.next.step.failed")
@@ -392,7 +403,11 @@ function projectTool(
           : "pending"
   const evidenceKey = `${sessionID}\n${data.assistantMessageID}\n${data.callID}`
   const currentEvidence = evidence.get(evidenceKey)
-  if ((existingState?.status === "completed" || existingState?.status === "error") && incomingStatus !== "completed" && incomingStatus !== "error")
+  if (
+    (existingState?.status === "completed" || existingState?.status === "error") &&
+    incomingStatus !== "completed" &&
+    incomingStatus !== "error"
+  )
     return { kind: "handled", sessionID }
   const fallback =
     existingState && "time" in existingState && existingState.time
@@ -473,7 +488,10 @@ function projectTool(
         status: "error" as const,
         input: currentInput,
         error: typeof error?.message === "string" ? error.message : "Unknown error",
-        metadata: toolMetadata(tool, undefined, record(record(data.provider)?.metadata)),
+        metadata: toolMetadata(tool, undefined, {
+          ...(existingState && "metadata" in existingState ? existingState.metadata : {}),
+          ...record(record(data.provider)?.metadata),
+        }),
         time: { start: currentStart, end: data.timestamp },
       },
     }
@@ -532,7 +550,7 @@ function toolOutput(value: unknown) {
 }
 
 function toolMetadata(tool: string, structured?: Record<string, unknown>, metadata?: Record<string, unknown>) {
-  if (tool !== "task" || !structured) return metadata ?? {}
+  if (tool !== "task" || !structured) return toolDetailsMetadata(tool, structured, metadata)
   return {
     ...metadata,
     ...(typeof structured.task_id === "string" && structured.task_id ? { task_id: structured.task_id } : {}),

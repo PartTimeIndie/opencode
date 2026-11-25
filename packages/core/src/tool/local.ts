@@ -12,6 +12,7 @@ import { Npm } from "../npm"
 import { PermissionV2 } from "../permission"
 import { Surface } from "../surface"
 import { SessionPlanDocument } from "../session/plan-document"
+import { NativeJob } from "../session/native-job"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
 
@@ -23,6 +24,7 @@ type LocalToolContext = {
   readonly directory: string
   readonly worktree: string
   readonly abort: AbortSignal
+  readonly explicitInvocation?: Tool.Context["explicitInvocation"]
   readonly metadata: (input: { readonly title?: string; readonly metadata?: Record<string, unknown> }) => void
   readonly ask: (input: unknown) => Promise<void>
   readonly customPart: (input: unknown) => Promise<void>
@@ -30,6 +32,9 @@ type LocalToolContext = {
     readonly planDocument: () => Promise<SessionPlanDocument.Info | undefined>
     readonly actionInvocations: () => Promise<Surface.SessionActionInvocation[]>
   }
+  /** Host bridge into another physical checkout's native task runtime. Absent
+   * where the host owns no Location map; it never grants write consent. */
+  readonly nativeJob?: NativeJob.NativeJobBridge
 }
 
 type LocalToolMetadata = {
@@ -42,6 +47,7 @@ type LocalToolDefinition = {
   readonly alwaysVisible?: boolean
   /** Contract marker that scopes the advertised tool to matching current-prompt turns. */
   readonly contractMarker?: string
+  readonly explicitInvocation?: string | ReadonlyArray<string>
   readonly budgetCategory?: "read" | "poll" | "other"
   readonly args: ZodRawShape
   readonly execute: (args: Record<string, unknown>, context: LocalToolContext) => Promise<LocalToolResult>
@@ -243,7 +249,8 @@ const load = Effect.fn("LocalTool.load")(function* (entry: Entry, location: Loca
   const permission = yield* Effect.serviceOption(PermissionV2.Service)
   const documents = yield* Effect.serviceOption(SessionPlanDocument.Service)
   const surface = yield* Effect.serviceOption(Surface.Service)
-  return [entry.name, adapt(definition, location, { permission, documents, surface }, entry)] as const
+  const nativeJob = yield* Effect.serviceOption(NativeJob.Bridge)
+  return [entry.name, adapt(definition, location, { permission, documents, surface, nativeJob }, entry)] as const
 })
 
 function parseManifest(input: string, directory: string) {
@@ -291,10 +298,12 @@ export function adapt(
     readonly permission: Option.Option<PermissionV2.Interface>
     readonly documents: Option.Option<SessionPlanDocument.Interface>
     readonly surface: Option.Option<Surface.Interface>
+    readonly nativeJob?: Option.Option<NativeJob.NativeJobBridge>
   },
   entry?: Entry,
 ) {
   const input = z.object(definition.args)
+  const nativeJob = services.nativeJob?._tag === "Some" ? services.nativeJob.value : undefined
   const tool = Tool.make({
     description: entry?.description ?? definition.description,
     ...(definition.budgetCategory ? { budgetCategory: () => definition.budgetCategory! } : {}),
@@ -318,6 +327,7 @@ export function adapt(
             directory: location.directory,
             worktree: location.project.directory,
             abort,
+            ...(context.explicitInvocation ? { explicitInvocation: context.explicitInvocation } : {}),
             metadata: (input) => metadata.push(input),
             ask: (input) => {
               if (!isAskInput(input) || services.permission._tag === "None") return unsupported("ask")()
@@ -344,6 +354,7 @@ export function adapt(
                   ? Effect.runPromise(services.surface.value.actionInvocations(context.sessionID)).then((items) => [...items])
                   : Promise.resolve([]),
             },
+            ...(nativeJob ? { nativeJob } : {}),
           })
           return normalizeResult(result, metadata)
         },
@@ -356,12 +367,18 @@ export function adapt(
     : definition.alwaysVisible
       ? Tool.withAlwaysVisible(tool)
       : tool
-  return Tool.withCatalog(scoped, {
-    scope: "location",
-    project: entry?.placement === "project" ? entry.project ?? path.basename(location.project.directory) : undefined,
-    source: entry?.file,
-    version: entry?.version,
-  })
+  return Tool.withCatalog(
+    definition.explicitInvocation !== undefined
+      ? Tool.withExplicitInvocation(scoped, definition.explicitInvocation)
+      : scoped,
+    {
+      scope: "location",
+      project:
+        entry?.placement === "project" ? (entry.project ?? path.basename(location.project.directory)) : undefined,
+      source: entry?.file,
+      version: entry?.version,
+    },
+  )
 }
 
 function isAskInput(input: unknown): input is {

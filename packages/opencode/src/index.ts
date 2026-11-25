@@ -11,6 +11,7 @@ import { ModelsCommand } from "./cli/cmd/models"
 import { UI } from "./cli/ui"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { FormatError } from "./cli/error"
+import { stripLauncherExecArgs } from "./cli/launcher-args"
 import { ServeCommand } from "./cli/cmd/serve"
 import { DebugCommand } from "./cli/cmd/debug"
 import { StatsCommand } from "./cli/cmd/stats"
@@ -31,7 +32,7 @@ import { errorMessage } from "@opencode-ai/core/util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
-const args = hideBin(process.argv)
+const args = stripLauncherExecArgs(hideBin(process.argv))
 
 function show(out: string) {
   const text = out.trimStart()

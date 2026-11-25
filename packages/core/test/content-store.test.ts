@@ -15,6 +15,9 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { testEffect } from "./lib/effect"
 import { tmpdir } from "./fixture/tmpdir"
+import { execFile } from "node:child_process"
+import { readFile, writeFile } from "node:fs/promises"
+import { promisify } from "node:util"
 
 const sessionID = SessionV2.ID.make("ses_content_store")
 const it = testEffect(Layer.empty)
@@ -57,6 +60,44 @@ const withStore = <A, E, R>(
   )
 
 describe("ContentStore", () => {
+  it.live("unpacks an archive only with explicit per-attachment consent and preserves ownership", () =>
+    withStore(({ store, root }) =>
+      Effect.gen(function* () {
+        const bytes = yield* Effect.promise(async () => {
+          await writeFile(path.join(root, "save.json"), '{"cards":[]}')
+          const archive = path.join(root, "save.tar")
+          await promisify(execFile)("tar", ["--format", "ustar", "-cf", archive, "-C", root, "save.json"], {
+            windowsHide: true,
+          })
+          return await readFile(archive)
+        })
+        const original = FileAttachment.create({
+          uri: `data:application/x-compressed;base64,${bytes.toString("base64")}`,
+          mime: "application/x-compressed",
+          name: "save.7z",
+          unpack: true,
+        })
+        const prompt = yield* store.normalizePrompt({
+          sessionID,
+          messageID: SessionMessage.ID.make("msg_unpack"),
+          prompt: new Prompt({ text: "Read the savegame", files: [original] }),
+        })
+        const file = prompt.files![0]!
+        expect(file.unpack).toBe(true)
+        const plain = yield* store.materialize({ sessionID, file: FileAttachment.create({ ...file, unpack: false }) })
+        expect(plain.mime).toBe("application/x-compressed")
+        const unpacked = yield* store.materialize({ sessionID, file })
+        expect(unpacked.mime).toBe("text/plain")
+        const manifest = Buffer.from(unpacked.uri.split(",")[1]!, "base64").toString("utf8")
+        expect(manifest).toContain('"save.json"')
+        expect(manifest).toContain("unpacked locally at the user's request")
+        expect((yield* store.materialize({ sessionID, file })).uri).toBe(unpacked.uri)
+        expect((yield* store.resolve({ sessionID, uri: file.uri }))?.bytes).toEqual(new Uint8Array(bytes))
+        expect(Exit.isFailure(yield* Effect.exit(store.materialize({ sessionID: "ses_other", file })))).toBe(true)
+      }),
+    ),
+  )
+
   it.live("deduplicates inline media and materializes it on demand", () =>
     withStore(({ store, db }) =>
       Effect.gen(function* () {
@@ -285,7 +326,9 @@ describe("ContentStore", () => {
         expect(Buffer.byteLength(provider.$opencode?.preview ?? "", "utf8")).toBeLessThanOrEqual(
           ToolOutputStore.MAX_PROVIDER_PREVIEW_BYTES,
         )
-        expect(provider.$opencode?.preview).not.toContain(`"report":"${"x".repeat(ToolOutputStore.MAX_STRUCTURED_BYTES)}`)
+        expect(provider.$opencode?.preview).not.toContain(
+          `"report":"${"x".repeat(ToolOutputStore.MAX_STRUCTURED_BYTES)}`,
+        )
       }),
     ),
   )
@@ -340,9 +383,7 @@ describe("ContentStore", () => {
           MAX_PERSISTED_CONTENT_PREVIEW_BYTES,
         )
         const structured = bounded.output.structured as { output: string; $opencode?: { text?: { uri?: string } } }
-        expect(Buffer.byteLength(structured.output, "utf8")).toBeLessThanOrEqual(
-          MAX_PERSISTED_CONTENT_PREVIEW_BYTES,
-        )
+        expect(Buffer.byteLength(structured.output, "utf8")).toBeLessThanOrEqual(MAX_PERSISTED_CONTENT_PREVIEW_BYTES)
         const metadata = bounded.output.structured as { $opencode?: { text?: { uri?: string } } }
         expect(metadata.$opencode?.text?.uri).toStartWith(ContentStore.URI_PREFIX)
         const resolved = yield* store.resolve({ uri: metadata.$opencode!.text!.uri!, sessionID })
@@ -414,9 +455,7 @@ describe("ContentStore", () => {
           MAX_PERSISTED_CONTENT_PREVIEW_BYTES,
         )
         const structured = bounded.output.structured as { output: string; $opencode?: { text?: { uri?: string } } }
-        expect(Buffer.byteLength(structured.output, "utf8")).toBeLessThanOrEqual(
-          MAX_PERSISTED_CONTENT_PREVIEW_BYTES,
-        )
+        expect(Buffer.byteLength(structured.output, "utf8")).toBeLessThanOrEqual(MAX_PERSISTED_CONTENT_PREVIEW_BYTES)
         expect((yield* db.select({ value: count() }).from(ContentBlobTable).get())?.value).toBe(1)
         expect((yield* db.select({ value: count() }).from(AttachmentTable).get())?.value).toBe(1)
         const materialized = yield* outputs.materialize({ sessionID, output: bounded.output })

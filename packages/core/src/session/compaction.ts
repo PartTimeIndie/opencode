@@ -15,6 +15,32 @@ import { isProviderStreamInactivity, providerStreamIdleTimeouts, withProviderStr
 
 const DEFAULT_BUFFER = 20_000
 const DEFAULT_KEEP_TOKENS = 8_000
+// A slash-command workflow (skill instructions, its required user questions)
+// lives in exactly one durable user message or one completed skill-tool result.
+// Summarizing that source loses the workflow, so compaction carries it verbatim
+// up to this budget, mirroring the durable todo state.
+export const DEFAULT_COMMAND_CONTEXT_TOKENS = 2_000
+const COMMAND_CONTEXT_OPEN = "[durable-command-invocation]"
+const COMMAND_CONTEXT_CLOSE = "[/durable-command-invocation]"
+const COMMAND_CONTEXT_PREAMBLE =
+  "The slash-command workflow below stays active across this checkpoint; continue following it, including its required user questions."
+const COMMAND_CONTEXT_TRUNCATED =
+  "[Earlier command text omitted because it exceeds the compaction carry budget.]"
+const COMMAND_CONTEXT_CARRIED =
+  /\[durable-command-invocation\]\n([\s\S]*?)\n\[\/durable-command-invocation\]/g
+// Same token boundaries as SkillV2.invokedBySlash so the compaction carry and
+// consent checks agree on what counts as a command reference.
+const COMMAND_TOKEN = /(?:^|\s)\/([A-Za-z0-9][A-Za-z0-9._-]*)(?=\s|$)/g
+const SKILL_CONTRACT_HEADER = /^<skill_content name="([^"]+)">/
+// Marker, preamble, truncation marker and separators are part of every carried
+// block; reserving their estimate once keeps initial emission and re-carries
+// idempotent under the same budget.
+const COMMAND_CONTEXT_RESERVED =
+  Token.estimate(COMMAND_CONTEXT_OPEN) +
+  Token.estimate(COMMAND_CONTEXT_PREAMBLE) +
+  Token.estimate(COMMAND_CONTEXT_CLOSE) +
+  Token.estimate(COMMAND_CONTEXT_TRUNCATED) +
+  8
 const SUMMARY_RETRY_MIN_INPUT_TOKENS = 50_000
 // Matches the session runner's provider retry budget: transient summary failures such as a
 // stream that ends without a finish reason are retried before compaction gives up.
@@ -92,6 +118,7 @@ type Dependencies = {
   }
   readonly config: readonly Config.Entry[]
   readonly streamIdleTimeouts?: ReturnType<typeof providerStreamIdleTimeouts>
+  readonly beforeRequest?: (sessionID: SessionSchema.ID) => Effect.Effect<void, SummaryFailed>
   readonly loadCurrent?: (sessionID: SessionSchema.ID) => Effect.Effect<{
     readonly entries: readonly Entry[]
     readonly todos: readonly { readonly content: string; readonly status: string; readonly priority: string }[]
@@ -102,6 +129,9 @@ type Dependencies = {
     readonly detached?: boolean
     readonly canSummarize: (model: Model) => boolean
   }) => Effect.Effect<Model | undefined>
+  // Known slash-command/skill names used to detect the still-active command
+  // invocation that compaction carries verbatim into the checkpoint.
+  readonly commandNames?: Effect.Effect<ReadonlySet<string>>
 }
 
 type SummaryResult = { readonly summary?: string; readonly contextOverflow: boolean }
@@ -231,6 +261,103 @@ const serializeTodos = (
     : ["[Durable todo state]", ...todos.map((todo) => `- [${todo.status}] (${todo.priority}) ${todo.content}`)].join(
         "\n",
       )
+
+const referencesCommand = (text: string, commandNames: ReadonlySet<string>) => {
+  for (const [, name] of text.matchAll(COMMAND_TOKEN)) if (commandNames.has(name)) return true
+  return false
+}
+
+const referencedCommandNames = (text: string, commandNames: ReadonlySet<string>) =>
+  [
+    ...new Set(
+      Array.from(text.matchAll(COMMAND_TOKEN), ([, name]) => name).filter((name) => commandNames.has(name)),
+    ),
+  ].sort()
+
+// The workflow body arrives through a completed skill-tool result on the plain
+// prompt path (composer-appended slash tokens), not only through command
+// admission, so completed skill contracts are carry sources too.
+const skillContractOutput = (message: SessionMessage.Message, commandNames: ReadonlySet<string>) => {
+  if (message.type !== "assistant") return
+  for (const part of message.content) {
+    if (part.type !== "tool" || part.name !== "skill" || part.state.status !== "completed") continue
+    for (const item of part.state.content) {
+      if (item.type !== "text") continue
+      const name = SKILL_CONTRACT_HEADER.exec(item.text)?.[1]
+      if (name !== undefined && commandNames.has(name)) return item.text
+    }
+  }
+}
+
+// Keep the head when bounding: command and skill contracts state their binding
+// workflow at the top, so dropping the tail is safer than dropping the start.
+const boundCommandContext = (text: string, maxTokens: number) => {
+  if (Token.estimate(text) <= maxTokens) return text
+  const marker = `\n${COMMAND_CONTEXT_TRUNCATED}`
+  return text.slice(0, Math.max(0, maxTokens * 4 - marker.length)) + marker
+}
+
+/**
+ * Returns the still-active slash-command workflow that compaction must carry
+ * verbatim into the checkpoint. `fresh` tells callers whether the text contains
+ * post-checkpoint content (`true` — include it in the summarizer context) or
+ * only blocks already carried by the latest checkpoint (`false` — that
+ * checkpoint's recent context already includes them).
+ */
+export const durableCommandContext = (
+  entries: readonly Entry[],
+  commandNames: ReadonlySet<string>,
+  maxTokens: number = DEFAULT_COMMAND_CONTEXT_TOKENS,
+): { readonly text: string; readonly fresh: boolean } => {
+  const payloadBudget = maxTokens - COMMAND_CONTEXT_RESERVED
+  if (payloadBudget <= 0 || commandNames.size === 0) return { text: "", fresh: false }
+  // Preserve every block the latest checkpoint carried so a newer reference to
+  // a different command cannot silently drop an active workflow.
+  let carried: string[] = []
+  let carriedBoundary = -1
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!
+    if (entry.message.type !== "compaction") continue
+    const matches = [...entry.message.recent.matchAll(COMMAND_CONTEXT_CARRIED)]
+    if (matches.length === 0) continue
+    carried = matches.map((match) => match[1]!.trim())
+    carriedBoundary = entry.seq
+    break
+  }
+  // Newest post-checkpoint source wins as the fresh block: a completed skill
+  // contract (the real workflow body) or a user message referencing a command.
+  let freshBlock: string | undefined
+  let freshFromUser = false
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!
+    if (entry.seq <= carriedBoundary) break
+    const message = entry.message
+    const contract = skillContractOutput(message, commandNames)
+    if (contract !== undefined) {
+      freshBlock = boundCommandContext(contract, payloadBudget)
+      break
+    }
+    if (message.type === "user" && referencesCommand(message.text, commandNames)) {
+      const names = referencedCommandNames(message.text, commandNames)
+      const identity = `\nCommand references: ${names.map((name) => `/${name}`).join(", ")}`
+      // Preamble and identity are part of the carried blob, so they consume the
+      // payload budget too; the slack keeps re-carries byte-identical.
+      const payloadSpace = payloadBudget - Token.estimate(COMMAND_CONTEXT_PREAMBLE) - Token.estimate(identity) - 4
+      freshBlock = [
+        COMMAND_CONTEXT_PREAMBLE,
+        payloadSpace > 0 ? boundCommandContext(message.text, payloadSpace) : COMMAND_CONTEXT_TRUNCATED,
+        identity,
+      ].join("\n")
+      freshFromUser = true
+      break
+    }
+  }
+  const blocks = [
+    ...carried.map((blob) => [COMMAND_CONTEXT_OPEN, boundCommandContext(blob, payloadBudget), COMMAND_CONTEXT_CLOSE].join("\n")),
+    ...(freshBlock === undefined ? [] : [[COMMAND_CONTEXT_OPEN, freshBlock, COMMAND_CONTEXT_CLOSE].join("\n")]),
+  ]
+  return { text: blocks.join("\n\n"), fresh: freshBlock !== undefined }
+}
 
 const settings = (documents: readonly Config.Entry[]) => {
   const configured = documents
@@ -376,6 +503,7 @@ export const make = (dependencies: Dependencies) => {
         limit,
       })
       if (!summaryPrompt) return { contextOverflow: true }
+      if (dependencies.beforeRequest) yield* dependencies.beforeRequest(input.sessionID)
       const chunks: string[] = []
       let finishReason: FinishReason | undefined
       let failed = false
@@ -519,6 +647,9 @@ export const make = (dependencies: Dependencies) => {
       readonly keepTokens?: number
       readonly keepTurns?: number | false
       readonly fallbackQuestionDetached?: boolean
+      // Tokens the caller already subtracted from keepTokens for the command
+      // carry, so this path does not subtract its own estimate a second time.
+      readonly carryReserveTokens?: number
     },
   ) {
     const context = input.model.route.defaults.limits?.context
@@ -527,9 +658,16 @@ export const make = (dependencies: Dependencies) => {
       ? yield* dependencies.loadCurrent(input.sessionID)
       : { entries: input.entries, todos: [] }
     const summaryEntries = current.entries
+    const commandNames = dependencies.commandNames ? yield* dependencies.commandNames : undefined
+    const commandContext = commandNames?.size
+      ? durableCommandContext(summaryEntries, commandNames)
+      : { text: "", fresh: false as const }
+    // The carry block is additive to the checkpoint, so shrink the retained
+    // tail by its exact footprint instead of growing the provider request.
+    const carryReserve = input.carryReserveTokens ?? Token.estimate(commandContext.text)
     const selected = select(
       summaryEntries,
-      input.keepTokens ?? config.tokens,
+      Math.max(0, (input.keepTokens ?? config.tokens) - carryReserve),
       input.keepTurns === false ? undefined : input.keepTurns ?? config.turns,
     )
     const previousSummary = summaryEntries.findLast((entry) => entry.message.type === "compaction")?.message
@@ -550,6 +688,7 @@ export const make = (dependencies: Dependencies) => {
       previousSummary?.type === "compaction" ? previousSummary.recent : "",
       selected?.head ?? "",
       todoContext,
+      commandContext.fresh ? commandContext.text : "",
     ].filter(Boolean)
     const previousSummaryText = previousSummary?.type === "compaction" ? previousSummary.summary : undefined
     const summaryPlan = (model: Model, request: LLMRequest) => {
@@ -618,7 +757,7 @@ export const make = (dependencies: Dependencies) => {
       timestamp: yield* DateTime.now,
       reason: "auto",
       text: summary,
-      recent: [selected?.recent ?? "", todoContext].filter(Boolean).join("\n\n"),
+      recent: [selected?.recent ?? "", todoContext, commandContext.text].filter(Boolean).join("\n\n"),
     })
     return true
   })
@@ -626,11 +765,26 @@ export const make = (dependencies: Dependencies) => {
     const current = dependencies.loadCurrent
       ? yield* dependencies.loadCurrent(input.sessionID)
       : { entries: input.entries, todos: [] }
-    const selected = select(current.entries, config.tokens, config.turns)
     const previous = current.entries.findLast((entry) => entry.message.type === "compaction")?.message
     const previousSummary = previous?.type === "compaction" ? previous : undefined
+    const commandNames = dependencies.commandNames ? yield* dependencies.commandNames : undefined
+    const commandContext = commandNames?.size
+      ? durableCommandContext(current.entries, commandNames)
+      : { text: "", fresh: false as const }
     const todoContext = serializeTodos(current.todos)
-    const context = [previousSummary?.recent ?? "", selected?.head ?? "", todoContext].filter(Boolean)
+    // Same additive-footprint rule as the automatic path: the carry block must
+    // not enlarge the checkpoint beyond the configured keep budget.
+    const selected = select(
+      current.entries,
+      Math.max(0, config.tokens - Token.estimate(commandContext.text)),
+      config.turns,
+    )
+    const context = [
+      previousSummary?.recent ?? "",
+      selected?.head ?? "",
+      todoContext,
+      commandContext.fresh ? commandContext.text : "",
+    ].filter(Boolean)
     const output = input.request.generation?.maxTokens ?? input.model.route.defaults.limits?.output ?? 0
     const summaryRequest = LLM.request({
       model: input.model,
@@ -680,7 +834,7 @@ export const make = (dependencies: Dependencies) => {
       timestamp: yield* DateTime.now,
       reason: "manual",
       text: summary.summary,
-      recent: [selected?.recent ?? "", todoContext].filter(Boolean).join("\n\n"),
+      recent: [selected?.recent ?? "", todoContext, commandContext.text].filter(Boolean).join("\n\n"),
     })
     return summary.summary
   })
@@ -722,13 +876,20 @@ export const make = (dependencies: Dependencies) => {
           reason: "the target model has no safe input budget after the configured compaction buffer",
         }))
       const summaryReserve = Math.min(2_000, Math.floor(keepBudget / 4))
+      // Reserve the command carry footprint explicitly so a tight target model
+      // compacts the tail smaller instead of overflowing after the checkpoint.
+      const commandNames = dependencies.commandNames ? yield* dependencies.commandNames : undefined
+      const carryReserve = commandNames?.size
+        ? Token.estimate(durableCommandContext(current.entries, commandNames).text)
+        : 0
       const compactedHistory = yield* compactAfterOverflow({
         sessionID: input.sessionID,
         entries: current.entries,
         model: input.targetModel,
         request: input.targetRequest,
         contextEstimateTokens,
-        keepTokens: Math.max(0, Math.min(config.tokens, keepBudget - summaryReserve)),
+        keepTokens: Math.max(0, Math.min(config.tokens, keepBudget - summaryReserve - carryReserve)),
+        carryReserveTokens: carryReserve,
         keepTurns: false,
         fallbackQuestionDetached: input.fallbackQuestionDetached,
       })

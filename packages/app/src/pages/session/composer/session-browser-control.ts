@@ -14,6 +14,8 @@ export type SessionBrowserStatus = {
   canGoBack?: boolean
   canGoForward?: boolean
   webContentsID?: number
+  /** Electron destroyed the guest; the dock must rebuild the frame before use. */
+  destroyed?: boolean
 }
 
 export type SessionBrowserController = {
@@ -89,13 +91,21 @@ export function isAllowedBrowserURL(value: string) {
 export function readBrowserWebviewStatus(webview: BrowserWebviewRuntime, fallbackURL: string, domReady: boolean) {
   const actualURL = webview.getAttribute("src") ?? fallbackURL
   if (!domReady) return { actualURL, loading: true }
-  const webContentsID = webview.getWebContentsId?.()
-  return {
-    actualURL: webview.getURL?.() || actualURL,
-    loading: webview.isLoading?.(),
-    canGoBack: webview.canGoBack?.(),
-    canGoForward: webview.canGoForward?.(),
-    ...(typeof webContentsID === "number" ? { webContentsID } : {}),
+  try {
+    const webContentsID = webview.getWebContentsId?.()
+    return {
+      actualURL: webview.getURL?.() || actualURL,
+      loading: webview.isLoading?.(),
+      canGoBack: webview.canGoBack?.(),
+      canGoForward: webview.canGoForward?.(),
+      ...(typeof webContentsID === "number" ? { webContentsID } : {}),
+    }
+  } catch {
+    // Electron throws "Object has been destroyed" once the guest is gone (for
+    // example a background eviction or a removed-and-restored dock). Report the
+    // stale frame as destroyed/loading instead of failing the action; the dock
+    // rebuilds the frame from the tab's URL when it sees this marker.
+    return { actualURL, loading: true, destroyed: true }
   }
 }
 

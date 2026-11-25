@@ -70,7 +70,7 @@ test("composer toolbar before-submit hooks run when submitting with Enter from t
     ],
     pageMessages: () => ({ items: [] }),
   })
-  await mockComposerToolbarPlugins(page, ["visual-qa-app", "progressive-plan-builder-app"])
+  await mockComposerToolbarPlugins(page, ["visual-qa-app", "progressive-plan-builder-app", "multi-agent-review-app"])
   await page.route(/\/api\/session\/[^/]+\/prompt(?:\?|$)/, (route) => {
     requests.push(JSON.parse(route.request().postData() ?? "{}"))
     return route.fulfill({
@@ -99,11 +99,20 @@ test("composer toolbar before-submit hooks run when submitting with Enter from t
 
   const composer = await openSessionComposer(page)
   const input = composer.locator('[data-component="prompt-input"]')
-  const toggle = page.getByRole("button", { name: "Visual QA fuer die naechste Nachricht aktivieren" })
+  const toggle = page.getByRole("button", { name: "Visual QA", exact: true })
   await expectAppVisible(toggle)
 
-  await toggle.click()
-  await expect(toggle).toHaveAttribute("aria-pressed", "true")
+  const review = page.getByRole("button", { name: "Multi-Agent Review", exact: true })
+  const planning = page.getByRole("button", { name: "Progressive Plan Builder", exact: true })
+  for (const button of [toggle, review, planning]) {
+    await button.click()
+    await expect(button).toHaveAttribute("aria-pressed", "true")
+  }
+  // Switching toolbar layouts replaces its DOM elements but must keep the draft selection.
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.locator('[data-component="plugin-toolbar-mobile-overflow"]')).toBeVisible()
+  await page.setViewportSize({ width: 1280, height: 720 })
+  for (const button of [toggle, review, planning]) await expect(button).toHaveAttribute("aria-pressed", "true")
   await input.click()
   await page.keyboard.type("Bitte fixen")
   if (process.env.VISUAL_QA_SCREENSHOT) {
@@ -112,12 +121,15 @@ test("composer toolbar before-submit hooks run when submitting with Enter from t
   await page.keyboard.press("Enter")
 
   await expect.poll(() => requests.length).toBe(1)
-  expect(requests[0]?.prompt).toMatchObject({ text: `Bitte fixen\n\n${visualQaReference}` })
+  const references = ((requests[0]?.prompt as { text?: string } | undefined)?.text ?? "").split("\n\n")
+  expect(references[0]).toBe("Bitte fixen")
+  expect(references.slice(1).sort()).toEqual([visualQaReference, multiAgentReviewReference, progressivePlanBuilderReference].sort())
+  for (const button of [toggle, review, planning]) await expect(button).toHaveAttribute("aria-pressed", "false")
 
   await page.reload()
   const blockedComposer = await openSessionComposer(page)
   const blockedInput = blockedComposer.locator('[data-component="prompt-input"]')
-  const plan = page.getByRole("button", { name: "Progressive Plan Builder fuer die naechste Nachricht aktivieren" })
+  const plan = page.getByRole("button", { name: "Progressive Plan Builder", exact: true })
   await expectAppVisible(plan)
   await blockedInput.fill("Bitte erst planen")
   await plan.click()
@@ -135,6 +147,9 @@ test("multi-select runs prompt improve and browser undo restores the original dr
   const errors = trackPageErrors(page)
   const requests: Record<string, unknown>[] = []
   const aiRuns: Record<string, unknown>[] = []
+  page.on("console", (message) => {
+    if (message.type() === "warning" || message.type() === "error") console.log(message.text())
+  })
   const failedResponses: string[] = []
   page.on("response", (response) => {
     if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`)
@@ -219,6 +234,9 @@ test("multi-select runs prompt improve and browser undo restores the original dr
     )
   })
 
+  await page.addInitScript(() => {
+    localStorage.setItem("opencode.app-plugin.prompt-improve-app.settings.modelChain", JSON.stringify("model:opencode/claude-opus-4-6"))
+  })
   const viewportName = process.env.VISUAL_QA_VIEWPORT === "mobile" ? "mobile" : "desktop"
   await page.setViewportSize(viewportName === "mobile" ? { width: 390, height: 844 } : { width: 1280, height: 720 })
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
@@ -226,9 +244,9 @@ test("multi-select runs prompt improve and browser undo restores the original dr
   const composer = await openSessionComposer(page)
   const input = composer.locator('[data-component="prompt-input"]')
   const improve = page.getByRole("button", { name: "Improve current prompt" })
-  const visualQa = page.getByRole("button", { name: "Visual QA fuer die naechste Nachricht aktivieren" })
-  const progressivePlanBuilder = page.getByRole("button", { name: "Progressive Plan Builder fuer die naechste Nachricht aktivieren" })
-  const multiAgentReview = page.getByRole("button", { name: "Multi-Agent Review fuer die naechste Nachricht aktivieren" })
+  const visualQa = page.getByRole("button", { name: "Visual QA", exact: true })
+  const progressivePlanBuilder = page.getByRole("button", { name: "Progressive Plan Builder", exact: true })
+  const multiAgentReview = page.getByRole("button", { name: "Multi-Agent Review", exact: true })
   const multiAgentProblemSolver = page.getByRole("button", { name: "Multi-Agent Problem Solver fuer die naechste Nachricht aktivieren" })
   await expectAppVisible(improve)
   await expectAppVisible(visualQa)
@@ -237,7 +255,7 @@ test("multi-select runs prompt improve and browser undo restores the original dr
   await expectAppVisible(multiAgentProblemSolver)
   const rightToolbarItems = await page
     .locator(
-      '[data-component="plugin-toolbar-outlet"][data-plugin-toolbar-placement="composer"][data-plugin-toolbar-align="right"] > [data-plugin-toolbar-item]',
+      '[data-component="plugin-toolbar-outlet"][data-plugin-toolbar-placement="composer"][data-plugin-toolbar-align="right"] [data-plugin-toolbar-item]',
     )
     .evaluateAll((items) => items.map((item) => item.getAttribute("data-plugin-toolbar-item")))
   const improveIndex = rightToolbarItems.indexOf("prompt-improve-app/promptImprove")
@@ -403,7 +421,7 @@ test("composer toolbar before-submit hooks run when submitting a new session dra
 
   const input = page.locator('[data-dock-area="middle"]').getByRole("textbox", { name: /Ask anything/ })
   await expectAppVisible(input)
-  const toggle = page.getByRole("button", { name: "Visual QA fuer die naechste Nachricht aktivieren" })
+  const toggle = page.getByRole("button", { name: "Visual QA", exact: true })
   await expectAppVisible(toggle)
 
   await toggle.click()
@@ -476,14 +494,14 @@ test("multi-agent review toolbar production plugin appends its skill reference",
 
   const composer = await openSessionComposer(page)
   const input = composer.locator('[data-component="prompt-input"]')
-  const toggle = page.getByRole("button", { name: "Multi-Agent Review fuer die naechste Nachricht aktivieren" })
+  const toggle = page.getByRole("button", { name: "Multi-Agent Review", exact: true })
   await expectAppVisible(toggle)
 
   await toggle.click()
   await expect(toggle).toHaveAttribute("aria-pressed", "true")
   await input.click()
   await page.keyboard.type("Bitte reviewen")
-  await page.keyboard.press("Enter")
+  await composer.locator('[data-action="prompt-submit"]').click()
 
   await expect.poll(() => requests.length).toBe(1)
   expect(requests[0]?.prompt).toMatchObject({ text: `Bitte reviewen\n\n${multiAgentReviewReference}` })
@@ -599,22 +617,26 @@ async function mockComposerToolbarPlugins(page: Page, pluginIDs: string[]) {
           version: "1",
           module: `/app/plugin/${id}/1/index.js`,
           hash: id,
-          ...(id === "prompt-improve-app"
-            ? { capabilities: ["ui:toolbar", "ui:settings", "host:ai"] }
-            : id === "speech-to-text-app"
-              ? { capabilities: ["ui:toolbar", "ui:settings", "commands", "host:composer"] }
-              : {}),
+          ...JSON.parse(
+            readFileSync(new URL(`../../../../.opencode/plugins/${id}/package.json`, import.meta.url), "utf8"),
+          ).opencode.app,
         })),
       }),
     }),
   )
   for (const id of pluginIDs) {
-    await page.route(`**/app/plugin/${id}/1/index.js**`, (route) =>
+    await page.route(`**/app/plugin/${id}/1/*.js*`, (route) =>
       route.fulfill({
         status: 200,
         contentType: "text/javascript",
         headers: { "access-control-allow-origin": "*" },
-        body: readFileSync(new URL(`../../../../.opencode/plugins/${id}/index.js`, import.meta.url), "utf8"),
+        body: readFileSync(
+          new URL(
+            `../../../../.opencode/plugins/${id}/${new URL(route.request().url()).pathname.split("/").pop()}`,
+            import.meta.url,
+          ),
+          "utf8",
+        ),
       }),
     )
     await page.route(`**/app/plugin/${id}/1/assets/**`, (route) =>

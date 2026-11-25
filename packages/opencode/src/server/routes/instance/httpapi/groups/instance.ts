@@ -1,4 +1,4 @@
-import { Agent } from "@/agent/agent"
+﻿import { Agent } from "@/agent/agent"
 import { Command } from "@/command"
 import { Format } from "@/format"
 import { LSP } from "@/lsp/lsp"
@@ -60,6 +60,46 @@ export class ApiVcsGitActionError extends Schema.ErrorClass<ApiVcsGitActionError
   { httpApiStatus: 500 },
 ) {}
 
+const ApiVcsGitHistoryErrorData = Schema.Struct({
+  message: Schema.String,
+  code: Schema.Literals([
+    "invalid_ref",
+    "invalid_cursor",
+    "history_unavailable",
+    "shallow_changed",
+    "output_limit",
+    "process_failed",
+  ]),
+  recovery: Schema.Literals(["refresh", "retry", "change-selection", "none"]),
+})
+
+export class ApiVcsGitHistoryInvalidError extends Schema.ErrorClass<ApiVcsGitHistoryInvalidError>("VcsGitHistoryInvalidError")(
+  { name: Schema.Literal("VcsGitHistoryError"), data: ApiVcsGitHistoryErrorData },
+  { httpApiStatus: 400 },
+) {}
+
+export class ApiVcsGitHistoryStaleError extends Schema.ErrorClass<ApiVcsGitHistoryStaleError>("VcsGitHistoryStaleError")(
+  { name: Schema.Literal("VcsGitHistoryError"), data: ApiVcsGitHistoryErrorData },
+  { httpApiStatus: 409 },
+) {}
+
+export class ApiVcsGitHistoryLimitError extends Schema.ErrorClass<ApiVcsGitHistoryLimitError>("VcsGitHistoryLimitError")(
+  { name: Schema.Literal("VcsGitHistoryError"), data: ApiVcsGitHistoryErrorData },
+  { httpApiStatus: 413 },
+) {}
+
+export class ApiVcsGitHistoryProcessError extends Schema.ErrorClass<ApiVcsGitHistoryProcessError>("VcsGitHistoryProcessError")(
+  { name: Schema.Literal("VcsGitHistoryError"), data: ApiVcsGitHistoryErrorData },
+  { httpApiStatus: 502 },
+) {}
+
+export const ApiVcsGitHistoryErrors = [
+  ApiVcsGitHistoryInvalidError,
+  ApiVcsGitHistoryStaleError,
+  ApiVcsGitHistoryLimitError,
+  ApiVcsGitHistoryProcessError,
+] as const
+
 export const InstancePaths = {
   dispose: "/instance/dispose",
   path: "/path",
@@ -69,6 +109,8 @@ export const InstancePaths = {
   vcsDiffRaw: "/vcs/diff/raw",
   vcsApply: "/vcs/apply",
   vcsGit: "/vcs/git",
+  vcsGitHistory: "/vcs/git/history",
+  vcsGitCommitMessage: "/vcs/git/commit-message",
   vcsGitDiscover: "/vcs/git/discover",
   vcsGitAction: "/vcs/git/action",
   command: "/command",
@@ -167,6 +209,32 @@ export const InstanceApi = HttpApi.make("instance")
             identifier: "vcs.git",
             summary: "Get Git workbench snapshot",
             description: "Retrieve status, history, branches, remotes, tags, stashes, conflicts, and operation state.",
+          }),
+        ),
+        HttpApiEndpoint.post("vcsGitHistory", InstancePaths.vcsGitHistory, {
+          query: WorkspaceRoutingQuery,
+          payload: Vcs.GitHistoryRequest,
+          success: described(Vcs.GitHistoryPage, "Git history page"),
+          error: ApiVcsGitHistoryErrors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "vcs.git.history",
+            summary: "Get a filtered Git history page",
+            description:
+              "Retrieve one page of a branch-filtered, anchored commit history. Initial requests pass a selector; continuations pass the opaque cursor only.",
+          }),
+        ),
+        HttpApiEndpoint.post("vcsGitCommitMessage", InstancePaths.vcsGitCommitMessage, {
+          query: WorkspaceRoutingQuery,
+          payload: Vcs.GitCommitMessageRequest,
+          success: described(Vcs.GitCommitMessagePage, "Git commit message chunk"),
+          error: ApiVcsGitHistoryErrors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "vcs.git.commit-message",
+            summary: "Get a chunk of a full commit message",
+            description:
+              "Retrieve the next char-safe chunk of a commit message for commits whose body was truncated in the history page.",
           }),
         ),
         HttpApiEndpoint.get("vcsGitDiscover", InstancePaths.vcsGitDiscover, {

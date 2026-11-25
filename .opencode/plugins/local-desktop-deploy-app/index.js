@@ -31,40 +31,49 @@ export default {
       enabled: (ctx) => Boolean(isOpencodeProject(ctx.directory) && isWindowsHost() && canRunHostCommand(api)),
       run: async (ctx) => {
         if (!ctx.directory) return
-        const previous = (await currentDeployStatus(api, ctx.directory)) ?? api.kv?.get?.(STATUS_KEY, undefined)
-        const resume = previous?.status === "ready" ? readyBuild(previous) : undefined
-        if (previous?.status === "ready" && !resume) {
-          throw new Error("Prepared deployment metadata is incomplete. Inspect desktop:deploy status before retrying.")
-        }
-        if (isInFlightDeployStatus(previous?.status)) {
-          throw new Error(`Deployment ${previous.runID ?? previous.buildID ?? previous.status} is still in flight; wait for its console before starting another.`)
-        }
-        if (
-          !window.confirm(
-            [
-              resume
-                ? `Vorbereiteten Build ${resume.buildID} extern deployen?`
-                : "Neue OpenCode-Prod-Version extern bauen und deployen?",
-              "",
-              resume
-                ? "Das vorhandene unveränderliche Paket wird verwendet, nicht der aktuelle Quellcode. Es wird kein neuer Build gestartet."
-                : "Eine unabhängige CMD startet sofort und beendet OpenCode vollständig, bevor Build, Paketierung und Prüfung beginnen.",
-              resume
-                ? "Für einen neuen Build zuerst desktop:deploy discard ausführen. Abbrechen behält das Paket."
-                : "OpenCode bleibt während des gesamten Builds geschlossen und startet erst nach geprüftem Deploy neu.",
-              "Mit OK erteilst du ausdrücklich die Freigabe für sofortiges Schließen, nötigenfalls Force-Close und Neustart nach geprüftem Deploy.",
-              "",
-              ...DEPLOY_CHECKLIST,
-              previousStatusLine(previous),
-            ].join("\n"),
-          )
-        ) {
-          return
-        }
-
         const startedAt = Date.now()
-        saveDeployStatus(api, { status: "running", phase: "Handoff", startedAt, directory: ctx.directory })
         try {
+          const previous = (await currentDeployStatus(api, ctx.directory)) ?? api.kv?.get?.(STATUS_KEY, undefined)
+          const resume = previous?.status === "ready" ? readyBuild(previous) : undefined
+          if (previous?.status === "ready" && !resume) {
+            throw new Error(
+              "Prepared deployment metadata is incomplete. Inspect desktop:deploy status before retrying.",
+            )
+          }
+          if (isInFlightDeployStatus(previous?.status)) {
+            const result = await runHostScript(api, ctx.directory, conflictConsoleScript(), {
+              title: "Opening deploy console",
+              message: "Opening the visible console to review the existing deployment.",
+              timeoutMs: HANDOFF_TIMEOUT_MS,
+            })
+            if (!commandSucceeded(result) || !commandOutput(result).includes("CANCELLATION_CONSOLE : started"))
+              throw new Error(commandErrorMessage(result))
+            return
+          }
+          if (
+            !window.confirm(
+              [
+                resume
+                  ? `Vorbereiteten Build ${resume.buildID} extern deployen?`
+                  : "Neue OpenCode-Prod-Version extern bauen und deployen?",
+                "",
+                resume
+                  ? "Das vorhandene unveränderliche Paket wird verwendet, nicht der aktuelle Quellcode. Es wird kein neuer Build gestartet."
+                  : "Eine unabhängige CMD startet sofort und beendet OpenCode vollständig, bevor Build, Paketierung und Prüfung beginnen.",
+                resume
+                  ? "Für einen neuen Build zuerst desktop:deploy discard ausführen. Abbrechen behält das Paket."
+                  : "OpenCode bleibt während des gesamten Builds geschlossen und startet erst nach geprüftem Deploy neu.",
+                "Mit OK erteilst du ausdrücklich die Freigabe für sofortiges Schließen, nötigenfalls Force-Close und Neustart nach geprüftem Deploy.",
+                "",
+                ...DEPLOY_CHECKLIST,
+                previousStatusLine(previous),
+              ].join("\n"),
+            )
+          ) {
+            return
+          }
+
+          saveDeployStatus(api, { status: "running", phase: "Handoff", startedAt, directory: ctx.directory })
           const handoffScript = resume ? launchScript(resume.buildID) : automaticScript()
           const handoffResult = await runHostScript(api, ctx.directory, handoffScript, {
             title: resume ? "Deploying prepared desktop package" : "Starting external build and deploy",
@@ -73,9 +82,14 @@ export default {
               : "Handing off to an independent console that closes OpenCode first.",
             timeoutMs: HANDOFF_TIMEOUT_MS,
           })
+          const recoveredAutomaticStatus =
+            !resume && commandSucceeded(handoffResult) && !hasAutomaticMarker(handoffResult)
+              ? await reconcileAutomaticHandoff(api, ctx.directory, startedAt)
+              : undefined
           const acknowledged = resume
             ? commandSucceeded(handoffResult) && hasLaunchMarker(handoffResult, resume.buildID)
-            : commandSucceeded(handoffResult) && hasAutomaticMarker(handoffResult)
+            : commandSucceeded(handoffResult) &&
+              (hasAutomaticMarker(handoffResult) || advancedAutomaticHandoffStatus(recoveredAutomaticStatus, startedAt))
           if (!acknowledged) {
             const failed = {
               ...handoffResult,
@@ -96,7 +110,8 @@ export default {
             startedAt,
             finishedAt: Date.now(),
             directory: ctx.directory,
-            message: "External automatic deploy started. OpenCode will close now; durable completion will be reconciled after restart.",
+            message:
+              "External automatic deploy started. OpenCode will close now; durable completion will be reconciled after restart.",
           })
         } catch (error) {
           const status = api.kv?.get?.(STATUS_KEY, undefined)
@@ -127,20 +142,43 @@ export default {
 }
 
 async function currentDeployStatus(api, directory) {
-  try {
-    const result = await api.host.command.run({
-      command: "powershell.exe",
-      arguments: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64Utf16Le(statusScript())],
-      directory,
-    })
-    if (!commandSucceeded(result)) return undefined
-    const status = durableStatus(commandOutput(result), directory)
-    if (!status) return undefined
-    saveDeployStatus(api, status)
-    return status
-  } catch {
-    return undefined
+  const result = await api.host.command.run({
+    command: "powershell.exe",
+    arguments: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64Utf16Le(statusScript())],
+    directory,
+  })
+  if (!commandSucceeded(result)) throw new Error(commandErrorMessage(result))
+  const status = durableStatus(commandOutput(result), directory)
+  if (!status) return undefined
+  saveDeployStatus(api, status)
+  return status
+}
+
+async function reconcileAutomaticHandoff(api, directory, startedAt) {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    try {
+      const status = await currentDeployStatus(api, directory)
+      if (advancedAutomaticHandoffStatus(status, startedAt)) return status
+    } catch {
+      // The command's output may be incomplete; keep checking durable state until the handoff window closes.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
   }
+}
+
+export function advancedAutomaticHandoffStatus(status, startedAt) {
+  return Boolean(
+    status &&
+      typeof status === "object" &&
+      typeof status.runID === "string" &&
+      /^auto-[A-Za-z0-9-]+$/.test(status.runID) &&
+      typeof status.finishedAt === "number" &&
+      status.finishedAt >= startedAt &&
+      ["automatic-closing-app", "automatic-building", "automatic-deploying", "completed", "automatic-failed"].includes(
+        status.status,
+      ),
+  )
 }
 
 async function runHostScript(api, directory, script, loading) {
@@ -273,7 +311,19 @@ function metadata(output, label) {
 
 export function isInFlightDeployStatus(status) {
   if (typeof status !== "string" || !status) return false
-  if (["automatic-completed", "automatic-failed", "automatic-cancelled", "completed", "failed", "deployed", "discarded", "ready"].includes(status)) return false
+  if (
+    [
+      "automatic-completed",
+      "automatic-failed",
+      "automatic-cancelled",
+      "completed",
+      "failed",
+      "deployed",
+      "discarded",
+      "ready",
+    ].includes(status)
+  )
+    return false
   return (
     status.startsWith("automatic-") ||
     [
@@ -309,11 +359,11 @@ export function prepareScript() {
 }
 
 export function automaticScript() {
-  return deployCommandScript(["automatic", "--detach", "--approved-close", "--force-close-approved", "--restart"])
+  return deployCommandScript(["automatic", "--approved-close", "--force-close-approved", "--restart"])
 }
 
 export function hasAutomaticMarker(result) {
-  return /AUTOMATIC\s*:/i.test(commandOutput(result))
+  return /^AUTOMATIC\s*:\s*detached worker for auto-[A-Za-z0-9-]+\s*$/im.test(commandOutput(result))
 }
 
 export function launchScript(buildID) {
@@ -332,12 +382,32 @@ export function statusScript() {
   return deployCommandScript(["status"])
 }
 
+export function conflictConsoleScript() {
+  return `
+$ErrorActionPreference = "Stop"
+try {
+  $repo = (Get-Location).Path
+  $candidateRepo = [IO.Path]::GetFullPath((Join-Path $repo ([IO.Path]::Combine("..", ".."))))
+  if (Test-Path -LiteralPath (Join-Path $candidateRepo "packages/opencode/package.json") -PathType Leaf) { $repo = $candidateRepo }
+  $script = Join-Path $repo "script/build-and-deploy.cmd"
+  if (-not (Test-Path -LiteralPath $script -PathType Leaf)) { throw "CMD tool not found: $script" }
+  Start-Process -FilePath $env:ComSpec -ArgumentList ('/d /k ""' + $script + '""') -WorkingDirectory $repo -WindowStyle Normal
+  [Console]::WriteLine("CANCELLATION_CONSOLE : started")
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+`
+}
+
 function deployCommandScript(args) {
   return `
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 try {
   $repo = (Get-Location).Path
+  $candidateRepo = [IO.Path]::GetFullPath((Join-Path $repo ([IO.Path]::Combine("..", ".."))))
+  if (Test-Path -LiteralPath (Join-Path $candidateRepo "packages/opencode/package.json") -PathType Leaf) { $repo = $candidateRepo }
   $env:PATH = @(
     $env:PATH,
     [Environment]::GetEnvironmentVariable("Path", "User"),
@@ -380,7 +450,7 @@ export function commandErrorMessage(result) {
 }
 
 export function deployPhase(output) {
-  if (/desktop:deploy launch|STARTED\s*:|AUTOMATIC\s*:|automatic-worker/i.test(output)) return "Deploy"
+  if (/desktop:deploy (?:launch|automatic)|desktop-prod-deploy\.ts automatic|STARTED\s*:|AUTOMATIC\s*:|automatic-worker/i.test(output)) return "Deploy"
   return "Prepare"
 }
 

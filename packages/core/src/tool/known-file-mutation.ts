@@ -8,8 +8,10 @@ import type { Database } from "../database/database"
 import { FileKnowledge } from "../file-knowledge"
 import { FileMutationPendingTable } from "../file-knowledge.sql"
 import { FileMutation } from "../file-mutation"
-import type { LocationMutation } from "../location-mutation"
+import { LocationMutation } from "../location-mutation"
 import type { SessionFileMutation } from "../session/file-mutation"
+import type { WorkspaceCheckout } from "../session/workspace/checkout"
+import { LegacyDelegationGuard } from "../session/legacy-delegation/guard"
 import type { Tool } from "./tool"
 
 export type Operation = {
@@ -90,6 +92,7 @@ export function commit(input: {
   files: FileMutation.Interface
   resolution: LocationMutation.Interface
   journal?: SessionFileMutation.Interface
+  checkouts?: WorkspaceCheckout.Interface
 }) {
   return Effect.gen(function* () {
     if (!input.database)
@@ -156,6 +159,7 @@ export function commit(input: {
         Effect.asVoid,
         Effect.mapError(() => new FileKnowledge.StorageError()),
       )
+    const authority = { managed: false, writing: false, rolledBack: false }
     const results = yield* input.files
       .transact(
         prepared.map((item) => item.change),
@@ -163,16 +167,22 @@ export function commit(input: {
           before: Effect.gen(function* () {
             for (const item of prepared) {
               const resolved = yield* input.resolution
-                .resolve({ path: item.operation.path, kind: "file" })
+                .resolve({ path: item.operation.path, kind: "file" }, LocationMutation.guardedPaths)
                 .pipe(
                   Effect.mapError(
                     () => new ToolFailure({ message: "File target changed while waiting; read and retry manually." }),
                   ),
                 )
-              if (resolved.canonical !== item.operation.target.canonical)
+              if (!LocationMutation.sameTarget(item.operation.target, resolved))
                 return yield* new ToolFailure({
                   message: `File target changed: ${item.operation.path}. No files were changed.`,
                 })
+              const managed = yield* LegacyDelegationGuard.assertFileWrite(
+                { db, checkouts: input.checkouts },
+                input.context.sessionID,
+                resolved.canonical,
+              ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
+              authority.managed ||= managed
               const pending = yield* db
                 .select()
                 .from(FileMutationPendingTable)
@@ -224,7 +234,24 @@ export function commit(input: {
               )
               .pipe(Effect.mapError(() => new FileKnowledge.StorageError()))
           }),
-          rolledBack: clear,
+          fence: <A, E2>(operation: Effect.Effect<A, E2>) => Effect.suspend<A, E2 | ToolFailure | FileKnowledge.StorageError, never>(() => {
+            if (!authority.managed) return operation
+            return db.transaction(() => Effect.gen(function* () {
+              for (const item of prepared) {
+                const managed = yield* LegacyDelegationGuard.assertFileWrite(
+                  { db, checkouts: input.checkouts }, input.context.sessionID, item.operation.target.canonical,
+                ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
+                if (!managed) return yield* new ToolFailure({ message: "Managed write authority disappeared before commit." })
+              }
+              authority.writing = true
+              return yield* operation
+            }), { behavior: "immediate" }).pipe(
+              Effect.catchCause((cause) => (!authority.writing || authority.rolledBack ? clear : Effect.void)
+                .pipe(Effect.andThen(Effect.failCause(cause)))),
+              Effect.catchTag("SqlError", () => new FileKnowledge.StorageError()),
+            )
+          }),
+          rolledBack: clear.pipe(Effect.tap(() => Effect.sync(() => { authority.rolledBack = true }))),
           committed: (results) =>
             Effect.gen(function* () {
               for (const [index, result] of results.entries()) {

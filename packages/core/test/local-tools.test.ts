@@ -138,6 +138,7 @@ export default tool({ description: "Module description", args: {}, async execute
               expect(catalog).toContainEqual({
                 id: "manifest_tool",
                 description: "Manifest description",
+                parameters: expect.objectContaining({ type: "object" }),
                 scope: "location",
                 project: "Fixture",
                 source: path.join(directory, ".opencode", "tools", "manifest_tool.ts"),

@@ -4,6 +4,7 @@ import { Array, Context, Effect, Exit, Layer, Schema, Semaphore, Scope } from "e
 import { castDraft, enableMapSet, type Draft } from "immer"
 import { ModelV2 } from "./model"
 import { PermissionSchema } from "./permission/schema"
+import { ConfigSkillInvocation } from "./config/skill-invocation"
 import { ProviderV2 } from "./provider"
 import { PositiveInt } from "./schema"
 import { State } from "./state"
@@ -58,6 +59,7 @@ export class Info extends Schema.Class<Info>("AgentV2.Info")({
     glob: PositiveInt.pipe(Schema.optional),
   }).pipe(Schema.optional),
   permissions: PermissionSchema.Ruleset,
+  skills: Schema.Record(Schema.String, ConfigSkillInvocation.SkillEntry).pipe(Schema.optional),
 }) {
   static empty(id: ID) {
     return new Info({

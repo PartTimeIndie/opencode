@@ -5,12 +5,17 @@ import { open, mkdir, readFile, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { createHash } from "crypto"
 import { ToolFailure } from "@opencode-ai/llm"
-import { Duration, Effect, Layer, Option, Schema } from "effect"
+import { Duration, Effect, Fiber, Layer, Option, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { Config } from "../config"
 import { ContentStore } from "../content-store"
+import { Database } from "../database/database"
 import { FSUtil } from "../fs-util"
 import { LocationMutation } from "../location-mutation"
+import { Location } from "../location"
+import { ShellEnvironment } from "../shell-environment"
+import { WorkspaceCheckout } from "../session/workspace/checkout"
+import { LegacyDelegationGuard } from "../session/legacy-delegation/guard"
 import { ShellCommandAccess } from "../permission/shell-command-access"
 import { AppProcess } from "../process"
 import { PermissionV2 } from "../permission"
@@ -19,6 +24,7 @@ import { Shell } from "../shell"
 import { executablePath } from "../util/windows-path"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
+import { liveOutput, LIVE_OUTPUT_INTERVAL_MS } from "./live-output"
 
 export const name = "bash"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
@@ -113,6 +119,11 @@ const isTimeout = (error: AppProcess.AppProcessError) =>
 
 // The generic "Unable to execute command" settlement must keep its cause visible
 // (spawn failures are otherwise indistinguishable from timeouts in the transcript).
+export const executionFailure = (command: string, error: { readonly cause?: unknown }) =>
+  error instanceof ToolFailure ? error : new ToolFailure({
+    message: `Unable to execute command: ${command}${describeExecutionFailure(error)}`,
+  })
+
 const describeExecutionFailure = (error: { readonly cause?: unknown }) => {
   const cause = error.cause instanceof Error ? error.cause : undefined
   if (cause === undefined) return ""
@@ -144,8 +155,6 @@ export function budgetCategory(input: unknown): Tool.BudgetCategory {
 // TODO: Port BashArity reusable command-prefix approvals.
 // TODO: Replace token-based command-argument external-directory advisories with parser-based detection.
 // TODO: Restore cmd-specific invocation/path handling on Windows.
-// TODO: Add plugin shell.env environment augmentation once V2 plugin hooks exist.
-// TODO: Add durable/live progress metadata streaming for long-running commands once V2 tool invocation progress context is wired.
 // TODO: Persist background job status and define restart recovery before exposing remote observation.
 // TODO: Re-add model-facing background launch only with owner-bound get/wait/cancel tools and completion delivery.
 // TODO: Add HTTP background-job observation only after durable status, restart recovery, and authorization are defined.
@@ -170,9 +179,42 @@ export const externalCommandDirectories = (command: string, cwd: string) => {
   return [...directories]
 }
 
-const makeCommand = (shell: string, command: string, cwd: string) => {
-  const environment =
-    process.platform === "win32" ? { env: { Path: executablePath() }, extendEnv: true as const } : {}
+// On Windows variable names are case-insensitive: build the whole effective
+// child environment per logical variable name — inherited values first, the
+// executable-path fallback next, hook values last — so a differently-cased
+// hook value reliably replaces the inherited or fallback entry and exactly one
+// key survives per variable. process.env itself stays untouched; the first
+// spelling seen is kept because the OS treats the casing variants as one
+// variable. Other platforms keep the spawner's case-sensitive extendEnv merge.
+export const mergeEnvironmentCaseInsensitive = (
+  inherited: Record<string, string | undefined>,
+  fallback: Record<string, string>,
+  hooks: Record<string, string>,
+) => {
+  const merged: Record<string, string> = {}
+  const spellings = new Map<string, string>()
+  const assign = (entries: Array<[string, string | undefined]>) => {
+    for (const [name, value] of entries) {
+      if (value === undefined) continue
+      const logical = name.toLowerCase()
+      const spelling = spellings.get(logical) ?? name
+      spellings.set(logical, spelling)
+      merged[spelling] = value
+    }
+  }
+  assign(Object.entries(inherited))
+  assign(Object.entries(fallback))
+  assign(Object.entries(hooks))
+  return merged
+}
+
+const makeCommand = (shell: string, command: string, cwd: string, env: Record<string, string>) => {
+  const environment = process.platform === "win32"
+    ? {
+        env: mergeEnvironmentCaseInsensitive(process.env, { Path: executablePath() }, env),
+        extendEnv: false as const,
+      }
+    : { env: { ...env }, extendEnv: true as const }
   if (process.platform === "win32" && Shell.ps(shell)) {
     return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
       ...environment,
@@ -244,10 +286,14 @@ export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const tools = yield* Tools.Service
     const mutation = yield* LocationMutation.Service
+    const location = yield* Location.Service
+    const shellEnvironment = yield* ShellEnvironment.Service
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
     const config = yield* Config.Service
     const permission = yield* PermissionV2.Service
+    const database = Option.getOrUndefined(yield* Effect.serviceOption(Database.Service))
+    const checkouts = Option.getOrUndefined(yield* Effect.serviceOption(WorkspaceCheckout.Service))
     const shell = Shell.acceptable(Config.latest(yield* config.entries(), "shell"))
     const contentStore = Option.getOrUndefined(yield* Effect.serviceOption(ContentStore.Service))
 
@@ -266,7 +312,14 @@ export const layer = Layer.effectDiscard(
                 messageID: context.assistantMessageID,
                 callID: context.toolCallID,
               }
-              const target = yield* mutation.resolve({ path: input.workdir ?? ".", kind: "directory" })
+              const resolveWorkdir = () =>
+                mutation.resolve({ path: input.workdir ?? ".", kind: "directory" }, LocationMutation.guardedPaths)
+              const target = yield* resolveWorkdir()
+              yield* LegacyDelegationGuard.assertShell(
+                { db: database?.db, checkouts },
+                context.sessionID,
+                target.canonical,
+              ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
               const external = target.externalDirectory
               if (external)
                 yield* permission.assert({
@@ -288,10 +341,22 @@ export const layer = Layer.effectDiscard(
                 source,
               })
 
+              const checkWorkdir = Effect.gen(function* () {
+                const current = yield* resolveWorkdir()
+                if (!LocationMutation.sameTarget(target, current))
+                  return yield* new ToolFailure({ message: "Working directory changed while waiting; retry manually." })
+                yield* LegacyDelegationGuard.assertShell(
+                  { db: database?.db, checkouts },
+                  context.sessionID,
+                  current.canonical,
+                ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
+              })
+              yield* checkWorkdir
               if ((yield* fs.stat(target.canonical)).type !== "Directory")
                 return yield* Effect.fail(new Error(`Working directory is not a directory: ${target.canonical}`))
 
-              const command = makeCommand(shell, input.command, target.canonical)
+              const env = yield* shellEnvironment.get({ directory: location.directory, cwd: target.canonical, sessionID: context.sessionID, callID: context.toolCallID })
+              const command = makeCommand(shell, input.command, target.canonical, env)
               const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
               // Spool both streams exactly once while draining; publish the original
               // before the release hook unlinks the temp files.
@@ -299,17 +364,57 @@ export const layer = Layer.effectDiscard(
                 Effect.promise(() => Promise.all([spoolFile("stdout"), spoolFile("stderr")])),
                 ([stdoutSpool, stderrSpool]) =>
                   Effect.gen(function* () {
+                    const preview = liveOutput()
+                    let lastOutput: string | undefined
+                    let lastTruncated = false
+                    const report = Effect.suspend(() => {
+                      if (!preview || !context.progress) return Effect.void
+                      const snapshot = preview.snapshot()
+                      if (snapshot.output === lastOutput && snapshot.truncated === lastTruncated) return Effect.void
+                      return context
+                        .progress({
+                          structured: { command: input.command, cwd: target.canonical, ...snapshot },
+                          content: [],
+                        })
+                        .pipe(
+                          Effect.tap(() =>
+                            Effect.sync(() => {
+                              lastOutput = snapshot.output
+                              lastTruncated = snapshot.truncated
+                            }),
+                          ),
+                        )
+                    })
+                    yield* report
+                    const ticker = context.progress
+                      ? yield* Effect.forkChild(
+                          Effect.forever(Effect.sleep(LIVE_OUTPUT_INTERVAL_MS).pipe(Effect.andThen(report))),
+                        )
+                      : undefined
+                    yield* checkWorkdir
                     const result = yield* appProcess
                       .run(command, {
                         timeout: Duration.millis(timeout),
                         maxOutputBytes: MAX_CAPTURE_BYTES,
                         maxErrorBytes: MAX_CAPTURE_BYTES,
-                        spoolStdout: (chunk) => stdoutSpool.write(chunk),
-                        spoolStderr: (chunk) => stderrSpool.write(chunk),
+                        spoolStdout: (chunk) => {
+                          stdoutSpool.write(chunk)
+                          preview?.push("stdout", chunk)
+                        },
+                        spoolStderr: (chunk) => {
+                          stderrSpool.write(chunk)
+                          preview?.push("stderr", chunk)
+                        },
                       })
                       .pipe(
                         Effect.catchTag("AppProcessError", (error) =>
                           isTimeout(error) ? Effect.succeed(undefined) : Effect.fail(error),
+                        ),
+                        Effect.ensuring(
+                          (ticker ? Fiber.interrupt(ticker) : Effect.void).pipe(
+                            Effect.andThen(Effect.sync(() => preview?.finish())),
+                            Effect.andThen(report),
+                          ),
                         ),
                       )
                     const stdoutSpooled = yield* Effect.promise(() => stdoutSpool.finish())
@@ -318,8 +423,9 @@ export const layer = Layer.effectDiscard(
                       return {
                         command: input.command,
                         cwd: target.canonical,
-                        output: `Command exceeded timeout of ${timeout} ms. Retry with a larger timeout if the command is expected to take longer.`,
-                        truncated: false,
+                        output:
+                          `${preview?.snapshot().output ?? ""}\nCommand exceeded timeout of ${timeout} ms. Retry with a larger timeout if the command is expected to take longer.`.trim(),
+                        truncated: preview?.snapshot().truncated ?? false,
                         timedOut: true,
                         ...(warnings.length ? { warnings } : {}),
                       }
@@ -401,7 +507,9 @@ export const layer = Layer.effectDiscard(
                     }
                   }),
                 ([stdoutSpool, stderrSpool]) =>
-                  Effect.promise(() => Promise.all([stdoutSpool.dispose(), stderrSpool.dispose()]).then(() => undefined)),
+                  Effect.promise(() =>
+                    Promise.all([stdoutSpool.dispose(), stderrSpool.dispose()]).then(() => undefined),
+                  ),
               )
             }).pipe(
               // Permission decisions keep their typed identity as defects: the
@@ -411,11 +519,7 @@ export const layer = Layer.effectDiscard(
               // failures and invited bypass retries with StartProcess/cmd
               // start variants.
               Effect.catchIf(isPermissionDecision, (error) => Effect.die(error)),
-              Effect.mapError((error) =>
-                new ToolFailure({
-                  message: `Unable to execute command: ${input.command}${describeExecutionFailure(error)}`,
-                }),
-              ),
+              Effect.mapError((error) => executionFailure(input.command, error)),
             ),
         }),
       })

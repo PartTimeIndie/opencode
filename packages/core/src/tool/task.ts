@@ -1,7 +1,7 @@
 export * as TaskTool from "./task"
 
 import { ToolFailure } from "@opencode-ai/llm"
-import { Cause, DateTime, Deferred, Effect, Fiber, Layer, Option, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Schema, Semaphore } from "effect"
 import { createHash } from "node:crypto"
 import { AgentV2 } from "../agent"
 import { FanoutWorkflow } from "../fanout-workflow"
@@ -11,24 +11,40 @@ import { Database } from "../database/database"
 import { EventV2 } from "../event"
 import { PermissionV2 } from "../permission"
 import { ProjectV2 } from "../project"
+import { QuestionV2 } from "../question"
 import { SessionV2, admitPrompt, createSession, type CreateInput, type PromptInput } from "../session"
-import { SessionEvent } from "../session/event"
+import { SessionExecution } from "../session/execution"
+import { SessionFork } from "../session/fork"
+import { SessionHistory } from "../session/history"
 import { SessionInput } from "../session/input"
 import { SessionMessage } from "../session/message"
 import { Prompt } from "../session/prompt"
-import { SessionRunner } from "../session/runner"
 import { SessionSchema } from "../session/schema"
 import { SessionStore } from "../session/store"
 import { SessionAgentPolicy } from "../session/agent-policy"
+import { TaskAdmission } from "../session/task-admission"
+import { TaskContext } from "../session/task-context"
+import { DelegationPreferences } from "../session/delegation-preferences"
+import { WorkspaceCheckout } from "../session/workspace/checkout"
+import { WorkspaceBasis } from "../session/workspace/basis"
+import { MirrorRoot } from "../session/workspace/mirror-root"
 import { ContentStore } from "../content-store"
 import { Tool } from "./tool"
 import { ModelPolicy } from "./model-policy"
 import { TaskJob } from "./task-job"
 import { ToolRegistry } from "./registry"
 import { Tools } from "./tools"
+import { reviewerText } from "../util/tool-details"
+import { ReviewerLoopPolicy } from "./reviewer-loop-policy"
+import { collectReviewResult, type ReviewEvidenceReference } from "./review-result-recovery"
 
 export const name = "task"
 export const fanoutName = "multi_agent_fanout"
+
+export function reviewRecoveryEnabled(settings: ConfigMultiAgent.Info | undefined) {
+  const review = settings?.review
+  return typeof review === "object" && review !== null ? review.result_recovery !== false : true
+}
 
 const UNLIMITED = Number.POSITIVE_INFINITY
 const REVIEWER_STATUS_POLL_MS = 15_000
@@ -43,6 +59,18 @@ const ToolBudget = Schema.Struct({
 export const Input = Schema.Struct({
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
+  topics: Schema.Array(Schema.String).pipe(Schema.optional).annotate({
+    description: "Explicitly judged task topics for saved delegation rules and advice. These are not permission or model grants.",
+  }),
+  workspace: Schema.Literals(["mirror", "main", "readonly"]).pipe(Schema.optional).annotate({
+    description: "Defaults to mirror: independent private project files. Readonly restricts this task to read, grep and glob in Main. Main writing requires a separate single-use host approval; this choice grants no file or Shell permission.",
+  }),
+  untracked_paths: Schema.Array(Schema.String).pipe(Schema.optional).annotate({
+    description: "Up to 256 explicitly selected repository-relative non-ignored untracked files to include in a new mirror. Tracked dirty files are included automatically. No free destination path or implicit private-file scan.",
+  }),
+  context: TaskContext.Mode.pipe(Schema.optional).annotate({
+    description: "Initial conversation context, independent of workspace. Defaults to fork (sanitized parent history). Use fresh for a self-contained assignment with only the child's own instructions, no parent history or attachments. Choose explicitly; a failed fork never falls back. Follow-ups retain the original mode and child history.",
+  }),
   subagent_type: Schema.String.annotate({
     description: "The configured agent ID or a plugin-registered alias. Unknown IDs fail closed.",
   }),
@@ -90,6 +118,12 @@ export const Output = Schema.Struct({
 export type Output = typeof Output.Type
 
 const FanoutInput = Schema.Struct({
+  context: TaskContext.Mode.pipe(Schema.optional).annotate({
+    description: "Initial reviewer context: fork (default) inherits sanitized dialogue; fresh receives only the complete review brief and its own instructions. Independent of the enforced read-only workspace. No automatic fallback.",
+  }),
+  topics: Schema.Array(Schema.String).pipe(Schema.optional).annotate({
+    description: "Explicit task topics used by saved delegation rules, not keyword routing or permission grants.",
+  }),
   workflow: Schema.String.annotate({
     description:
       'The registered plugin workflow ID, command, or public name (for example "review" or "/multi-agent-review"). Never pass the tool name "multi_agent_fanout" as the workflow. Commands may include or omit a leading slash; the workflow supplies the configured worker models and result schema.',
@@ -105,7 +139,10 @@ const FanoutInput = Schema.Struct({
   }),
   timeout_ms: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1))
     .pipe(Schema.optional)
-    .annotate({ description: "Deprecated compatibility field; ignored. Reviewers always run without a runtime ceiling. Omit this field." }),
+    .annotate({
+      description:
+        "Deprecated compatibility field; ignored. Reviewers always run without a runtime ceiling. Omit this field.",
+    }),
   tool_budget: ToolBudget.pipe(Schema.optional).annotate({
     description: "Optional hard per-reviewer limits for read, grep, and glob. Omit this for unlimited tool use.",
   }),
@@ -113,9 +150,30 @@ const FanoutInput = Schema.Struct({
 
 const FanoutResult = Schema.Struct({
   reviewer: ConfigMultiAgent.Reviewer,
-  status: Schema.Literals(["success", "spawn_no_output", "error"]),
+  sessionID: Schema.String.pipe(Schema.optional),
+  status: Schema.Literals(["success", "partial", "spawn_no_output", "error"]),
   task: Output,
   result: Schema.Unknown.pipe(Schema.optional),
+  repairClaim: Schema.String.pipe(Schema.optional),
+  recovery: Schema.Struct({
+    source: Schema.Literals(["original", "repaired"]),
+    findings: Schema.Array(Schema.Unknown),
+    original: Schema.String,
+    repaired: Schema.String.pipe(Schema.optional),
+    issues: Schema.Array(Schema.String),
+    evidence: Schema.Array(Schema.Struct({
+      messageID: SessionMessage.ID,
+      partIDs: Schema.Array(Schema.String),
+      digest: Schema.String,
+      phase: Schema.Literals(["initial", "correction", "legacy"]),
+      findingIndexes: Schema.Array(Schema.Number),
+    })).pipe(Schema.optional),
+    // Maps each retained receipt finding back to the full evidence-index space.
+    retainedFindingIndexes: Schema.Array(Schema.Number).pipe(Schema.optional),
+    omittedFindings: Schema.Number.pipe(Schema.optional),
+    usage: Schema.Unknown.pipe(Schema.optional),
+    repairStatus: Schema.Literals(["success", "failed", "unavailable"]).pipe(Schema.optional),
+  }).pipe(Schema.optional),
 })
 
 const FanoutOutput = Schema.Struct({
@@ -184,6 +242,8 @@ Each invocation starts a fresh child session unless you provide task_id to send 
 
 Every child stores a session-scoped capability snapshot. Its tools and permissions are always the intersection of the selected subagent and every parent in the spawn chain; a child can never escalate beyond its parent. Legacy task sessions without this snapshot cannot be resumed.
 
+Context and files are independent: context=fork (default) inherits sanitized conversation history; context=fresh uses only your self-contained assignment and the child's own instructions, with no parent attachments. Choose fresh for bounded independent work; choose fork when prior dialogue matters. Workspace still defaults to mirror. Neither choice bypasses permissions, new steer input, source drift or Main consent. A failed fork never silently becomes fresh. Follow-ups keep the child's history and original mode.
+
 Tasks have no implicit runtime ceiling. Reviewer and registered fanout workflow tasks ignore timeout_ms and always run without a runtime ceiling. For other tasks, set timeout_ms only when the caller explicitly wants a hard deadline; use task_cancel to stop background work manually.
 
 To hand work between models without losing child history, resume the same task_id with the same subagent_type and pass the new model and optional variant. The override applies to the resumed prompt and its execution. Model overrides are restricted to the models configured on the selected agent, the parent session, and its model chain; unconfigured models are rejected with the allowed list instead of being executed.`
@@ -211,18 +271,20 @@ function unknownAgentMessage(input: string, agents: ReadonlyArray<AgentV2.Info>)
 }
 
 type TaskSessionOps = {
+  readonly start?: (input: TaskAdmission.Input) => Effect.Effect<SessionSchema.Info, unknown>
+  readonly followup?: (input: TaskAdmission.FollowupInput) => Effect.Effect<SessionSchema.Info, unknown>
   readonly create: (input: CreateInput) => Effect.Effect<SessionSchema.Info, unknown>
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info, unknown>
   readonly find: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info | undefined, unknown>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionInput.Admitted, unknown>
-  readonly run: (sessionID: SessionSchema.ID) => Effect.Effect<void, unknown>
-  readonly awaitTerminal: (sessionID: SessionSchema.ID, admitted: SessionInput.Admitted) => Effect.Effect<void, unknown>
+  readonly run: (sessionID: SessionSchema.ID, admitted: SessionInput.Admitted) => Effect.Effect<void, unknown>
   readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void, unknown>
-  readonly messages: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionMessage.Message>, unknown>
+  readonly messages: (sessionID: SessionSchema.ID, promptID?: SessionMessage.ID) => Effect.Effect<ReadonlyArray<SessionMessage.Message>, unknown>
   readonly limits: () => Effect.Effect<{ maxThreads: number; maxDepth: number }>
   readonly reviewers: (
     input: ConfigMultiAgent.ResolveReviewerInput,
   ) => Effect.Effect<ConfigMultiAgent.ResolveReviewerResult>
+  readonly reviewRecovery: () => Effect.Effect<boolean>
 }
 
 export function resolveConfiguredReviewers(config: Config.Interface, input: ConfigMultiAgent.ResolveReviewerInput) {
@@ -237,6 +299,10 @@ export function resolveConfiguredReviewers(config: Config.Interface, input: Conf
   )
 }
 
+/** Run durable task input without granting a forced, input-free provider turn. */
+export const runAdmitted = (execution: SessionExecution.Interface, admitted: SessionInput.Admitted) =>
+  execution.wake(admitted.sessionID, admitted.admittedSeq).pipe(Effect.andThen(execution.wait(admitted.sessionID)))
+
 const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -248,6 +314,9 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
       const sessions = yield* sessionOps
       const delivered = new Set<SessionSchema.ID>()
       const workflows = Option.getOrUndefined(yield* Effect.serviceOption(FanoutWorkflow.Service))
+      // Fanout worker call IDs are local correlation keys, not persisted tool
+      // calls. Keep the actual host call separately and out of model input.
+      const fanoutBoundaries = new WeakMap<Tool.Context, { readonly messageID: SessionMessage.ID; readonly callID: string }>()
 
       const task = Tool.make({
         description,
@@ -280,7 +349,9 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                   description: input.description,
                   subagent_type: subagentType,
                 },
-                source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
+                source: { type: "tool", ...(fanoutBoundaries.get(context) ?? {
+                  messageID: context.assistantMessageID, callID: context.toolCallID,
+                }) },
               })
               .pipe(Effect.mapError(() => new ToolFailure({ message: `Permission denied: task ${subagentType}` })))
 
@@ -317,6 +388,7 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
               agent: nextAgent.model,
               parent: parent.model,
               extra: context.allowedModels,
+              direct: workflow !== undefined,
             })
             if (!modelSelection.ok)
               return yield* Effect.fail(new ToolFailure({ message: ModelPolicy.rejectionMessage(modelSelection) }))
@@ -347,10 +419,7 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
             // with the original prompt ID would fail as PromptConflictError
             // instead of reconciling the already-admitted task.
             const reselected =
-              taskID !== undefined &&
-              existing?.model &&
-              input.model === undefined &&
-              input.variant === undefined
+              taskID !== undefined && existing?.model && input.model === undefined && input.variant === undefined
                 ? ModelPolicy.selectModel({
                     agent: nextAgent.model,
                     parent: parent.model,
@@ -359,7 +428,11 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                   })
                 : undefined
             const model =
-              reselected !== undefined ? (reselected.ok ? reselected.model : modelSelection.model) : modelSelection.model
+              reselected !== undefined
+                ? reselected.ok
+                  ? reselected.model
+                  : modelSelection.model
+                : modelSelection.model
             const parentAgent = yield* agents
               .get(context.agent)
               .pipe(
@@ -382,6 +455,34 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                 next_action: "wait" as const,
               }
 
+            const prompt = taskPrompt(input, workflow)
+            // A native dispatch child needs a fresh admitted scope: its saved
+            // binding accepts exactly one input, and a main-writing follow-up
+            // needs its own single-use host consent. Legacy children keep the
+            // ordinary prompt path.
+            if (taskID !== undefined && existing && sessions.followup && existing.agentPolicy?.source.type === "task")
+              yield* sessions.followup({
+                childID,
+                parentID: context.sessionID,
+                parentAgent: context.agent,
+                boundary: {
+                  assistantMessageID: context.assistantMessageID,
+                  toolCallID: fanoutBoundaries.get(context)?.callID ?? context.toolCallID,
+                },
+                prompt: { id: taskPromptID(context), sessionID: childID, prompt, agent: nextAgent.id,
+                  ...(model === undefined ? {} : { model }), resume: false },
+                agent: nextAgent.id,
+                ...(model === undefined ? {} : { model }),
+                topics: input.topics,
+                context: input.context,
+                workflowTools: workflow?.tools,
+                action: workflow ? "multi_agent_fanout" : "task",
+                modelSelection: { requested: input.model, variant: input.variant, workflow: workflow?.configKey },
+              }).pipe(
+                Effect.mapError((error) => admissionFailure(error, "Unable to admit the task follow-up")),
+              )
+
+            return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
             if (input.background) {
               yield* jobs
                 .reserve({
@@ -405,7 +506,10 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                 .pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
             }
 
-            const child = existing
+            // Acquisition and cleanup registration share one mask. Restore only
+            // preparation so a pending interrupt cannot orphan a renewed lease.
+            return yield* restore(Effect.gen(function* () {
+            const child = existing && (taskID !== undefined || !sessions.start)
               ? existing
               : yield* Effect.gen(function* () {
                   const parentDelegableTools = yield* registry.materialize(
@@ -413,7 +517,7 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                     SessionAgentPolicy.delegable(parent.agentPolicy?.tools ?? parentAgent.tools),
                   )
                   const childTools = yield* registry.materialize(nextAgent.permissions, nextAgent.tools)
-                  return yield* sessions.create({
+                  const create: CreateInput = {
                     id: childID,
                     parentID: context.sessionID,
                     title: `${input.description} (@${nextAgent.id} subagent)`,
@@ -431,21 +535,32 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                       type: "task",
                     }),
                     location: parent.location,
-                  })
+                  }
+                  return yield* sessions.start
+                    ? sessions.start({
+                        create,
+                        prompt: { id: taskPromptID(context), sessionID: childID, prompt: taskPrompt(input, workflow),
+                          agent: nextAgent.id, ...(model === undefined ? {} : { model }), resume: false },
+                        parentAgent: context.agent,
+                        boundary: { assistantMessageID: context.assistantMessageID,
+                          toolCallID: fanoutBoundaries.get(context)?.callID ?? context.toolCallID },
+                        workflowTools: workflow?.tools,
+                        action: workflow ? "multi_agent_fanout" : "task",
+                        topics: input.topics,
+                        workspace: input.workspace,
+                        context: input.context,
+                        untrackedPaths: input.untracked_paths,
+                        modelSelection: { requested: input.model, variant: input.variant, workflow: workflow?.configKey },
+                      })
+                    : sessions.create(create)
                 }).pipe(
-                  Effect.tapError((error) =>
-                    input.background
-                      ? jobs
-                          .fail(childID, `Unable to create task session: ${formatRunError(error)}`)
-                          .pipe(Effect.ignore)
-                      : Effect.void,
-                  ),
                   Effect.mapError(
-                    (error) => new ToolFailure({ message: `Unable to create task session: ${formatRunError(error)}` }),
+                    (error) => admissionFailure(error, "Unable to create task session"),
                   ),
                 )
 
-            const prompt = taskPrompt(input, workflow)
+            yield* context.progress?.({ structured: { sessionID: child.id, state: "starting" }, content: [] }) ??
+              Effect.void
             const decodeResult =
               prompt.format?.type === "json_schema" ? FanoutWorkflow.resultDecoder(prompt.format.schema) : undefined
             if (input.background) {
@@ -469,10 +584,9 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                 )
               if (!("admitted" in admission)) return admission
 
-              const backgroundRun = Effect.raceFirst(
-                sessions.awaitTerminal(child.id, admission.admitted),
-                sessions.run(child.id),
-              ).pipe(Effect.andThen(readTaskText(sessions, child.id, admission.admitted, !!prompt.format, decodeResult)))
+              const backgroundRun = sessions.run(child.id, admission.admitted).pipe(
+                Effect.andThen(readTaskText(sessions, child.id, admission.admitted, !!prompt.format, decodeResult)),
+              )
               yield* jobs.launch(
                 child.id,
                 (timeout === undefined
@@ -515,7 +629,11 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
               })
               .pipe(
                 Effect.flatMap((admitted) =>
-                  Effect.raceFirst(sessions.awaitTerminal(child.id, admitted), sessions.run(child.id)).pipe(
+                  (
+                    context.progress?.({ structured: { sessionID: child.id, state: "running" }, content: [] }) ??
+                    Effect.void
+                  ).pipe(
+                    Effect.andThen(sessions.run(child.id, admitted)),
                     Effect.as(admitted),
                   ),
                 ),
@@ -569,6 +687,14 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
               text,
               next_action: "none" as const,
             }
+            })).pipe(Effect.onExit((exit) =>
+              input.background && Exit.isFailure(exit)
+                ? jobs.fail(childID, Cause.hasInterruptsOnly(exit.cause)
+                  ? "Task preparation was interrupted before launch"
+                  : formatRunError(Cause.squash(exit.cause))).pipe(Effect.asVoid)
+                : Effect.void,
+            ))
+            }))
           }),
       })
 
@@ -593,12 +719,54 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                 })
                 if (!resolved.ok) return yield* Effect.fail(new ToolFailure({ message: resolved.reason }))
                 const limits = yield* sessions.limits()
+                const recoveryEnabled = workflow.configKey === "review" && (yield* sessions.reviewRecovery())
                 // Only reviewers proven persisted in Settings extend the model
                 // policy. Requested and injected reviewers are model input:
                 // their models must resolve inside the configured agent,
                 // session, or Settings reviewer models, or the reviewer child
                 // fails closed before its session is created.
                 const reviewerModels = ModelPolicy.refs(resolved.configuredReviewers)
+                const prior = yield* Effect.exit(sessions.messages(context.sessionID))
+                // Keep readable legacy claims; recovery never dispatches collector HTTP.
+                const claimsReadable = Exit.isSuccess(prior)
+                const savedClaims = (claimsReadable ? prior.value : []).flatMap((message) => message.type === "assistant" ? message.content : [])
+                  .filter((part): part is SessionMessage.AssistantTool => part.type === "tool" && part.id === context.toolCallID && part.name === fanoutName)
+                  .flatMap((part) => part.state.status === "pending" ? [] : [
+                    ...(Array.isArray(part.state.structured.reviewers) ? part.state.structured.reviewers : []),
+                    ...(Array.isArray(part.state.structured.results) ? part.state.structured.results : []),
+                  ])
+                  .flatMap((row) => row && typeof row === "object" && typeof row.repairClaim === "string" ? [row.repairClaim] : [])
+                // Historical claims remain diagnostic data only.
+                const reviewers = resolved.reviewers.map((reviewer, index) => ({
+                  reviewer,
+                  state: "queued" as "queued" | "starting" | "running" | "completed" | "partial" | "error",
+                  sessionID: undefined as string | undefined,
+                  text: undefined as string | undefined,
+                  result: undefined as unknown,
+                  recovery: undefined as unknown,
+                  repairClaim: savedClaims.includes(repairClaim(`${context.sessionID}:${context.toolCallID}`, index, workflow.id))
+                    ? repairClaim(`${context.sessionID}:${context.toolCallID}`, index, workflow.id) : undefined as string | undefined,
+                }))
+                const progressLock = Semaphore.makeUnsafe(1)
+                const report = () =>
+                  progressLock.withPermit(
+                    Effect.suspend(
+                      () =>
+                        context.progress?.({
+                          structured: {
+                            workflow: workflow.id,
+                             reviewers: reviewers.map(({ result, recovery, ...reviewer }) => ({ ...reviewer, ...(recovery === undefined ? {} : { recovery: recoveryPreview(recovery) }) })),
+                             partial_results: reviewers.flatMap((row) =>
+                               (row.state === "completed" && row.result !== undefined) || row.state === "partial"
+                                   ? [{ reviewer: row.reviewer, sessionID: row.sessionID, status: row.state === "partial" ? "partial" : "success", ...(row.result === undefined ? {} : { result: row.result }), ...(row.recovery === undefined ? {} : { recovery: recoveryReceipt(row.recovery as Parameters<typeof recoveryReceipt>[0]) }) }]
+                                 : [],
+                             ),
+                          },
+                          content: [],
+                        }) ?? Effect.void,
+                    ),
+                  )
+                yield* report()
                 const results = yield* Effect.forEach(
                   resolved.reviewers,
                   (reviewer, index) => {
@@ -606,7 +774,19 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                       ...context,
                       toolCallID: `${context.toolCallID}-reviewer-${index + 1}`,
                       allowedModels: reviewerModels,
+                      // Never inherit the parent publisher as a child call publisher.
+                      progress: (snapshot) =>
+                        Effect.gen(function* () {
+                          const row = reviewers[index]
+                          if (!row) return
+                          if (typeof snapshot.structured.sessionID === "string")
+                            row.sessionID = snapshot.structured.sessionID
+                          if (snapshot.structured.state === "starting" || snapshot.structured.state === "running")
+                            row.state = snapshot.structured.state
+                          yield* report()
+                        }),
                     }
+                    fanoutBoundaries.set(childContext, { messageID: context.assistantMessageID, callID: context.toolCallID })
                     const reviewerSessionID = taskSessionID(childContext)
                     return Effect.forkChild(
                       Tool.settle(
@@ -618,6 +798,9 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                           input: {
                             description: `Reviewer ${index + 1}: ${reviewer.model}`,
                             prompt: input.prompt,
+                            topics: input.topics,
+                            workspace: "readonly",
+                            context: input.context,
                             subagent_type: workflow.agentID,
                             model: reviewer.model,
                             ...(reviewer.variant === undefined ? {} : { variant: reviewer.variant }),
@@ -638,26 +821,75 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
                       Effect.flatMap((fiber) => waitForReviewer(reviewerSessionID, fiber, sessions)),
                       Effect.match({
                         onFailure: (error) =>
-                          taskError(reviewerSessionID, `Reviewer ${index + 1}: ${reviewer.model}`, formatRunError(error)),
+                          taskError(
+                            reviewerSessionID,
+                            `Reviewer ${index + 1}: ${reviewer.model}`,
+                            formatRunError(error),
+                          ),
                         onSuccess: (output) => output,
                       }),
-                      Effect.map((output) => {
-                        const result = workflow.decode(output.text)
+                      Effect.flatMap((output) => Effect.gen(function* () {
+                         if (workflow.configKey !== "review") return { output, recovery: undefined, result: undefined, partial: false }
+                        const history = yield* sessions.messages(reviewerSessionID, taskPromptID(childContext))
+                          .pipe(Effect.catch(() => Effect.succeed([] as ReadonlyArray<SessionMessage.Message>)))
+                         return { output, ...collectReviewResult({
+                           schema: workflow.resultSchema, messages: history, promptID: taskPromptID(childContext),
+                           completed: output.state === "completed", text: output.text, recoveryEnabled,
+                         }) }
+                      })),
+                      Effect.tap(({ output, recovery, result: recoveredResult, partial }) =>
+                        Effect.gen(function* () {
+                          const row = reviewers[index]
+                          if (!row) return
+                           const result = partial || output.state !== "completed" ? undefined : recoveredResult ?? workflow.decode(output.text)
+                           row.state = result !== undefined ? "completed" : recovery?.findings.length ? "partial" : "error"
+                           row.recovery = recovery
+                           // Keep a model-usable receipt separate from the shortened UI preview.
+                           // Oversized results remain available in the child history, not as a falsely complete receipt.
+                           if (result !== undefined && JSON.stringify(result).length <= 32_000) row.result = result
+                          // Session links originate from the creation callback, not the deterministic pre-spawn ID.
+                           const text = reviewerText(output.text, result ?? (recovery?.findings.length ? { findings: recovery.findings } : undefined))
+                          const limit = Math.max(1, Math.floor(16000 / reviewers.length))
+                           const preview = bytePreview(text, limit)
+                          row.text =
+                            text.length > limit
+                              ? `${preview}\n[Preview shortened; open the agent session for the full result]`
+                              : preview
+                          yield* report()
+                        }),
+                      ),
+                      Effect.map(({ output, recovery, result: recoveredResult, partial }) => {
+                        const result = partial || output.state !== "completed" ? undefined : recoveredResult ?? workflow.decode(output.text)
                         return {
                           reviewer,
+                          ...(reviewers[index]?.sessionID ? { sessionID: reviewers[index].sessionID } : {}),
                           status:
-                            result !== undefined
-                              ? ("success" as const)
+                             result !== undefined
+                               ? ("success" as const)
+                               : recovery?.findings.length ? ("partial" as const)
                               : output.text.startsWith(SPAWN_NO_OUTPUT_PREFIX)
                                 ? ("spawn_no_output" as const)
                                 : ("error" as const),
-                          task: output,
-                          ...(result === undefined ? {} : { result }),
+                           task: output,
+                            ...(result === undefined || Buffer.byteLength(JSON.stringify(result)) > 32_000 ? {} : { result }),
+                            ...(reviewers[index]?.repairClaim ? { repairClaim: reviewers[index].repairClaim } : {}),
+                            ...(recovery === undefined ? {} : { recovery: recoveryReceipt(recovery) }),
                         }
                       }),
                     )
                   },
                   { concurrency: limits.maxThreads === UNLIMITED ? "unbounded" : limits.maxThreads },
+                ).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.gen(function* () {
+                      for (const row of reviewers) {
+                        if (row.state === "completed" || row.state === "partial" || row.state === "error") continue
+                        row.state = "error"
+                        row.text = "Reviewer interrupted"
+                      }
+                      yield* report()
+                    }),
+                  ),
                 )
                 return {
                   workflow: workflow.id,
@@ -734,10 +966,10 @@ const layerWith = <R>(sessionOps: Effect.Effect<TaskSessionOps, never, R>) =>
     }),
   )
 
-export const layer = layerWith(
+/** Session adapter with an explicit job owner, also used by real-layer fixtures. */
+export const sessionLayer = layerWith(
   Effect.gen(function* () {
     const sessions = yield* SessionV2.Service
-    const events = Option.getOrUndefined(yield* Effect.serviceOption(EventV2.Service))
     const messages = (sessionID: SessionSchema.ID) => sessions.messages({ sessionID, order: "asc" })
     return {
       create: sessions.create,
@@ -751,16 +983,16 @@ export const layer = layerWith(
         ),
       prompt: sessions.prompt,
       run: sessions.resume,
-      awaitTerminal: events
-        ? (sessionID, admitted) => waitForTerminalHistory(events, messages, sessionID, admitted)
-        : () => Effect.never,
       interrupt: sessions.interrupt,
       messages,
       limits: () => Effect.succeed({ maxThreads: 4, maxDepth: 2 }),
       reviewers: (input) => Effect.succeed(ConfigMultiAgent.resolveReviewers(input)),
+      reviewRecovery: () => Effect.succeed(true),
     }
   }),
-).pipe(Layer.provide(TaskJob.memory))
+)
+
+export const layer = sessionLayer.pipe(Layer.provide(TaskJob.memory))
 
 export const locationLayer = layerWith(
   Effect.gen(function* () {
@@ -769,25 +1001,49 @@ export const locationLayer = layerWith(
     const projects = yield* ProjectV2.Service
     const store = yield* SessionStore.Service
     const content = yield* ContentStore.Service
-    const runner = yield* SessionRunner.Service
+    const execution = yield* SessionExecution.Service
     const config = yield* Config.Service
+    const agents = yield* AgentV2.Service
+    const permission = yield* PermissionV2.Service
+    const registry = yield* ToolRegistry.Service
+    const checkouts = yield* WorkspaceCheckout.Service.pipe(Effect.provide(WorkspaceCheckout.layer))
+    const questions = Option.getOrUndefined(yield* Effect.serviceOption(QuestionV2.Service))
     const get = Effect.fn("TaskTool.location.get")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
       if (!session) return yield* new SessionV2.NotFoundError({ sessionID })
       return session
     })
-    const messages = (sessionID: SessionSchema.ID) => get(sessionID).pipe(Effect.andThen(store.context(sessionID)))
+    const messages = (sessionID: SessionSchema.ID, promptID?: SessionMessage.ID) => get(sessionID).pipe(
+      Effect.andThen(promptID ? SessionHistory.loadForTask(db, sessionID, promptID) : store.context(sessionID)),
+    )
+    const admission = {
+      db, events, store, content, agents, permission, registry, checkouts,
+      // NEW mirrors live beside the canonical checkout on its own volume. Existing
+      // mirrors never consult this resolver; their saved descriptor wins. When no
+      // default is usable, the host's question service offers one explicit folder.
+      mirrorRoot: MirrorRoot.defaultRoot,
+      ...(questions ? { mirrorRootChoice: mirrorRootChoice(questions) } : {}),
+      delegationLayers: () => Effect.gen(function* () {
+        const entries = yield* config.entries({ refresh: true })
+        if (config.issues && (yield* config.issues()).length)
+          return yield* new DelegationPreferences.Invalid({ reason: "state" })
+        return DelegationPreferences.documentLayers(entries)
+      }),
+      workflowModels: (skillKey: string) => resolveConfiguredReviewers(config, { skillKey }).pipe(
+        Effect.map((resolved) => resolved.ok ? ModelPolicy.refs(resolved.configuredReviewers) : []),
+      ),
+    }
     return {
+      start: (input) => TaskAdmission.admit(admission, input),
+      followup: (input) => TaskAdmission.followup(admission, input),
       create: (input) => createSession({ db, events, projects, store }, input),
       get,
       find: store.get,
       prompt: (input) => admitPrompt({ db, events, store, content }, input),
-      run: (sessionID) => runner.run({ sessionID, force: true }),
-      awaitTerminal: (sessionID, admitted) => waitForTerminalHistory(events, messages, sessionID, admitted),
-      interrupt: (sessionID) =>
-        Effect.gen(function* () {
-          yield* events.publish(SessionEvent.InterruptRequested, { sessionID, timestamp: yield* DateTime.now })
-        }),
+      // Step failures can still recover. Only the managed drain owns completion
+      // and cancellation; observing a failed step must never interrupt its retry.
+      run: (_sessionID, admitted) => runAdmitted(execution, admitted),
+      interrupt: execution.interrupt,
       messages,
       limits: () =>
         config.entries().pipe(
@@ -800,9 +1056,24 @@ export const locationLayer = layerWith(
           }),
         ),
       reviewers: (input) => resolveConfiguredReviewers(config, input),
+      reviewRecovery: () => config.entries({ refresh: true }).pipe(Effect.map((entries) => {
+        return reviewRecoveryEnabled(Config.latest(entries, "multi_agent"))
+      })),
     }
   }),
 )
+
+/** The single explicit folder choice for one exact task start, asked through the
+ * native blocking question UI (a `folder_picker` form field: a folder path, never an
+ * upload). The question row is keyed to the parent's tool call, so an exact retry
+ * reuses that receipt and a drifted start is refused by the question service.
+ * Dismissal resolves to undefined: no start. */
+export const mirrorRootChoice = (questions: QuestionV2.Interface): NonNullable<TaskAdmission.Dependencies["mirrorRootChoice"]> => (input) =>
+  questions.ask({
+    sessionID: input.sessionID,
+    questions: [MirrorRoot.choiceQuestion(input)],
+    tool: { messageID: input.boundary.assistantMessageID, callID: input.boundary.toolCallID },
+  }).pipe(Effect.catchTag("QuestionV2.RejectedError", () => Effect.succeed(undefined)))
 
 function taskPrompt(input: typeof Input.Type, workflow?: FanoutWorkflow.Definition) {
   const schema = input.result_schema ?? workflow?.resultSchema
@@ -861,10 +1132,14 @@ function validateTaskSession(
 ) {
   if (session.parentID !== parentID)
     return Effect.fail(new ToolFailure({ message: `Task ${session.id} does not belong to session ${parentID}` }))
-  if (
-    session.location.directory !== parent.location.directory ||
-    session.location.workspaceID !== parent.location.workspaceID
-  )
+  const mirror = session.agentPolicy?.mirrorWorkspace
+  const privatePlacement = mirror?.taskID === session.id && mirror.directory === session.location.directory &&
+    mirror.sourcePlacement.directory === parent.location.directory && session.agentPolicy?.source.sessionID === parentID &&
+    mirror.basis.sourceSessionID === parentID && WorkspaceBasis.digest(mirror.basis) === mirror.basisDigest &&
+    session.agentPolicy?.executionPlacement?.directory === mirror.directory &&
+    session.agentPolicy.executionPlacement.checkout !== mirror.sourcePlacement.checkout
+  if (!privatePlacement && (session.location.directory !== parent.location.directory ||
+    session.location.workspaceID !== parent.location.workspaceID))
     return Effect.fail(new ToolFailure({ message: `Task ${session.id} is not in this session location` }))
   if (session.agent !== agent.id)
     return Effect.fail(
@@ -896,70 +1171,6 @@ function taskPlacement(
   )
 }
 
-function waitForTerminalHistory(
-  events: EventV2.Interface,
-  messages: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionMessage.Message>, unknown>,
-  sessionID: SessionSchema.ID,
-  admitted: SessionInput.Admitted,
-) {
-  return Effect.acquireUseRelease(
-    Effect.gen(function* () {
-      const terminal = yield* Deferred.make<void>()
-      const unsubscribe = yield* events.listen((event) => {
-        if (!isChildEvent(event, sessionID)) return Effect.void
-        if (isTerminalActivityEvent(event)) return Deferred.succeed(terminal, undefined).pipe(Effect.asVoid)
-        if (event.type !== SessionEvent.Step.Ended.type && event.type !== SessionEvent.Step.Failed.type) return Effect.void
-        return messages(sessionID).pipe(
-          Effect.flatMap((history) =>
-            hasTerminalResponse(history, admitted) ? Deferred.succeed(terminal, undefined).pipe(Effect.asVoid) : Effect.void,
-          ),
-          Effect.ignore,
-        )
-      })
-      return { terminal, unsubscribe }
-    }),
-    ({ terminal }) =>
-      messages(sessionID).pipe(
-        Effect.flatMap((history) => (hasTerminalResponse(history, admitted) ? Effect.void : Deferred.await(terminal))),
-      ),
-    ({ unsubscribe }) => unsubscribe,
-  )
-}
-
-function hasTerminalResponse(messages: ReadonlyArray<SessionMessage.Message>, admitted: SessionInput.Admitted) {
-  const promptIndex = messages.findIndex((message) => message.id === admitted.id)
-  if (promptIndex < 0) return false
-  const candidates = messages.slice(promptIndex + 1)
-  const nextUserIndex = candidates.findIndex((message) => message.type === "user")
-  const window = nextUserIndex === -1 ? candidates : candidates.slice(0, nextUserIndex)
-  const assistants = window.filter((message): message is SessionMessage.Assistant => message.type === "assistant")
-  const assistant = assistants.at(-1)
-  if (assistant?.time.completed === undefined) return false
-  const chain = assistant.model.chain
-  if (assistant.error && chain && (chain.active ?? 0) < chain.steps.length - 1) return false
-  if (admitted.prompt.format?.type !== "json_schema")
-    return assistant.error !== undefined || (assistant.finish !== undefined && assistant.finish !== "tool-calls")
-  if (assistant.structured !== undefined) return true
-  if (!assistant.error) return false
-  if (!assistant.error.message.includes("did not produce structured output")) return true
-  return (
-    assistants.filter((message) => message.error?.message.includes("did not produce structured output")).length >
-    (admitted.prompt.format.retryCount ?? 0)
-  )
-}
-
-function isChildEvent(event: EventV2.Payload, sessionID: SessionSchema.ID) {
-  return (event.data as { readonly sessionID?: string }).sessionID === sessionID
-}
-
-function isTerminalActivityEvent(event: EventV2.Payload) {
-  return (
-    event.type === SessionEvent.Activity.Completed.type ||
-    event.type === SessionEvent.Activity.Failed.type ||
-    event.type === SessionEvent.Activity.Interrupted.type
-  )
-}
-
 function readTaskText(
   sessions: TaskSessionOps,
   sessionID: SessionSchema.ID,
@@ -968,7 +1179,7 @@ function readTaskText(
   decodeResult: ((text: string) => unknown) | undefined,
 ) {
   return Effect.suspend(() =>
-    sessions.messages(sessionID).pipe(
+    sessions.messages(sessionID, admitted.id).pipe(
       Effect.mapError(() => new ToolFailure({ message: `Unable to read task session: ${sessionID}` })),
       Effect.flatMap((messages) => {
         const promptIndex = messages.findIndex((message) => message.id === admitted.id)
@@ -1043,7 +1254,9 @@ function ownedTask(jobs: TaskJob.Interface, taskID: SessionSchema.ID, parentSess
 
 // Reviewers have no fixed runtime ceiling: while the child fiber is still
 // pending, re-check it on a fixed cadence and keep waiting. Only the child's
-// own provider-stream guard, a genuine failure, or cancellation may end it.
+// own provider-stream guard, a genuine failure, cancellation, or a verified
+// identical-action loop (see reviewer-loop-policy) may end it. Suspicion is at
+// most a warning unless a host-attested override granted the suspicion stop.
 function waitForReviewer(
   childID: SessionSchema.ID,
   fiber: Fiber.Fiber<Output, ToolFailure>,
@@ -1053,14 +1266,57 @@ function waitForReviewer(
     const pending = yield* Fiber.join(fiber).pipe(Effect.timeoutOption(REVIEWER_STATUS_POLL_MS))
     if (Option.isNone(pending)) {
       const messages = yield* Effect.orElseSucceed(sessions.messages(childID), () => [])
-      yield* Effect.logDebug("reviewer still working; continuing to wait", {
-        reviewerSessionID: childID,
-        messageCount: messages.length,
-      })
+      const repeats = observeReviewerRepeats(messages)
+      if (repeats >= 2) {
+        // No attested host grant exists for the suspicion stop yet; when one is
+        // added it must bind session, parent call and child run before this
+        // lookup may replace the fail-safe "verified-loop" mode.
+        const decision = ReviewerLoopPolicy.decide("verified-loop", {
+          repeats,
+          // Projected history cannot prove full externalized output, the child's
+          // source stamp, or a delivered correction hint yet; those gates stay
+          // closed, so only the warn path is reachable from this observation.
+          fullOutputEqual: false,
+          sourceStampEqual: false,
+          correctionHintDelivered: false,
+        })
+        if (decision.action === "abort-child") {
+          yield* Effect.logWarning("stopping looping reviewer child", { reviewerSessionID: childID, reason: decision.reason })
+          yield* sessions.interrupt(childID).pipe(Effect.ignore)
+        } else if (decision.action === "warn") {
+          yield* Effect.logWarning("reviewer shows repeated identical actions; continuing to observe", {
+            reviewerSessionID: childID,
+            reason: decision.reason,
+          })
+        }
+      }
       return yield* waitForReviewer(childID, fiber, sessions)
     }
     return pending.value
   })
+}
+
+// Count consecutive identical completed tool actions at the tail of the child's
+// projected history. Signature and full-output hash must both match; a hash of
+// incomplete content can still only warn.
+function observeReviewerRepeats(messages: ReadonlyArray<SessionMessage.Message>): number {
+  const assistant = messages.filter((message): message is SessionMessage.Assistant => message.type === "assistant").at(-1)
+  const calls = (assistant?.content ?? []).filter(
+    (part): part is SessionMessage.AssistantTool => part.type === "tool" && part.state.status === "completed",
+  )
+  if (calls.length === 0) return 0
+  const hash = (call: SessionMessage.AssistantTool) =>
+    createHash("sha256")
+      .update(JSON.stringify(call.state.status === "completed" ? call.state.content : []))
+      .digest("hex")
+  const signature = (call: SessionMessage.AssistantTool) =>
+    `${call.name}:${JSON.stringify(call.state.status === "completed" ? call.state.input : "")}`
+  let repeats = 1
+  for (let index = calls.length - 2; index >= 0; index--) {
+    if (signature(calls[index]) !== signature(calls[index + 1]) || hash(calls[index]) !== hash(calls[index + 1])) break
+    repeats++
+  }
+  return repeats
 }
 
 function deliverTaskStatus(info: TaskJob.Info, delivered: Set<SessionSchema.ID>) {
@@ -1084,7 +1340,8 @@ function taskStatus(info: TaskJob.Info, delivery?: "new" | "already_delivered"):
     ...(info.output === undefined ? {} : { result: info.output }),
     ...(info.error === undefined ? {} : { error: info.error }),
     ...(delivery === undefined ? {} : { delivery }),
-    next_action: info.status === "running" ? "wait" : info.status === "error" ? "resume" : "none",
+    // Terminal failure is not evidence that follow-up admission is safe.
+    next_action: info.status === "running" ? "wait" : "none",
   }
 }
 
@@ -1124,7 +1381,53 @@ function taskError(sessionID: SessionSchema.ID, description: string, text: strin
     state: "error",
     summary: `Task failed: ${description}`,
     text: text || "Task failed without an error message",
-    next_action: "resume",
+    next_action: "none",
+  }
+}
+
+function repairClaim(callID: string, index: number, workflow: string) {
+  return createHash("sha256").update(`${callID}\0${index}\0${workflow}`).digest("hex")
+}
+
+function bytePreview(value: string, limit: number) {
+  const bytes = Buffer.from(value)
+  if (bytes.length <= limit) return value
+  return `${bytes.subarray(0, Math.max(0, limit - 120)).toString("utf8").replace(/[\uD800-\uDBFF]$/, "")}\n[Preview shortened; open the reviewer session for original evidence]`
+}
+
+function recoveryReceipt(value: { source: "original" | "repaired"; findings: unknown[]; original: string; repaired?: string; issues: string[]; evidence?: ReviewEvidenceReference[]; usage?: unknown; repairStatus?: "success" | "failed" | "unavailable" }) {
+  let bytes = 0
+  const retainedFindingIndexes: number[] = []
+  const findings = value.findings.filter((finding, index) => {
+    const size = Buffer.byteLength(JSON.stringify(finding))
+    if (size > 16_000 - bytes) return false
+    bytes += size
+    retainedFindingIndexes.push(index)
+    return true
+  })
+  return {
+    ...value,
+    findings,
+    ...(value.evidence === undefined ? {} : { retainedFindingIndexes }),
+    ...(findings.length < value.findings.length ? { omittedFindings: value.findings.length - findings.length } : {}),
+    original: bytePreview(value.original, 4_000),
+    ...(value.repaired === undefined ? {} : { repaired: bytePreview(value.repaired, 4_000) }),
+    issues: value.issues.slice(0, 20).map((issue) => bytePreview(issue, 200)),
+  }
+}
+
+function recoveryPreview(value: unknown) {
+  if (!value || typeof value !== "object" || !("original" in value)) return
+  const recovery = value as { source?: string; original?: string; repaired?: string; findings?: unknown[]; issues?: string[]; repairStatus?: string }
+  const findings = (recovery.findings ?? []).slice(0, 20)
+    .filter((finding) => Buffer.byteLength(JSON.stringify(finding)) < 1_000)
+  return {
+    source: recovery.source,
+    findings,
+    original: bytePreview(recovery.original ?? "", 2_000),
+    ...(recovery.repaired === undefined ? {} : { repaired: bytePreview(recovery.repaired, 2_000) }),
+    issues: (recovery.issues ?? []).slice(0, 20).map((issue) => bytePreview(issue, 200)),
+    repairStatus: recovery.repairStatus,
   }
 }
 
@@ -1145,6 +1448,21 @@ function classifyPhantom(window: ReadonlyArray<SessionMessage.Message>): "never_
 function formatAssistantError(error: SessionMessage.Assistant["error"]) {
   if (!error) return "Task failed without an error message"
   return error.message
+}
+
+export function admissionFailure(error: unknown, prefix: string) {
+  if (error instanceof SessionFork.CaptureConflict && error.reason === "pending")
+    return new ToolFailure({
+      message: "Task dispatch was not started because the parent session has new or held input (task_pending_input). " +
+        "Process that input through the normal session flow first. Only then create a new task for the current request; " +
+        "do not retry this rejected assignment, switch to context:fresh as a fallback, or change the input ledger manually.",
+      metadata: { code: "task_pending_input", retryable: false, next_action: "process_pending_input" },
+    })
+  if (error instanceof TaskAdmission.Conflict && (error.stage === "mirror-root" || error.reason === "dismissed"))
+    // Retrying the same call cannot help: its question receipt is bound to this start.
+    return new ToolFailure({ message: `${prefix}: ${error.message}`,
+      metadata: { code: error.reason === "dismissed" ? "task_mirror_root_dismissed" : "task_mirror_root_refused", retryable: false } })
+  return new ToolFailure({ message: `${prefix}: ${formatRunError(error)}` })
 }
 
 function formatRunError(error: unknown) {

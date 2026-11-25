@@ -21,6 +21,7 @@ import { isRecord, JsonObject, optionalArray, optionalNull, ProviderShared } fro
 import { OpenAIOptions } from "./utils/openai-options"
 import { Lifecycle } from "./utils/lifecycle"
 import { ToolStream } from "./utils/tool-stream"
+import { StructuredOutputTransport } from "../structured-output-transport"
 
 const ADAPTER = "openai-chat"
 const IMAGE_MIMES = new Set<string>(ProviderShared.IMAGE_MIMES)
@@ -93,6 +94,13 @@ export const bodyFields = {
   messages: Schema.Array(OpenAIChatMessage),
   tools: optionalArray(OpenAIChatTool),
   tool_choice: Schema.optional(OpenAIChatToolChoice),
+  response_format: Schema.optional(Schema.Union([
+    Schema.Struct({ type: Schema.Literal("text") }),
+    Schema.Struct({
+      type: Schema.Literal("json_schema"),
+      json_schema: Schema.Struct({ name: Schema.String, schema: JsonObject, strict: Schema.Boolean }),
+    }),
+  ])),
   stream: Schema.Literal(true),
   stream_options: Schema.optional(Schema.Struct({ include_usage: Schema.Boolean })),
   store: Schema.optional(Schema.Boolean),
@@ -169,6 +177,7 @@ export interface ParserState {
   readonly finishReason?: FinishReason
   readonly lifecycle: Lifecycle.State
   readonly completed: boolean
+  readonly resultContract?: boolean
   /**
    * Tool call fragments whose provider index has not received a full id+name
    * identity yet. Some OpenAI-compatible proxies stream argument deltas for an
@@ -376,6 +385,9 @@ const fromRequest = Effect.fn("OpenAIChat.fromRequest")(function* (
     messages: yield* lowerMessages(request, options.reasoningField),
     tools: request.tools.length === 0 ? undefined : request.tools.map(lowerTool),
     tool_choice: request.toolChoice ? yield* lowerToolChoice(request.toolChoice) : undefined,
+    response_format: request.responseFormat?.type === "json"
+      ? { type: "json_schema" as const, json_schema: { name: "structured_output", schema: request.responseFormat.schema, strict: StructuredOutputTransport.strictSchema(request.responseFormat.schema) } }
+      : request.responseFormat?.type === "text" ? { type: "text" as const } : undefined,
     stream: true as const,
     stream_options: options.includeUsage ? { include_usage: true } : undefined,
     max_tokens: generation?.maxTokens,
@@ -509,6 +521,7 @@ const step = (state: ParserState, event: OpenAIChatStreamEvent) =>
         finishReason,
         lifecycle,
         completed: state.completed,
+        resultContract: state.resultContract,
         ...(Object.keys(pendingToolCalls).length > 0 ? { pendingToolCalls } : {}),
       },
       events,
@@ -562,7 +575,7 @@ const finishEvents = (state: ParserState): ReadonlyArray<LLMEvent> => {
     )
     return events
   }
-  if (reason === "stop" && !state.hasOutput) {
+  if (reason === "stop" && !state.hasOutput && !state.resultContract) {
     events.push(
       LLMEvent.providerError({
         message: "OpenAI Chat provider returned stop without assistant content or a tool call",
@@ -595,18 +608,20 @@ interface OpenAIChatProtocolOptions {
 const makeProtocol = (options: OpenAIChatProtocolOptions) =>
   Protocol.make({
     id: ADAPTER,
+    jsonSchema: true,
     body: {
       schema: OpenAIChatBody,
       from: (request) => fromRequest(request, options),
     },
     stream: {
       event: OpenAIChatStreamEvent,
-      initial: () => ({
+      initial: (request) => ({
         tools: ToolStream.empty<number>(),
         toolCallEvents: [],
         hasOutput: false,
         lifecycle: Lifecycle.initial(),
         completed: false,
+        resultContract: request.responseFormat?.type === "json" || request.responseFormat?.type === "tool",
       }),
       step,
       terminal: (event) => event === "[DONE]",

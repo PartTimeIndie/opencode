@@ -21,6 +21,7 @@ import { ModelV2 } from "../model"
 import { Npm } from "../npm"
 import { PluginV2 } from "../plugin"
 import { ProviderV2 } from "../provider"
+import { CrashActivity } from "../observability/crash-activity"
 
 function modelDTO(model: ModelV2.Info): ProviderModel {
   return catalogSnapshot(Schema.encodeSync(ModelV2.Info)(model)) as ProviderModel
@@ -87,7 +88,11 @@ export function providerCatalogEditor(editor: Catalog.Editor): ProviderCatalogEd
   }
 }
 
-function authMethod(value: ProviderAuthMethod, signal: AbortSignal): Integration.Implementation {
+function traceProvider<A>(pluginID: string, name: string, callback: () => Promise<A>) {
+  return CrashActivity.trackPromise({ kind: "plugin", pluginID, name: `provider.${name}` }, callback)
+}
+
+function authMethod(value: ProviderAuthMethod, signal: AbortSignal, pluginID: string): Integration.Implementation {
   const integrationID = Integration.ID.make(value.integrationID)
   if (!("authorize" in value)) {
     if (value.method.type === "env") return { integrationID, method: Schema.decodeUnknownSync(Integration.EnvMethod)(value.method) }
@@ -99,21 +104,29 @@ function authMethod(value: ProviderAuthMethod, signal: AbortSignal): Integration
     authorize: (inputs) => Effect.gen(function* () {
       const attempt = new AbortController()
       yield* Effect.addFinalizer(() => Effect.sync(() => attempt.abort()))
-      const result = yield* Effect.tryPromise(() => value.authorize(inputs, AbortSignal.any([signal, attempt.signal])))
+      const result = yield* Effect.tryPromise(() => traceProvider(pluginID, "authorize",
+        async () => value.authorize(inputs, AbortSignal.any([signal, attempt.signal])),
+      ))
       if (result.mode === "code") return {
         mode: "code" as const,
         url: result.url,
         instructions: result.instructions,
-        callback: (code: string) => Effect.tryPromise(() => result.callback(code)).pipe(Effect.map(Schema.decodeUnknownSync(Credential.Info))),
+        callback: (code: string) => Effect.tryPromise(() => traceProvider(pluginID, "authorize.callback",
+          async () => result.callback(code),
+        )).pipe(Effect.map(Schema.decodeUnknownSync(Credential.Info))),
       }
       return {
         mode: "auto" as const,
         url: result.url,
         instructions: result.instructions,
-        callback: Effect.tryPromise(() => result.callback).pipe(Effect.map(Schema.decodeUnknownSync(Credential.Info))),
+        callback: Effect.tryPromise(() => traceProvider(pluginID, "authorize.callback",
+          async () => result.callback,
+        )).pipe(Effect.map(Schema.decodeUnknownSync(Credential.Info))),
       }
     }),
-    refresh: value.refresh ? (credential) => Effect.tryPromise((requestSignal) => value.refresh!(credential, AbortSignal.any([signal, requestSignal]))).pipe(
+    refresh: value.refresh ? (credential) => Effect.tryPromise((requestSignal) => traceProvider(pluginID, "refresh",
+      async () => value.refresh!(credential, AbortSignal.any([signal, requestSignal])),
+    )).pipe(
       Effect.map(Schema.decodeUnknownSync(Credential.OAuth)),
     ) : undefined,
   }
@@ -136,7 +149,9 @@ export function providerRegistration(module: ProviderPluginModule, options?: Rea
       const disposers = new Set<() => void | Promise<void>>()
       yield* Effect.addFinalizer(() => Effect.gen(function* () {
         controller.abort()
-        yield* Effect.forEach(Array.from(disposers).reverse(), (dispose) => Effect.promise(async () => dispose()).pipe(
+        yield* Effect.forEach(Array.from(disposers).reverse(), (dispose) => Effect.promise(() =>
+          traceProvider(module.id, "dispose", async () => dispose()),
+        ).pipe(
           Effect.catchCause((cause) => Effect.logError("Provider plugin disposal failed", { id: module.id, cause })),
         ), { discard: true })
         disposers.clear()
@@ -186,7 +201,7 @@ export function providerRegistration(module: ProviderPluginModule, options?: Rea
               }),
               method: { update: (method) => {
                 integrationID(method.integrationID)
-                editor.method.update(authMethod(method, controller.signal))
+                editor.method.update(authMethod(method, controller.signal, module.id))
               } },
             }
             update(publicEditor)
@@ -223,7 +238,7 @@ export function providerRegistration(module: ProviderPluginModule, options?: Rea
           },
         },
       }
-      const hooks = yield* Effect.promise(() => module.provider(api, options))
+      const hooks = yield* Effect.promise(() => traceProvider(module.id, "initialize", async () => module.provider(api, options)))
       if (!hooks) return
       return {
         "catalog.transform": hooks["catalog.transform"] ? (event) => Effect.promise(() => hooks["catalog.transform"]!(providerCatalogEditor(event))) : undefined,

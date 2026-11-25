@@ -12,12 +12,15 @@ export interface Context {
   readonly agent: AgentV2.ID
   readonly assistantMessageID: SessionMessage.ID
   readonly toolCallID: string
+  /** Host-bound observation only; never supplied through model tool arguments. */
+  readonly progress?: (snapshot: Progress) => Effect.Effect<void>
   /** Receipt watermark frozen before the provider request, never model input. */
   readonly fileKnowledgeCutoff?: number
   /** Effective materialization policy, supplied by the host, never model input. */
   readonly toolPolicy?: AgentV2.Info["tools"]
   /** Exact group results retained in the prepared model request, after bounds/transforms. */
   readonly skillGroupOutputs?: ReadonlyArray<string>
+  readonly explicitInvocation?: { readonly command: string; readonly inputID: string; readonly activityID: string }
   /**
    * Additional models the executing tool may select on top of the enforced
    * agent/parent chain policy. Only trusted server code extends the policy
@@ -27,6 +30,11 @@ export interface Context {
    * this way).
    */
   readonly allowedModels?: ReadonlyArray<ModelV2.Ref>
+}
+
+export type Progress = {
+  readonly structured: Record<string, unknown>
+  readonly content: ReadonlyArray<Content>
 }
 
 export type BudgetCategory = "read" | "poll" | "other"
@@ -79,6 +87,7 @@ type Runtime = {
   readonly capabilities?: ReadonlyArray<string>
   readonly alwaysVisible?: boolean
   readonly contractMarker?: string
+  readonly explicitInvocation?: ReadonlyArray<string>
   readonly defaultDisabled?: boolean
   readonly definition: (name: string) => ToolDefinition
   readonly settle: (call: ToolCall, context: Context) => Effect.Effect<ToolOutput, ToolFailure>
@@ -201,6 +210,23 @@ export const withContractMarker = <Input extends SchemaType<any>, Output extends
 }
 
 export const contractMarker = (tool: AnyTool): string | undefined => runtimeOf(tool).contractMarker
+export const explicitInvocation = (tool: AnyTool): ReadonlyArray<string> | undefined =>
+  runtimeOf(tool).explicitInvocation
+export const withExplicitInvocation = <Input extends SchemaType<any>, Output extends SchemaType<any>>(
+  tool: Definition<Input, Output>,
+  command: string | ReadonlyArray<string>,
+) => {
+  const commands = typeof command === "string" ? [command] : command
+  if (
+    !Array.isArray(commands) ||
+    !commands.length ||
+    commands.some((name) => typeof name !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name))
+  )
+    throw new Error("Explicit invocation requires exact lowercase slash-command names without /")
+  const decorated = Object.freeze({}) as Definition<Input, Output>
+  runtimes.set(decorated, { ...runtimeOf(tool), explicitInvocation: Object.freeze([...new Set(commands)]) })
+  return decorated
+}
 export const isDefaultDisabled = (tool: AnyTool) => runtimeOf(tool).defaultDisabled === true
 export const withDefaultDisabled = <Input extends SchemaType<any>, Output extends SchemaType<any>>(
   tool: Definition<Input, Output>,

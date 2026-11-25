@@ -17,6 +17,7 @@ describe("SurfaceHandler.dismissSurfaceRequest", () => {
       open: () => Effect.die("unused"),
       present: () => Effect.die("unused"),
       reply: () => Effect.die("unused"),
+      replyFromMain: () => Effect.die("unused"),
       reject: (id, owner) =>
         Effect.sync(() => {
           dismissed.push({ requestID: id, sessionID: owner })

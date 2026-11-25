@@ -1,5 +1,6 @@
 import { afterEach, describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { CrashActivity } from "@opencode-ai/core/observability/crash-activity"
 import { Effect, Layer } from "effect"
 import { HttpClientResponse } from "effect/unstable/http"
 import { Session as SessionNs } from "@/session/session"
@@ -325,9 +326,24 @@ describe("session messages endpoint", () => {
           .pipe(Effect.orDie)
         yield* database.db.update(SessionTable).set({ directory }).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
 
-        const messages = yield* request(`/api/session/${session.id}/message?limit=80`)
+        const updates: CrashActivity.Update[] = []
+        const messages = yield* Effect.acquireUseRelease(
+          Effect.sync(() => CrashActivity.configure((update) => updates.push(update))),
+          () => request(`/api/session/${session.id}/message?limit=80`),
+          (stop) => Effect.sync(stop),
+        )
         expect(messages.status).toBe(200)
         expect((yield* json<{ data: SessionMessage.Message[] }>(messages)).data).toHaveLength(1)
+        const stages = updates.flatMap((update) =>
+          update.phase === "start" && update.kind === "session-stage" && update.sessionID === session.id ? [update] : [],
+        )
+        expect(stages.map((stage) => stage.name)).toEqual([
+          "http.message-page", "messages.lookup", "messages.query", "messages.decode",
+          "http.message-context", "messages.context-decode", "http.public-projection",
+        ])
+        for (const stage of stages)
+          expect(updates).toContainEqual({ phase: "end", id: stage.id, outcome: "success" })
+        expect(JSON.stringify(updates)).not.toContain("still readable")
 
         const prompt = yield* request(`/api/session/${session.id}/prompt`, {
           method: "POST",

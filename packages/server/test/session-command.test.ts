@@ -5,6 +5,7 @@ import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { CommandV2 } from "@opencode-ai/core/command"
+import { AgentV2 } from "@opencode-ai/core/agent"
 import { PluginBoot } from "@opencode-ai/core/plugin/boot"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -17,8 +18,12 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { ContentStore } from "@opencode-ai/core/content-store"
-import { Effect, Layer } from "effect"
-import { loadSessionCommand } from "../src/handlers/session"
+import { Effect, Layer, Schema } from "effect"
+import { Tool } from "@opencode-ai/core/tool/tool"
+import { ToolRegistry } from "@opencode-ai/core/tool/registry"
+import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
+import { explicitCommandPrompt, loadSessionCommand } from "../src/handlers/session"
 
 const sessionID = SessionV2.ID.make("ses_server_command")
 const messageID = SessionMessage.ID.make("msg_server_command")
@@ -43,6 +48,7 @@ test("admits a local command without waiting for MCP command boot", async () => 
     get: (name) => Effect.succeed(name === command.name ? command : undefined),
   })
   const locations = LocationServiceMap.of({
+    bindExecution: () => Effect.void,
     get: () => Layer.mergeAll(commands, boot) as never,
     invalidate: () => Effect.void,
   })
@@ -109,4 +115,41 @@ test("admits a local command without waiting for MCP command boot", async () => 
       }),
     ).pipe(Effect.provide(layer), Effect.timeout("2 seconds")),
   )
+})
+
+test("command API preserves explicit tool names through template expansion without activating or exposing their schemas", async () => {
+  const registry = ToolRegistry.layer.pipe(
+    Layer.provide(ApplicationTools.layer),
+    Layer.provide(Layer.mock(ToolOutputStore.Service, {})),
+  )
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const tools = yield* ToolRegistry.Service
+    yield* tools.register({ export_report: Tool.withExplicitInvocation(Tool.make({
+      description: "Manual report export", input: Schema.Struct({}), output: Schema.String,
+      execute: () => Effect.die("No execution during command resolution"),
+    }), ["export-report", "report-preview"]) })
+    const expanded = "# Report skill\n\nPrepare a preview only."
+    expect(yield* explicitCommandPrompt("export-report", expanded)).toBe("/export-report\n\n" + expanded)
+    expect(yield* explicitCommandPrompt("report-preview", expanded)).toBe("/report-preview\n\n" + expanded)
+    expect(yield* explicitCommandPrompt("ordinary-command", expanded)).toBe(expanded)
+    expect(yield* explicitCommandPrompt("export-report-extra", expanded)).toBe(expanded)
+    expect((yield* tools.materialize(undefined, undefined, { sessionID, agent: AgentV2.ID.make("build"), lastUserText: "/export-report" })).definitions).toEqual([])
+  })).pipe(Effect.provide(registry)))
+})
+
+test("skill commands keep a leading slash marker so downstream durable checks recognize the invocation", async () => {
+  const registry = ToolRegistry.layer.pipe(
+    Layer.provide(ApplicationTools.layer),
+    Layer.provide(Layer.mock(ToolOutputStore.Service, {})),
+  )
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const expanded = "# Review workflow\n\nAsk the user which findings to implement before editing."
+    expect(yield* explicitCommandPrompt("review-flow", expanded, "skill")).toBe("/review-flow\n\n" + expanded)
+    expect(yield* explicitCommandPrompt("ordinary-command", expanded, "command")).toBe(expanded)
+    expect(yield* explicitCommandPrompt("mcp-command", expanded, "mcp")).toBe(expanded)
+    expect(yield* explicitCommandPrompt("export-report", expanded, "skill")).toBe("/export-report\n\n" + expanded)
+    expect(yield* explicitCommandPrompt("review-flow", "/review-flow\n\n" + expanded, "skill")).toBe(
+      "/review-flow\n\n" + expanded,
+    )
+  })).pipe(Effect.provide(registry)))
 })

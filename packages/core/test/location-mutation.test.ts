@@ -62,31 +62,51 @@ describe("LocationMutation", () => {
     ),
   )
 
-  it.live("rejects a relative lexical escape instead of promoting it to external authority", () =>
+  it.live("classifies a relative lexical escape as external when requested by a guarded tool", () =>
     withTmp((directory) =>
       Effect.gen(function* () {
-        const error = yield* Effect.flip((yield* LocationMutation.Service).resolve({ path: "../outside.txt" }))
+        const mutation = yield* LocationMutation.Service
+        const input = { path: "../outside.txt" }
+        const error = yield* Effect.flip(mutation.resolve(input))
         expect(error).toMatchObject({ _tag: "LocationMutation.PathError", reason: "relative_escape" })
+        const outside = yield* Effect.promise(() => fs.realpath(path.dirname(directory)))
+        expect(yield* mutation.resolve(input, { authorizeExternalAliases: true })).toMatchObject({
+          canonical: path.join(outside, "outside.txt"),
+          resource: path.join(outside, "outside.txt").replaceAll("\\", "/"),
+          externalDirectory: { directory: outside, resource: path.join(outside, "*").replaceAll("\\", "/") },
+        })
       }).pipe(provide(directory)),
     ),
   )
 
-  it.live("rejects a prospective target below an escaping symlink ancestor", () =>
-    withTmp((directory) => {
-      const outside = `${directory}-outside`
-      return Effect.gen(function* () {
-        if (process.platform === "win32") return
-        yield* Effect.promise(async () => {
-          await fs.mkdir(outside)
-          await fs.symlink(outside, path.join(directory, "escape"))
-        })
-        const error = yield* Effect.flip(
-          (yield* LocationMutation.Service).resolve({ path: path.join("escape", "new.txt") }),
-        )
+  it.live("classifies a prospective target below an external symlink or junction using its canonical directory", () =>
+    withTmp((directory) => withTmp((outside) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => fs.symlink(outside, path.join(directory, "escape"), process.platform === "win32" ? "junction" : "dir"))
+        const mutation = yield* LocationMutation.Service
+        const input = { path: path.join("escape", "new.txt") }
+        const error = yield* Effect.flip(mutation.resolve(input))
         expect(error).toMatchObject({ _tag: "LocationMutation.PathError", reason: "location_escape" })
-        yield* Effect.promise(() => fs.rm(outside, { recursive: true, force: true }))
-      }).pipe(provide(directory))
-    }),
+        const root = yield* Effect.promise(() => fs.realpath(outside))
+        expect(yield* mutation.resolve(input, { authorizeExternalAliases: true })).toMatchObject({
+          canonical: path.join(root, "new.txt"),
+          externalDirectory: { directory: root, resource: path.join(root, "*").replaceAll("\\", "/") },
+        })
+      }).pipe(provide(directory)),
+    )),
+  )
+
+  it.live("does not treat a dangling symlink or junction as a prospective directory", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => fs.symlink(path.join(directory, "missing"), path.join(directory, "dangling"), process.platform === "win32" ? "junction" : "dir"))
+        const mutation = yield* LocationMutation.Service
+        for (const target of ["dangling", "dangling/new.txt"]) {
+          const error = yield* Effect.flip(mutation.resolve({ path: target }, { authorizeExternalAliases: true }))
+          expect(error).toMatchObject({ _tag: "LocationMutation.PathError", reason: "unresolved_identity" })
+        }
+      }).pipe(provide(directory)),
+    ),
   )
 
   it.live("follows an in-location symlink using ordinary filesystem semantics", () =>

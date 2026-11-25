@@ -1,4 +1,6 @@
-import type { AppHostDesktopServiceState } from "@opencode-ai/plugin/app"
+import type { AppHostClipboardWriteResult, AppHostDesktopServiceState } from "@opencode-ai/plugin/app"
+import type { AttentionCommand, AttentionResult } from "@/session-attention/broker"
+import type { AttentionEntry } from "@/session-attention/state"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import type { AsyncStorage, SyncStorage } from "@solid-primitives/storage"
 import type { Accessor } from "solid-js"
@@ -99,6 +101,15 @@ type PlatformBase = {
   /** Storage mechanism, defaults to localStorage */
   storage?: (name?: string) => SyncStorage | AsyncStorage
 
+  /** Desktop main-process writer for cross-window important-session results. */
+  sessionAttention?: {
+    list(): Promise<Record<string, AttentionEntry>>
+    update(command: AttentionCommand): Promise<AttentionResult>
+    subscribe(callback: (key: string, entry: AttentionEntry) => void): () => void
+    visible(key: string | null): Promise<void>
+    isVisible(key: string): Promise<boolean>
+  }
+
   /** Application-global desktop updater */
   updater?: UpdaterPlatform
 
@@ -128,6 +139,9 @@ type PlatformBase = {
 
   /** Native embedded browser host available in the desktop shell. */
   embeddedBrowser?: "webview"
+
+  /** Reserve or release a browser guest during a user-directed dock transfer. */
+  browserTransfer?(action: "reserve" | "commit" | "release", id: number, ticket?: string): Promise<string | boolean>
 
   /** Get whether native pinch/Ctrl-scroll zoom gestures are enabled (desktop only) */
   getPinchZoomEnabled?(): Promise<boolean> | boolean
@@ -161,6 +175,9 @@ type PlatformBase = {
     input: { pluginID: string; serviceID: string; accelerator: string },
     onInvoke: (invocation: PlatformDesktopServiceInvocation) => void | Promise<void>,
   ): Promise<PlatformDesktopServiceRegistration>
+
+  /** Write text through the desktop shell; works without renderer focus (desktop only). */
+  writeClipboardText?(text: string): Promise<AppHostClipboardWriteResult>
 }
 
 export type Platform = PlatformBase &

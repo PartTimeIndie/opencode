@@ -1,4 +1,4 @@
-import { For, Index, Match, Show, Switch, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { For, Index, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Dialog } from "@opencode-ai/ui/v2/dialog-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
@@ -12,8 +12,10 @@ import { useCommand } from "@/context/command"
 import { useLayout } from "@/context/layout"
 import { useServer } from "@/context/server"
 import { useServerSDK } from "@/context/server-sdk"
+import { useServerSync } from "@/context/server-sync"
 import { SettingsModelTargetPickerV2 } from "@/components/settings-model-target-picker"
 import { SettingsModelPickerV2 } from "@/components/settings-model-picker"
+import { SettingsVoicePickerV2 } from "@/components/settings-voice-picker"
 import { subscribeAppPluginSettingsChanges } from "@/plugin/app-plugin-settings-events"
 import {
   modelTargetSettingsField,
@@ -26,8 +28,10 @@ import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
 import { SettingsContributionV2 } from "./parts/contribution"
 import { pluginSettingsFieldAction, pluginSettingsSectionAction, pluginToolbarAction, SETTINGS_ANCHOR_EVENT } from "./search-index"
-import { createPluginSettingItem, readPluginSetting, updatePluginSetting } from "./plugin-setting-values"
+import { createPluginSettingItem, pluginSettingsLeafFields, readPluginSetting, updatePluginSetting } from "./plugin-setting-values"
 import { createPluginSettingsRevisions } from "./plugin-settings-revisions"
+import { createSkillBrowser } from "./skill-browser"
+import { DelegationSettingsPanel } from "./delegation"
 import "./settings-v2.css"
 
 export function SettingsSkillsPluginsV2() {
@@ -57,6 +61,8 @@ export function SettingsSkillsPluginsV2() {
       </div>
       <div class="settings-v2-tab-body">
         <PluginToolbarSettingsPanel />
+        <SkillPolicySettingsPanel />
+        <DelegationSettingsPanel />
         <Show when={plugins.settingsItems().length > 0}>
           <For each={plugins.settingsItems()}>
             {(item) => <PluginSettingsPanel item={item} revision={revisions.get(item.pluginID ?? item.id)} />}
@@ -64,6 +70,187 @@ export function SettingsSkillsPluginsV2() {
         </Show>
       </div>
     </>
+  )
+}
+
+type EffectiveSkillPolicy = {
+  visible: boolean
+  invocation: string
+  sources: { visible: string; invocation: string }
+}
+
+type SkillPolicyRow = {
+  name: string
+  description?: string
+  effective?: EffectiveSkillPolicy
+}
+
+const invocationOptions = [
+  { value: "allow" as const, label: "Allow" },
+  { value: "ask" as const, label: "Ask" },
+  { value: "manual" as const, label: "Manual" },
+  { value: "deny" as const, label: "Deny" },
+]
+
+const sourceLabel = (source: string | undefined) => {
+  switch (source) {
+    case "agent-entry":
+      return "agent override"
+    case "global-entry":
+      return "global setting"
+    case "legacy-manual":
+      return "legacy manual list"
+    default:
+      return "skill metadata"
+  }
+}
+
+/**
+ * Global skill invocation/visibility defaults. Catalog visibility and
+ * invocation consent are independent fields: hiding a skill never blocks it,
+ * and invocation modes never change toolbar icon visibility.
+ */
+export function SkillPolicySettingsPanel() {
+  const layout = useLayout()
+  const serverSDK = useServerSDK()
+  const serverSync = useServerSync()
+  const [search, setSearch] = createSignal("")
+  const [pending, setPending] = createSignal("")
+  const browser = createSkillBrowser<SkillPolicyRow>(async () => {
+    const directory = layout.projects.list()[0]?.worktree
+    if (!directory) throw new Error("Open a project to manage its available skills.")
+    const response = await serverSDK().client.v2.skill.list({ location: { directory } })
+    if (response.error || !response.data) throw new Error("Skills could not be loaded. Try again.")
+    return response.data.data ?? []
+  })
+  const skills = browser.items
+  const expanded = browser.expanded
+  const refresh = browser.refresh
+  const reveal = browser.reveal
+  onCleanup(browser.dispose)
+  onMount(() => {
+    const listener = (event: Event) => {
+      if ((event as CustomEvent<string>).detail === "settings-skill-policy") reveal()
+    }
+    window.addEventListener(SETTINGS_ANCHOR_EVENT, listener)
+    onCleanup(() => window.removeEventListener(SETTINGS_ANCHOR_EVENT, listener))
+  })
+
+  const apply = async (
+    name: string,
+    entry: { visible?: boolean | null; invocation?: "allow" | "ask" | "manual" | "deny" | null },
+  ) => {
+    setPending(name)
+    try {
+      await serverSync().updateConfig({ skill_policy: { global: { [name]: entry } } } as never)
+      showToast({ title: "Skill policy saved", description: name })
+      refresh()
+    } catch (error) {
+      showToast({
+        title: "Skill policy could not be saved",
+        description: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      setPending("")
+    }
+  }
+
+  const filtered = createMemo(() => {
+    const query = search().trim().toLowerCase()
+    const all = skills() ?? []
+    if (!query) return all
+    return all.filter(
+      (item) => item.name.toLowerCase().includes(query) || item.description?.toLowerCase().includes(query),
+    )
+  })
+
+  return (
+    <div class="settings-v2-section" data-action="settings-skill-policy" data-skill-policy-settings>
+      <div class="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 class="settings-v2-section-title">Skills</h3>
+          <p class="text-12-regular text-text-weak mt-1">
+            Visibility controls the model catalog only. Invocation decides how a skill may load; hidden skills stay
+            selectable in the slash menu.
+          </p>
+        </div>
+        <ButtonV2
+          type="button"
+          size="small"
+          variant="neutral"
+          class="shrink-0 whitespace-nowrap"
+          aria-expanded={expanded()}
+          onClick={() => expanded() ? browser.collapse() : reveal()}
+        >
+          {expanded() ? "Hide skills" : "Browse skills"}
+        </ButtonV2>
+      </div>
+      <Show when={expanded()}>
+        <TextInputV2
+          type="search"
+          appearance="base"
+          class="max-w-full"
+          placeholder="Filter skills"
+          aria-label="Filter skills"
+          value={search()}
+          onInput={(event) => setSearch(event.currentTarget.value)}
+        />
+      <Show when={browser.error()}>
+        <div role="alert" class="text-12-regular text-text-weak">
+          {browser.error()}
+          <ButtonV2 size="small" variant="neutral" onClick={() => void refresh()}>Try again</ButtonV2>
+        </div>
+      </Show>
+      <Show when={!browser.error()}>
+      <Show when={skills() !== undefined} fallback={<p class="text-12-regular text-text-weak">Loading skills…</p>}>
+        <SettingsListV2>
+          <For each={filtered()}>
+            {(item) => {
+              const effective = () => item.effective
+              return (
+                <SettingsRowV2
+                  title={`/${item.name}`}
+                  description={effective() ? `${item.description ?? ""} · catalog: ${effective()?.visible ? "shown" : "hidden"} (${sourceLabel(effective()?.sources.visible)}) · invocation: ${effective()?.invocation} (${sourceLabel(effective()?.sources.invocation)})` : `${item.description ?? ""} · effective policy unavailable`}
+                >
+                  <div class="flex items-center gap-2" data-skill-policy-row={item.name}>
+                    <SwitchV2
+                      checked={effective()?.visible ?? false}
+                      aria-label={`Show ${item.name} in the model catalog`}
+                      disabled={!effective() || pending() === item.name}
+                      onChange={(value) => void apply(item.name, { visible: value })}
+                    />
+                    <SelectV2
+                      appearance="inline"
+                      options={invocationOptions}
+                      current={invocationOptions.find((option) => option.value === effective()?.invocation)}
+                      value={(option) => option.value}
+                      label={(option) => option.label}
+                      placement="bottom-end"
+                      gutter={6}
+                      disabled={!effective() || pending() === item.name}
+                      onSelect={(option) => option && void apply(item.name, { invocation: option.value })}
+                    />
+                    <ButtonV2
+                      size="small"
+                      variant="ghost-muted"
+                      disabled={pending() === item.name}
+                      onClick={() => void apply(item.name, { visible: null, invocation: null })}
+                    >
+                      Reset
+                    </ButtonV2>
+                  </div>
+                </SettingsRowV2>
+              )
+            }}
+          </For>
+        </SettingsListV2>
+        <Show when={filtered().length === 0}>
+          <p class="text-12-regular text-text-weak">No matching skills.</p>
+        </Show>
+      </Show>
+      </Show>
+      </Show>
+    </div>
   )
 }
 
@@ -261,6 +448,16 @@ function PluginSettingsField(props: {
     return plugins.settingValue(pluginID(), props.rootKey ?? props.field.key, props.rootDefault ?? fieldDefault(props.field))
   }
   const value = <T,>(fallback: T) => readPluginSetting(root(), props.path ?? [], fallback) as T
+  const reference = (key: string | undefined) => {
+    props.revision
+    if (!key) return ""
+    const field = pluginSettingsLeafFields(props.item.sections.flatMap((section) => section.fields)).find((item) => item.key === key)
+    const fallback = field ? fieldDefault(field) : ""
+    const result = props.item.storage
+      ? props.item.storage.read(key, fallback)
+      : plugins.settingValue(pluginID(), key, fallback)
+    return typeof result === "string" ? result : ""
+  }
   const set = (next: unknown) => {
     const update = (current: unknown) => updatePluginSetting(current, props.path ?? [],
       typeof next === "function" ? next(readPluginSetting(current, props.path ?? [], fieldDefault(props.field))) : next)
@@ -285,7 +482,7 @@ function PluginSettingsField(props: {
       )}
       title={props.field.label}
       description={props.field.description}
-      block={["skill-list", "object", "list"].includes(props.field.type)}
+      block={["skill-list", "object", "list", "voice"].includes(props.field.type)}
     >
       <Switch>
         <Match when={props.field.type === "model-selection" ? props.field : undefined}>
@@ -413,6 +610,18 @@ function PluginSettingsField(props: {
               required={field().required}
               autoSelectSingle={field().autoSelectSingle}
               autoSelectDefault={field().autoSelectDefault}
+              onChange={set}
+            />
+          )}
+        </Match>
+        <Match when={props.field.type === "voice" ? props.field : undefined}>
+          {(field) => (
+            <SettingsVoicePickerV2
+              value={String(value(field().default))}
+              target={reference(field().targetKey)}
+              language={reference(field().languageKey)}
+              label={field().label}
+              allowCustom={field().allowCustom}
               onChange={set}
             />
           )}

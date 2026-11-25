@@ -171,7 +171,7 @@ const cases = [
     agent: "build",
     turns: 1,
     prompt:
-      "Laufende freigegebene Aufgabe: unmittelbare Location-Effekte und Core-eigene Kartenprojektion prüfen. Welche zuständige PU-Fachreferenz musst du lesen? Nenne den konkreten Pfad. Lade keine fachfremden Release-/Nightly-Referenzen.",
+      "Synthetische Referenzauswahl: Ein erfundenes Projekt dokumentiert die Spielansicht in gameplay-presentation.md und Veröffentlichungen in release-and-mirrors.md. Die Aufgabe betrifft ausschließlich die Spielansicht. Welche zuständige Referenz musst du lesen? Nenne den konkreten Pfad. Lade keine fachfremden Release-Referenzen; führe keine Projektaktionen aus.",
   },
   {
     id: "test-boundary",
@@ -332,7 +332,7 @@ if (reviewPlan) {
       {
         role: "system",
         content:
-          "Independent read-only defect review. Inspect only the supplied plan and current source for C:/GitRepros/PU on master and C:/GitRepros/opencode on dev. No branches/worktrees, writes or execution. Return JSON {verdict: pass|findings|needs_review, findings:[{severity,path,message,evidence,suggestion}]}. Report actionable defects, not promises. Legacy plan-validation paperwork is not a veto over explicit human continuation. Source support is not installed support. Check scope/permissions/manual modes, actual minimum visible membership, cheaper root, nested traversal, aliases, revision and retained history/compaction, opt-in config and native-host compatibility. Do not waive tests.",
+          "Independent read-only defect review. Inspect only the supplied plan and source excerpts from this checkout. Do not infer another project, branch or external source location. No branches/worktrees, writes or execution. Return JSON {verdict: pass|findings|needs_review, findings:[{severity,path,message,evidence,suggestion}]}. Report actionable defects, not promises. Legacy plan-validation paperwork is not a veto over explicit human continuation. Source support is not installed support. Check scope/permissions/manual modes, actual minimum visible membership, cheaper root, nested traversal, aliases, revision and retained history/compaction, opt-in config and native-host compatibility. Do not waive tests.",
       },
       {
         role: "user",

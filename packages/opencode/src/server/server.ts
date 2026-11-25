@@ -1,13 +1,14 @@
 import "./init-projectors"
 
 import { NodeHttpServer } from "@effect/platform-node"
-import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
+import { Cause, ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
-import { createServer } from "node:http"
+import { createStartupServer } from "./startup-server"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
+import { traceSessionRead } from "./routes/instance/httpapi/middleware/session-read-crash-trace"
 import { WebSocketTracker } from "./routes/instance/httpapi/websocket-tracker"
 import { PublicApi } from "./routes/instance/httpapi/public"
 import type { CorsOptions } from "@opencode-ai/server/cors"
@@ -70,12 +71,15 @@ export async function openapi() {
 export let url: URL | undefined
 
 export async function listen(opts: ListenOptions): Promise<Listener> {
-  const listener = await Effect.runPromise(listenEffect(opts))
+  return promiseListener(await Effect.runPromise(listenEffect(opts)))
+}
+
+export function promiseListener(listener: EffectListener): Listener {
   return {
     hostname: listener.hostname,
     port: listener.port,
     url: listener.url,
-    stop: (close?: boolean) => Effect.runPromiseExit(listener.stop(close)).then(() => undefined),
+    stop: (close?: boolean) => Effect.runPromise(listener.stop(close)),
   }
 }
 
@@ -98,12 +102,12 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
 
 function listenerLayer(opts: ListenOptions, port: number) {
   return HttpRouter.serve(HttpApiApp.createRoutes(opts), {
-    middleware: disposeMiddleware,
+    middleware: (effect) => traceSessionRead(disposeMiddleware(effect)),
     disableLogger: true,
     disableListenLog: true,
   }).pipe(
     Layer.provideMerge(WebSocketTracker.layer),
-    Layer.provideMerge(serverLayer({ port, hostname: opts.hostname })),
+    Layer.provideMerge(serverLayer({ ...opts, port })),
     // Install a fresh `ConfigProvider` per listener so `Config.string(...)`
     // reads reflect the current `process.env`. Effect's default
     // `ConfigProvider` snapshots `process.env` on first read and caches the
@@ -173,7 +177,6 @@ function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>, list
     const forceCloseOnce = yield* Effect.cached(forceClose(state).pipe(Effect.ignore))
     const closeScopeOnce = yield* Effect.cached(
       Scope.close(state.scope, Exit.void).pipe(
-        Effect.ignore,
         Effect.ensuring(
           Effect.sync(() => {
             if (url === listenerUrl) url = undefined
@@ -186,7 +189,13 @@ function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>, list
       Effect.gen(function* () {
         yield* unpublishMdns
         if (close) yield* forceCloseOnce
-        yield* closeScopeOnce
+        yield* closeScopeOnce.pipe(
+          Effect.catchCause((cause) =>
+            close && cause.reasons.length > 0 && cause.reasons.every(Cause.isInterruptReason)
+              ? Effect.void
+              : Effect.failCause(cause),
+          ),
+        )
       })
   })
 }
@@ -195,8 +204,8 @@ function forceClose(state: ListenerState) {
   return Effect.all([state.http.closeAll, state.websockets.closeAll], { concurrency: "unbounded", discard: true })
 }
 
-function serverLayer(opts: { port: number; hostname: string }) {
-  const server = createServer()
+function serverLayer(opts: ListenOptions) {
+  const server = createStartupServer(opts)
   server.on("connection", (socket) => {
     socket.on("error", (error) => {
       if (isClientDisconnect(error)) return

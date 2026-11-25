@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process"
-import { access, copyFile, mkdir, rename, rm } from "node:fs/promises"
+import { access, copyFile, cp, mkdir, rename, rm } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 
@@ -11,6 +11,7 @@ export type CliInstallDependencies = {
   access: typeof access
   mkdir: typeof mkdir
   copyFile: typeof copyFile
+  cp: typeof cp
   rename: typeof rename
   rm: typeof rm
   randomUUID: typeof randomUUID
@@ -58,16 +59,33 @@ export async function refreshManagedCli(deps: CliInstallDependencies = defaults(
 
 async function replaceCliAtomically(deps: CliInstallDependencies, source: string, directory: string, target: string) {
   const temporary = join(directory, `.opencode-${deps.randomUUID()}.tmp`)
+  const packages = join(directory, "plugin-packages")
+  const stagedPackages = join(directory, `.opencode-packages-${deps.randomUUID()}.tmp`)
+  const previousPackages = join(directory, `.opencode-packages-${deps.randomUUID()}.previous`)
   const cleanup = () => deps.rm(temporary, { force: true }).catch(() => undefined)
 
-  await deps.copyFile(source, temporary).catch(async (error) => {
+  try {
+    await deps.copyFile(source, temporary)
+    for (const family of ["provider", "tui"]) {
+      const packaged = join(deps.resourcesPath, "plugin-packages", family)
+      await deps.access(join(packaged, "release-manifest.json"))
+      await deps.cp(packaged, join(stagedPackages, family), { recursive: true })
+    }
+    const existing = await deps.access(packages).then(() => true).catch(() => false)
+    if (existing) await deps.rename(packages, previousPackages)
+    try {
+      await deps.rename(stagedPackages, packages)
+      await deps.rename(temporary, target)
+    } catch (error) {
+      await deps.rm(packages, { recursive: true, force: true })
+      if (existing) await deps.rename(previousPackages, packages)
+      throw error
+    }
+    if (existing) await deps.rm(previousPackages, { recursive: true, force: true })
+  } finally {
     await cleanup()
-    throw error
-  })
-  await deps.rename(temporary, target).catch(async (error) => {
-    await cleanup()
-    throw error
-  })
+    await deps.rm(stagedPackages, { recursive: true, force: true })
+  }
   return target
 }
 
@@ -89,6 +107,7 @@ function defaults(): CliInstallDependencies {
     access,
     mkdir,
     copyFile,
+    cp,
     rename,
     rm,
     randomUUID,

@@ -152,15 +152,30 @@ export namespace EffectFlock {
         const now = wall()
 
         const hb = yield* safeStat(heartbeatPath)
-        if (hb) return now - mtimeMs(hb) > STALE_MS
-
         const meta = yield* safeStat(metaPath)
-        if (meta) return now - mtimeMs(meta) > STALE_MS
-
         const dir = yield* safeStat(lockDir)
-        if (!dir) return false
+        const latest = hb ?? meta ?? dir
+        if (!latest || now - mtimeMs(latest) <= STALE_MS) return false
+        if (!meta) return true
 
-        return now - mtimeMs(dir) > STALE_MS
+        // A delayed heartbeat is not proof that its writer exited. In
+        // particular, an event-loop stall must not let another process replace
+        // a live generation and make its eventual release fail token checks.
+        const raw = yield* fs.readFileString(metaPath).pipe(Effect.option)
+        if (Option.isNone(raw)) return false
+        const owner = Schema.decodeUnknownOption(LockMetaJson)(raw.value)
+        if (Option.isNone(owner)) return false
+        if (owner.value.hostname !== hostname || !Number.isSafeInteger(owner.value.pid) || owner.value.pid <= 0)
+          return false
+        return yield* Effect.sync(() => {
+          try {
+            process.kill(owner.value.pid, 0)
+            return false
+          } catch (cause) {
+            // Permission failures and unknown process state are not death.
+            return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ESRCH"
+          }
+        })
       })
 
       // -- single lock attempt --

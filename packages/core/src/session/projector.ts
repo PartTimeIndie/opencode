@@ -1,6 +1,6 @@
 export * as SessionProjector from "./projector"
 
-import { and, desc, eq, gt, gte, inArray, lt, sql } from "drizzle-orm"
+import { and, desc, eq, gt, gte, inArray, isNull, lt, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { createHash } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -9,9 +9,11 @@ import { basename, join } from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
-import { EventCheckpointTable, EventSequenceTable } from "../event/sql"
+import { EventCheckpointTable, EventSequenceTable, EventTable } from "../event/sql"
 import { LayerNode } from "../effect/layer-node"
 import { SessionEvent } from "./event"
+import { SessionAgentPolicy } from "./agent-policy"
+import { SessionAgentPolicyEvent } from "./agent-policy-event"
 import { SessionV1 } from "../v1/session"
 import { WorkspaceTable } from "../control-plane/workspace.sql"
 import { ProjectTable } from "../project/sql"
@@ -20,6 +22,10 @@ import { SessionMessageUpdater } from "./message-updater"
 import { SessionSchema } from "./schema"
 import { SessionInput } from "./input"
 import { SessionPlanDocument } from "./plan-document"
+import { SessionProtection } from "./protection"
+import { SessionForkEvent } from "./fork-event"
+import { SessionForkAttachments } from "./fork-attachments"
+import { AttachmentTable } from "../attachment.sql"
 import { WorkspaceV2 } from "../workspace"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
@@ -30,6 +36,8 @@ import {
   SessionContextEpochTable,
   SessionInputTable,
   SessionMessageTable,
+  SessionSkillSelectionBarrierTable,
+  SessionSkillSelectionTable,
   SessionTable,
 } from "./sql"
 import { AbsolutePath, type DeepMutable } from "../schema"
@@ -42,12 +50,12 @@ type ProjectionDatabase = Pick<DatabaseService, "select">
 
 const projectionCheckpointVersion = 2
 export const CheckpointAdapterID = "session-v2-projection"
-export const CheckpointAdapterVersion = 4
+export const CheckpointAdapterVersion = 5
 export function canRestoreCheckpointVersion(version: number) {
-  return [1, projectionCheckpointVersion, 3, CheckpointAdapterVersion].includes(version)
+  return [1, projectionCheckpointVersion, 3, 4, CheckpointAdapterVersion].includes(version)
 }
 export function hasCheckpointLegacyProjection(version: number) {
-  return [projectionCheckpointVersion, 3, CheckpointAdapterVersion].includes(version)
+  return [projectionCheckpointVersion, 3, 4, CheckpointAdapterVersion].includes(version)
 }
 const checkpointAdapterID = CheckpointAdapterID
 const checkpointAdapterVersion = CheckpointAdapterVersion
@@ -123,6 +131,7 @@ type SessionProjection = {
   readonly legacyParts: ReadonlyArray<typeof PartTable.$inferSelect>
   readonly messages: ReadonlyArray<typeof SessionMessageTable.$inferSelect>
   readonly inputs: ReadonlyArray<typeof SessionInputTable.$inferSelect>
+  readonly forkAttachments: ReadonlyArray<SessionForkAttachments.Row>
   readonly contextEpoch?: typeof SessionContextEpochTable.$inferSelect
 }
 
@@ -494,7 +503,11 @@ function touchSession(db: DatabaseService, event: Pick<SessionEvent.Event, "data
     .pipe(Effect.orDie)
 }
 
-function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: SessionMessage.Message) {
+function insertMessage(
+  db: DatabaseService,
+  event: { readonly seq?: number; readonly data: { readonly sessionID: SessionSchema.ID; readonly timestamp: DateTime.Utc } },
+  message: SessionMessage.Message,
+) {
   if (event.seq === undefined) return Effect.die("Synchronized Session event is missing aggregate sequence")
   const encoded = encodeMessage(message)
   const { id, type, ...data } = encoded
@@ -588,6 +601,7 @@ function cleanupRevert(db: DatabaseService, input: typeof SessionEvent.Revert.Cl
             tokens: message.tokens,
           }, -1)
       }
+      yield* SessionForkAttachments.detach(db, input.sessionID, rows.map((row) => row.id))
       yield* db.delete(SessionMessageTable).where(removal).run().pipe(Effect.orDie)
     }
 
@@ -643,12 +657,17 @@ function captureProjection(db: DatabaseService, aggregateID: string) {
       .where(eq(SessionContextEpochTable.session_id, session.id))
       .get()
       .pipe(Effect.orDie)
+    const forkAttachments = SessionForkAttachments.read(
+      yield* SessionForkAttachments.capture(db, session.id), session.id, new Set(messages.map((row) => row.id)),
+    )
+    if (!forkAttachments) return invalidCheckpoint("fork attachment ownership differs")
     return {
       session,
       legacyMessages,
       legacyParts,
       messages,
       inputs,
+      forkAttachments,
       ...(contextEpoch ? { contextEpoch } : {}),
     } satisfies SessionProjection
   })
@@ -804,7 +823,7 @@ function hydrateActiveCheckpoint(
     if (stored === undefined) return input.baseline
     if (
       input.baseline.adapter !== checkpointAdapterID ||
-      input.baseline.version !== checkpointAdapterVersion ||
+      ![4, checkpointAdapterVersion].includes(input.baseline.version) ||
       !Array.isArray(input.baseline.data.legacyMessages) ||
       !Array.isArray(input.baseline.data.legacyParts) ||
       !Array.isArray(input.baseline.data.messages) ||
@@ -1017,9 +1036,30 @@ function readProjection(baseline: EventV2.CheckpointBaseline) {
     legacyMessages: Array.isArray(baseline.data.legacyMessages) ? baseline.data.legacyMessages : [],
     legacyParts: Array.isArray(baseline.data.legacyParts) ? baseline.data.legacyParts : [],
   } as unknown) as SessionProjection & Record<string, unknown>
+  if (projection.session.fork_history_seq !== null && projection.session.fork_history_seq !== undefined &&
+    (!Number.isSafeInteger(projection.session.fork_history_seq) || projection.session.fork_history_seq < -1 || !projection.session.parent_id))
+    return invalidCheckpoint("fork history boundary is invalid")
+  const forkAttachments = SessionForkAttachments.read(
+    baseline.version >= 5 ? baseline.data.forkAttachments : [],
+    projection.session.id, new Set(projection.messages.map((row) => row.id)),
+  )
+  if (!forkAttachments) return invalidCheckpoint("fork attachment schema or ownership differs")
   if (baseline.version >= 3)
     readCheckpointOnly(projection, baseline.data.legacyCheckpointOnly)
-  return projection
+  // Older checkpoints predate the additive generation counter. Match SQLite's
+  // migration default only when absent; never erase a recorded measurement.
+  const session = baseline.version < 5 && projection.session.generation_ms === undefined
+    ? { ...projection.session, generation_ms: 0 }
+    : projection.session
+  return {
+    ...projection,
+    session: {
+      ...session,
+      fork_history_seq: session.fork_history_seq ?? null,
+      fork_dispatch_digest: session.fork_dispatch_digest ?? null,
+    },
+    forkAttachments,
+  }
 }
 
 const projectionBatchSize = 400
@@ -1072,6 +1112,9 @@ function restoreProjection(db: DatabaseService, aggregateID: string, baseline: E
           message: `Session checkpoint ${projection.session.id} does not match aggregate ${aggregateID}`,
         }),
       )
+    // Checkpoints contain dialogue projections, not execution ownership. Replacing
+    // a managed row would cascade away claims and could re-enable its child.
+    yield* SessionProtection.requireUnmanaged(db, projection.session.id).pipe(Effect.orDie)
     yield* db.delete(SessionTable).where(eq(SessionTable.id, projection.session.id)).run().pipe(Effect.orDie)
     yield* db.insert(SessionTable).values(projection.session).run().pipe(Effect.orDie)
     yield* insertLegacyMessages(db, projection.legacyMessages)
@@ -1082,6 +1125,7 @@ function restoreProjection(db: DatabaseService, aggregateID: string, baseline: E
       yield* db.insert(SessionInputTable).values([...projection.inputs]).run().pipe(Effect.orDie)
     if (projection.contextEpoch)
       yield* db.insert(SessionContextEpochTable).values(projection.contextEpoch).run().pipe(Effect.orDie)
+    yield* SessionForkAttachments.restore(db, aggregateID, projection.forkAttachments)
   })
 }
 
@@ -1161,7 +1205,7 @@ export function verifyCheckpointProjectionInCurrentRuntime(input: CheckpointVeri
   return Effect.gen(function* () {
     const expected = readProjection(input.expected)
     const checkpointOnly =
-      input.expected.version === checkpointAdapterVersion
+      input.expected.version >= 4
         ? readCheckpointOnly(expected, input.expected.data.legacyCheckpointOnly)
         : undefined
     const checkpointOnlyIDs = new Set(checkpointOnly?.entries.map((entry) => entry.partID) ?? [])
@@ -1236,7 +1280,7 @@ export function verifyCheckpointProjectionInCurrentRuntime(input: CheckpointVeri
     if (input.previous) {
       if (!previous) return yield* Effect.die("Checkpoint baseline is missing")
       yield* restoreProjection(db, input.aggregateID, input.previous)
-      if (input.previous.version === 1 && input.expected.version === checkpointAdapterVersion) {
+      if (input.previous.version === 1 && input.expected.version >= 4) {
         yield* insertLegacyMessages(db, expected.legacyMessages)
         yield* insertLegacyParts(db, expected.legacyParts)
       }
@@ -1325,8 +1369,8 @@ export function verifyCheckpointProjectionInCurrentRuntime(input: CheckpointVeri
     }
     const actual = yield* captureProjection(db, input.aggregateID)
     const parityOptions = {
-      includeContextEpoch: previous?.contextEpoch !== undefined,
-      normalizeLegacyProjection: input.previous?.version !== checkpointAdapterVersion,
+      includeContextEpoch: previous?.contextEpoch !== undefined || input.events.some((event) => event.type === EventV2.versionedType(SessionForkEvent.EpochImported.type, 1)),
+      normalizeLegacyProjection: !input.previous || input.previous.version < 4,
     }
     const expectedParity = projectionForParity(expected, parityOptions)
     const actualParity = actual && projectionForParity(actual, parityOptions)
@@ -3039,6 +3083,81 @@ function registerProjectors(options: LayerOptions) {
       restore: (aggregateID, baseline) => restoreProjection(db, aggregateID, baseline),
       verify: options.checkpointVerificationWorker ?? verifyProjection,
     })
+    yield* events.project(SessionForkEvent.MessageImported, (event) => Effect.gen(function* () {
+      const message = event.data.message
+      if (event.data.sourceSessionID === event.data.sessionID || message.id === event.data.sourceMessageID || message.metadata !== undefined)
+        return yield* Effect.die("Fork history must have independent identity and no inherited message capabilities")
+      if (message.type === "synthetic" && message.sessionID !== event.data.sessionID)
+        return yield* Effect.die("Fork synthetic message belongs to another Session")
+      if (message.type === "assistant" && (
+        message.time.completed === undefined || message.snapshot !== undefined ||
+        message.cost !== undefined || message.tokens !== undefined || message.tokenMeasurement !== undefined ||
+        message.content.some((part) => part.type === "custom" ||
+          (part.type === "tool" && (part.state.status === "pending" || part.state.status === "running")))
+      )) return yield* Effect.die("Fork assistant history must be terminal and carry no executable controls or source accounting")
+      if (message.type === "shell" && message.time.completed === undefined)
+        return yield* Effect.die("Fork shell history must be terminal")
+      const pending = yield* db.select({ id: SessionInputTable.id }).from(SessionInputTable)
+        .where(eq(SessionInputTable.id, message.id)).get().pipe(Effect.orDie)
+      if (pending) return yield* Effect.die("Fork history cannot consume a reserved input ID")
+      yield* insertMessage(db, event, message)
+    }))
+    yield* events.project(SessionForkEvent.HistoryBoundaryImported, (event) => Effect.gen(function* () {
+      if (event.seq === undefined || event.data.sourceSessionID === event.data.sessionID || event.data.throughSeq >= event.seq)
+        return yield* Effect.die("Fork history boundary is outside its imported history")
+      const messages = yield* db.select({ seq: SessionMessageTable.seq, id: SessionMessageTable.id }).from(SessionMessageTable)
+        .where(eq(SessionMessageTable.session_id, event.data.sessionID))
+        .orderBy(desc(SessionMessageTable.seq)).all().pipe(Effect.orDie)
+      if ((messages[0]?.seq ?? -1) !== event.data.throughSeq)
+        return yield* Effect.die("Fork history boundary must end at the last imported message")
+      for (const message of messages) {
+        const imported = yield* db.select().from(EventTable).where(and(
+          eq(EventTable.aggregate_id, event.data.sessionID), eq(EventTable.seq, message.seq),
+          eq(EventTable.type, EventV2.versionedType(SessionForkEvent.MessageImported.type, 1)),
+        )).get().pipe(Effect.orDie)
+        if (!imported) return yield* Effect.die("Fork history boundary requires imported message events")
+        const data = EventV2.decodeStoredEventData(imported.data)
+        if (data.sourceSessionID !== event.data.sourceSessionID || !data.message ||
+          typeof data.message !== "object" || !("id" in data.message) || data.message.id !== message.id)
+          return yield* Effect.die("Fork history boundary source does not match the imported message")
+      }
+      const epoch = yield* db.select({ sessionID: SessionContextEpochTable.session_id }).from(SessionContextEpochTable)
+        .where(eq(SessionContextEpochTable.session_id, event.data.sessionID)).get().pipe(Effect.orDie)
+      if (epoch) return yield* Effect.die("Fork history boundary cannot replace an existing epoch")
+      const child = yield* db.update(SessionTable).set({
+        fork_history_seq: event.data.throughSeq,
+        fork_dispatch_digest: event.data.dispatchDigest ?? null,
+        time_updated: sql`${SessionTable.time_updated}`,
+      }).where(and(eq(SessionTable.id, event.data.sessionID), eq(SessionTable.parent_id, event.data.sourceSessionID),
+        isNull(SessionTable.fork_history_seq))).returning({ id: SessionTable.id }).get().pipe(Effect.orDie)
+      if (!child) return yield* Effect.die("Fork history boundary requires a fresh child of the source")
+    }))
+    yield* events.project(SessionForkEvent.EpochImported, (event) => Effect.gen(function* () {
+      if (event.seq === undefined || event.data.baselineSeq >= event.seq || event.data.sourceSessionID === event.data.sessionID)
+        return yield* Effect.die("Fork epoch is outside its imported history")
+      yield* db.insert(SessionContextEpochTable).values({
+        session_id: event.data.sessionID,
+        baseline: event.data.baseline,
+        baseline_seq: event.data.baselineSeq,
+        snapshot: event.data.snapshot,
+        agent: event.data.agent,
+        revision: 0,
+      }).run().pipe(Effect.orDie)
+    }))
+    yield* events.project(SessionForkEvent.AttachmentsImported, (event) => Effect.gen(function* () {
+      if (event.data.attachments.length === 0) return
+      yield* db.insert(AttachmentTable).values(event.data.attachments.map((attachment) => ({
+        id: attachment.id,
+        session_id: event.data.sessionID,
+        message_id: attachment.messageID,
+        mime: attachment.mime,
+        filename: attachment.filename,
+        size_bytes: attachment.sizeBytes,
+        storage_path: attachment.storagePath,
+        blob_sha256: attachment.sha256,
+        created_at: attachment.createdAt,
+      }))).run().pipe(Effect.orDie)
+    }))
     yield* events.beforeCommit((event) => SessionInput.guardReservedID(db, event))
     yield* events.beforeCommit((event) => {
       if (event.type !== SessionEvent.TitleUpdated.type) return Effect.void
@@ -3191,7 +3310,12 @@ function registerProjectors(options: LayerOptions) {
         .pipe(Effect.orDie),
     )
     yield* events.project(SessionV1.Event.Deleted, (event) =>
-      db.delete(SessionTable).where(eq(SessionTable.id, event.data.sessionID)).run().pipe(Effect.orDie),
+      Effect.gen(function* () {
+        // EventV2 holds its immediate transaction here, closing the gap between
+        // recursive delete preflight and a newly configured Main/assigned child.
+        yield* SessionProtection.requireUnmanaged(db, event.data.sessionID).pipe(Effect.orDie)
+        yield* db.delete(SessionTable).where(eq(SessionTable.id, event.data.sessionID)).run().pipe(Effect.orDie)
+      }),
     )
     yield* events.project(SessionV1.Event.MessageUpdated, (event) =>
       Effect.gen(function* () {
@@ -3290,6 +3414,30 @@ function registerProjectors(options: LayerOptions) {
           Effect.andThen(SessionContextEpoch.requestReplacement(db, event.data.sessionID, event.seq)),
         )
     })
+    yield* events.project(SessionAgentPolicyEvent.AgentPolicyRebound, (event) =>
+      Effect.gen(function* () {
+        if (event.seq === undefined) return yield* Effect.die("Synchronized Session event is missing aggregate sequence")
+        const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, event.data.sessionID)).get()
+          .pipe(Effect.orDie)
+        if (!row || row.parent_id === null || row.fork_dispatch_digest === null)
+          return yield* Effect.die("Agent policy rebind requires an existing native dispatch child")
+        const current = yield* Schema.decodeUnknownEffect(SessionAgentPolicy.Info)(row.agent_policy).pipe(Effect.orDie)
+        if (current.source.type !== "task")
+          return yield* Effect.die("Agent policy rebind is reserved for native task children")
+        const bound = SessionAgentPolicy.isReadOnly(current)
+          ? current.readOnlyInputID : current.mirrorWorkspace?.inputID ?? current.mainWriteConsent?.inputID
+        if (bound !== event.data.previousInputID)
+          return yield* Effect.die("Agent policy rebind conflicts with the current input binding")
+        const nextDigest = event.data.agentPolicy.mirrorWorkspace?.dispatchDigest ??
+          event.data.agentPolicy.mainWriteConsent?.dispatchDigest
+        const updated = yield* db.update(SessionTable)
+          .set({ agent_policy: event.data.agentPolicy, time_updated: DateTime.toEpochMillis(event.data.timestamp),
+            ...(nextDigest === undefined ? {} : { fork_dispatch_digest: nextDigest }) })
+          .where(eq(SessionTable.id, event.data.sessionID))
+          .returning({ id: SessionTable.id }).get().pipe(Effect.orDie)
+        if (!updated) return yield* Effect.die("Agent policy rebind missed its child row")
+      }),
+    )
     yield* events.project(SessionEvent.ModelSwitched, (event) =>
       Effect.gen(function* () {
         yield* db
@@ -3352,6 +3500,7 @@ function registerProjectors(options: LayerOptions) {
           prompt: event.data.prompt,
           delivery: event.data.delivery,
           timeCreated: event.data.timestamp,
+          ...(event.data.origin === undefined ? {} : { origin: event.data.origin }),
         })
       }),
     )
@@ -3384,6 +3533,128 @@ function registerProjectors(options: LayerOptions) {
             promotedSeq: event.seq,
           }),
         )
+      }),
+    )
+    yield* events.project(SessionEvent.SkillSelection.Mutation, (event) =>
+      Effect.gen(function* () {
+        if (event.seq === undefined)
+          return yield* Effect.die("Synchronized Session event is missing aggregate sequence")
+        const at = DateTime.toEpochMillis(event.data.timestamp)
+        const seq = event.seq
+        if (event.data.mutation === "selected") {
+          if (event.data.origin === undefined || event.data.limits === undefined || event.data.generation === undefined)
+            return yield* Effect.die("Skill selection event is missing its selection payload")
+          const values = {
+            session_id: event.data.sessionID,
+            name: event.data.name!,
+            generation: event.data.generation,
+            origin_kind: event.data.origin.kind,
+            origin_id: event.data.origin.id,
+            origin_seq: event.data.origin.seq,
+            selected_at: event.data.selectedAt ? DateTime.toEpochMillis(event.data.selectedAt) : at,
+            limit_minutes: event.data.limits.minutes,
+            limit_messages: event.data.limits.messages,
+            forgotten_at: null,
+            forgotten_seq: null,
+            operation_id: null,
+            renewal_declined_at: null,
+            renewal_declined_generation: null,
+            bound_message_id: event.data.boundMessageID ?? null,
+            receipt_input_id: event.data.receiptInputID ?? null,
+            time_updated: at,
+          }
+          yield* db
+            .insert(SessionSkillSelectionTable)
+            .values(values)
+            .onConflictDoUpdate({
+              target: [SessionSkillSelectionTable.session_id, SessionSkillSelectionTable.name],
+              set: values,
+              // A racing adoption can publish the same origin twice; the second
+              // event must not start a phantom generation.
+              setWhere: sql`${SessionSkillSelectionTable.origin_id} is null or ${SessionSkillSelectionTable.origin_id} != ${event.data.origin.id} or ${SessionSkillSelectionTable.origin_kind} != ${event.data.origin.kind}`,
+            })
+            .run()
+            .pipe(Effect.orDie, Effect.asVoid)
+          return
+        }
+        if (event.data.mutation === "forgotten") {
+          if (event.data.name === undefined) {
+            // Forget-all raises the durable barrier that blocks lazy backfill
+            // from resurrecting origins that predate the decision.
+            yield* db
+              .insert(SessionSkillSelectionBarrierTable)
+              .values({
+                session_id: event.data.sessionID,
+                forgotten_seq: seq,
+                operation_id: event.data.operationID ?? null,
+                operation_name: null,
+                time_updated: at,
+              })
+              .onConflictDoUpdate({
+                target: SessionSkillSelectionBarrierTable.session_id,
+                set: {
+                  forgotten_seq: seq,
+                  operation_id: event.data.operationID ?? null,
+                  operation_name: null,
+                  time_updated: at,
+                },
+              })
+              .run()
+              .pipe(Effect.orDie, Effect.asVoid)
+            return
+          }
+          const tombstone = {
+            session_id: event.data.sessionID,
+            name: event.data.name,
+            generation: 0,
+            origin_kind: "input" as const,
+            origin_id: "",
+            origin_seq: 0,
+            selected_at: 0,
+            limit_minutes: 1,
+            limit_messages: 1,
+            forgotten_at: at,
+            forgotten_seq: seq,
+            operation_id: event.data.operationID ?? null,
+            renewal_declined_at: null,
+            renewal_declined_generation: null,
+            bound_message_id: null,
+            receipt_input_id: null,
+            time_updated: at,
+          }
+          yield* db
+            .insert(SessionSkillSelectionTable)
+            .values(tombstone)
+            .onConflictDoUpdate({
+              target: [SessionSkillSelectionTable.session_id, SessionSkillSelectionTable.name],
+              set: {
+                forgotten_at: at,
+                forgotten_seq: seq,
+                operation_id: event.data.operationID ?? null,
+                time_updated: at,
+              },
+            })
+            .run()
+            .pipe(Effect.orDie, Effect.asVoid)
+          return
+        }
+        // renewal_declined suppresses further renewal prompts for this exact
+        // generation until a new genuine selection supersedes it.
+        yield* db
+          .update(SessionSkillSelectionTable)
+          .set({
+            renewal_declined_at: at,
+            renewal_declined_generation: event.data.generation ?? null,
+            time_updated: at,
+          })
+          .where(
+            and(
+              eq(SessionSkillSelectionTable.session_id, event.data.sessionID),
+              eq(SessionSkillSelectionTable.name, event.data.name!),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie, Effect.asVoid)
       }),
     )
     yield* events.project(SessionEvent.InterruptRequested, () => Effect.void)

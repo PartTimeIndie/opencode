@@ -62,5 +62,18 @@ export const migrations = (
     import("./migration/20261020082748_orchestrator_checkout"),
     import("./migration/20261021115218_file_knowledge_receipt"),
     import("./migration/20261021115907_file_mutation_pending"),
+    import("./migration/20261027072654_orchestrator_commission"),
+    import("./migration/20261027072948_commission_repair_guard"),
+    import("./migration/20261028121736_background_job_owner_settlement"),
+    import("./migration/20261028122425_orchestrator_basis_digest"),
+    import("./migration/20261028143526_good_madame_masque"),
+    import("./migration/20261028152954_orchestrator_task_result"),
+    import("./migration/20261028154144_question_answer_source"),
+    import("./migration/20261106000000_session_fork_history"),
+    import("./migration/20261106145123_session_task_dispatch_binding"),
+    import("./migration/20261106173347_session_file_mutation_modes"),
+    import("./migration/20261111100110_funny_the_fallen"),
+    import("./migration/20261124091133_project_directory_icon"),
+    import("./migration/20261124144309_project_icon_generation_style"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

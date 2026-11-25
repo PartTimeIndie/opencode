@@ -119,7 +119,7 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
   frames: (prepared, request, runtime) =>
     Stream.unwrap(
       runtime.http
-        .execute(prepared.request, { retries: request.http?.retries })
+        .execute(prepared.request, { retries: request.http?.retries, provider: request.model.provider })
         .pipe(
           Effect.map((response) => {
             const idleTimeoutMs = request.http?.idleTimeoutMs

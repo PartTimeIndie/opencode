@@ -29,6 +29,12 @@ export const directoryKey = (path: string) => {
   return key
 }
 
+// Do not resolve parent segments: a symlink can change what `..` means.
+export const projectWorktreeKey = (path: string) => {
+  const value = isWindowsPath(path) ? path.replaceAll("\\", "/") : path
+  return directoryKey(value.replace(/\/\.(?=\/|$)\/?/g, "/"))
+}
+
 export const projectDirectoryKey = (path: string) => {
   const value = path.replaceAll("\\", "/")
   const segments = value.split("/").reduce<string[]>((parts, segment) => {

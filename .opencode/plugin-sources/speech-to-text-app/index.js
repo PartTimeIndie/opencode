@@ -336,8 +336,38 @@ export default {
     let disposeSettingsSubscription = () => {}
     let learnedTermsUnsubscribe = () => {}
 
+    // The host owns approval and admission; Speech owns only this recording's result.
+    const registerPreparation = (active) => {
+      if (!api.host.composer?.registerSendPreparation || !active.composerID || active.destination?.type === "desktop" || active.destination?.type === "text-input") return
+      const done = Promise.withResolvers()
+      const listeners = new Set()
+      const send = { operationID: crypto.randomUUID(), requested: false, done, listeners, dispose: () => {} }
+      active.send = send
+      send.dispose = api.host.composer.registerSendPreparation(active, {
+        operationID: send.operationID,
+        isActive: () => state.active === active && state.phase !== "idle",
+        subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+        prepare({ signal }) {
+          if (!send.requested) {
+            send.requested = true
+            active.improvement ??= { enabled: api.settings.get("automaticImprovement", false), settings: improvementSettingsSnapshot(api.settings) }
+            invalidateTranscriptPolishWindow(state)
+            const cancel = () => {
+              if (state.active === active) fail(new Error("Recording send cancelled"))
+            }
+            signal.addEventListener("abort", cancel, { once: true })
+            void done.promise.finally(() => signal.removeEventListener("abort", cancel))
+            if (signal.aborted) cancel()
+            else stop()
+          }
+          return done.promise
+        },
+      })
+    }
+
     const mode = () => api.settings.get("interactionMode", "toggle")
     const update = () => {
+      state.active?.send?.listeners.forEach((listener) => listener())
       for (const control of state.controls) {
         const ownsOperation = sameContext(control.context, state.active)
         const canStop = state.phase === "recording" || state.phase === "requesting-permission"
@@ -456,6 +486,13 @@ export default {
                 autoSelectSingle: true,
               },
               {
+                key: "copyTranscriptsToClipboard",
+                type: "boolean",
+                label: "Copy transcripts to clipboard",
+                description: "Copies each completed transcript to the system clipboard, replacing its previous contents. Disable this to keep the clipboard unchanged. Clipboard history depends on your operating system.",
+                default: true,
+              },
+              {
                 key: "deviceID",
                 type: "select",
                 label: "Microphone",
@@ -560,6 +597,8 @@ export default {
       const message = mediaErrorMessage(error)
       console.warn(`[speech-to-text] operation failed: ${message}`)
       const active = state.active
+      active?.send?.done.resolve({ ok: false, error: message })
+      active?.send?.dispose()
       state.operation += 1
       state.abort?.abort()
       releaseMedia()
@@ -571,8 +610,8 @@ export default {
       if (active?.desktopService) void status.finally(scheduleDesktopServiceSync)
     }
 
-    const runImprovement = async (active, transcript, scope, skills, includeSkills, instructions, snapshot, signal) => {
-      const result = await api.host.ai.run({
+    const runImprovement = async (active, transcript, scope, skills, includeSkills, instructions, snapshot, signal, onRetry) => {
+      const request = {
         directory: active.directory,
         ...improvementAIRequest({ improvementChain: snapshot.improvementChain }),
         signal,
@@ -597,14 +636,25 @@ export default {
         ),
         generation: { maxTokens: improvementMaxTokens(transcript, includeSkills ? skills : []), temperature: 0 },
         tools: [],
-      })
+      }
+      let result = await api.host.ai.run(request)
+      // Keep the same deadline and let configured chains own their own steps.
+      if (
+        !result.ok &&
+        request.model === "cerebras/qwen-3.8-27b" &&
+        /^(?:Error: )*Incomplete model response: output token budget exhausted \(8192 tokens; 8192 reasoning tokens\)(?:\.|$)/.test(result.error ?? "")
+      ) {
+        signal.throwIfAborted()
+        onRetry()
+        result = await api.host.ai.run({ ...request, variant: "none" })
+      }
       if (!result.ok || typeof result.text !== "string")
         throw new Error(result.error || "Transcript improvement failed")
       return parseImprovement(result.text, includeSkills)
     }
 
     const improveTranscript = async (active, transcript, parentSignal) => {
-      const snapshot = improvementSettingsSnapshot(api.settings)
+      const snapshot = active.improvement?.settings ?? improvementSettingsSnapshot(api.settings)
       return withSpeechTimeout(parentSignal, POST_PROCESSING_TIMEOUT_MS, "Transcript post-processing", async (signal) => {
         const includeSkills = includeSlashCommandsForInvocation(
           active,
@@ -643,6 +693,7 @@ export default {
         const spokenCandidates = spokenCatalogCandidates(transcript, preparation.catalog)
         const effectiveIncludeSkills = includeSkills && spokenCandidates.length > 0
         let improvementFailed = false
+        let retried = false
         return withImprovementFallback(
           transcript,
           preparation.catalog,
@@ -659,6 +710,7 @@ export default {
                 preparation.skills,
                 snapshot,
                 runSignal,
+                () => { retried = true },
               )
               console.info(
                 `[speech-to-text] improvement chain took ${Math.round(performance.now() - improvementStartedAt)}ms` +
@@ -669,7 +721,11 @@ export default {
           () => {
             improvementFailed = true
           },
-        ).then((text) => ({ text, fallback: improvementFailed }))
+        ).then((text) => ({
+          text,
+          fallback: improvementFailed,
+          failureDetail: improvementFailed && retried ? " (retry without reasoning failed)" : "",
+        }))
       })
     }
 
@@ -789,8 +845,40 @@ export default {
         text,
         position: "cursor",
         replace,
+        ...(active.send ? { operationID: active.send.operationID } : {}),
       })
     }
+
+    const copyTranscript = (text) => {
+      if (!text?.trim() || !api.settings.get("copyTranscriptsToClipboard", true)) return
+      // The desktop shell writes without document focus; Chromium's Clipboard
+      // API rejects while the user keeps working in another window.
+      const hostWrite = api.host.desktopServices?.writeClipboardText
+      const write = async () => {
+        if (hostWrite) {
+          const result = await hostWrite.call(api.host.desktopServices, text)
+          if (result?.ok) return
+        }
+        if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable")
+        await navigator.clipboard.writeText(text)
+      }
+      try {
+        void write().catch(() => {
+          console.warn("[speech-to-text] automatic clipboard copy failed")
+        })
+      } catch {
+        console.warn("[speech-to-text] automatic clipboard copy failed")
+      }
+    }
+
+    const logTimings = (timings) =>
+      console.info(
+        `[speech-to-text] timings prepare=${Math.round(timings.preparedAt - timings.startedAt)}ms` +
+          ` transcribe=${Math.round(timings.transcribedAt - timings.preparedAt)}ms` +
+          ` improve=${Math.round(timings.improvedAt - timings.transcribedAt)}ms` +
+          ` insert=${Math.round(timings.insertedAt - timings.improvedAt)}ms` +
+          ` total=${Math.round(timings.insertedAt - timings.startedAt)}ms`,
+      )
 
     // Corrections the user makes after a transcript is inserted are recorded
     // as learned terms on that composer's next submit. Only the derived term
@@ -887,13 +975,16 @@ export default {
         rawTranscript = result.text
         let text = result.text
         let improvementError = ""
-        if (api.settings.get("automaticImprovement", false)) {
+        let failureDetail = ""
+        active.improvement ??= { enabled: api.settings.get("automaticImprovement", false), settings: improvementSettingsSnapshot(api.settings) }
+        if (active.improvement.enabled) {
           setPhase("improving")
           try {
             const improvement = await improveTranscript(active, result.text, controller.signal)
             text = improvement.text
             transcriptImproved = !improvement.fallback
-            if (improvement.fallback) improvementError = "Improvement failed - raw transcript inserted"
+            failureDetail = improvement.failureDetail
+            if (improvement.fallback) improvementError = `Improvement failed - raw transcript inserted${failureDetail}`
           } catch (error) {
             if (controller.signal.aborted) throw error
             improvementError = "Improvement failed - raw transcript inserted"
@@ -903,25 +994,47 @@ export default {
         recoveryText = text
         timings.improvedAt = performance.now()
         if (operation !== state.operation) return
+        copyTranscript(text)
+        if (active.send?.requested && improvementError) {
+          // Keep the dictation instead of dropping it: the host blocks this send,
+          // lets the send transaction unwind and only then inserts the raw
+          // transcript as an unsent draft, so nothing unreviewed is ever sent.
+          const message = `Improvement failed - raw transcript inserted, not sent${failureDetail}`
+          active.send.done.resolve({ ok: false, error: message, insertDraft: text })
+          invalidateTranscriptPolishWindow(state)
+          timings.insertedAt = performance.now()
+          logTimings(timings)
+          state.lastTranscript = ""
+          state.lastInsertedText = ""
+          state.lastTranscriptImproved = transcriptImproved
+          state.lastFinishedAt = Date.now()
+          state.lastActive = undefined
+          state.recovery = undefined
+          active.send.dispose()
+          state.active = undefined
+          setPhase("idle", message)
+          return
+        }
         setPhase("inserting")
-        const inserted = await insertTranscript(active, text)
+        const insertionStarted = !active.send?.requested
+        const inserted = insertionStarted ? await insertTranscript(active, text) : { ok: true }
         if (operation !== state.operation) return
         if (!inserted.ok) throw new Error(inserted.error || "The transcript could not be inserted")
+        if (active.send?.requested) {
+          if (insertionStarted && !inserted.insertionReceiptID) throw new Error("Transcript insertion could not be verified")
+          active.send.done.resolve(inserted.insertionReceiptID ? { ok: true, insertionReceiptID: inserted.insertionReceiptID } : { ok: true, text })
+          invalidateTranscriptPolishWindow(state)
+        }
         timings.insertedAt = performance.now()
-        console.info(
-          `[speech-to-text] timings prepare=${Math.round(timings.preparedAt - timings.startedAt)}ms` +
-            ` transcribe=${Math.round(timings.transcribedAt - timings.preparedAt)}ms` +
-            ` improve=${Math.round(timings.improvedAt - timings.transcribedAt)}ms` +
-            ` insert=${Math.round(timings.insertedAt - timings.improvedAt)}ms` +
-            ` total=${Math.round(timings.insertedAt - timings.startedAt)}ms`,
-        )
-        state.lastTranscript = result.text
-        state.lastInsertedText = text
+        logTimings(timings)
+        state.lastTranscript = active.send?.requested ? "" : result.text
+        state.lastInsertedText = active.send?.requested ? "" : text
         state.lastTranscriptImproved = transcriptImproved
         state.lastFinishedAt = Date.now()
-        state.lastActive = active
+        state.lastActive = active.send?.requested ? undefined : { ...active, send: undefined, improvement: undefined }
         state.recovery = undefined
-        rememberInsertion(active, text)
+        if (!active.send?.requested) rememberInsertion(active, text)
+        active.send?.dispose()
         await publishDesktopState(active, "success", improvementError)
         state.active = undefined
         setPhase("idle", improvementError)
@@ -978,6 +1091,7 @@ export default {
       const operation = ++state.operation
       state.stopPending = false
       setPhase("preparing")
+      registerPreparation(state.active)
       await transcribe(operation, state.active, audio)
     }
 
@@ -1029,6 +1143,7 @@ export default {
       const operation = ++state.operation
       state.stopPending = false
       setPhase("requesting-permission")
+      registerPreparation(state.active)
       const controller = new AbortController()
       state.captureAbort = controller
       try {
@@ -1058,8 +1173,10 @@ export default {
           if (state.stream === stream) state.stream = undefined
           return
         }
-      if (state.stopPending) {
+        if (state.stopPending) {
           const active = state.active
+          active?.send?.done.resolve({ ok: false, error: "Recording stopped before audio was available" })
+          active?.send?.dispose()
           releaseMedia()
           await publishDesktopState(active, "cancelled")
           state.active = undefined
@@ -1149,7 +1266,7 @@ export default {
           if (signal.aborted || operation !== state.operation) return
           if (!inserted.ok) throw new Error(inserted.error || "Improved text could not be inserted")
           rememberInsertion(active, improvement.text)
-          await publishDesktopState(active, "success", improvement.fallback ? "Improvement failed - original clipboard text inserted" : "")
+          await publishDesktopState(active, "success", improvement.fallback ? `Improvement failed - original clipboard text inserted${improvement.failureDetail}` : "")
         })
         if (controller.signal.aborted && operation === state.operation) await publishDesktopState(active, "cancelled")
       } catch (error) {
@@ -1176,6 +1293,7 @@ export default {
       state.active = active
       state.abort = new AbortController()
       setPhase("improving")
+      registerPreparation(active)
       let recovery
       try {
         const improvement = await improveTranscript(active, transcript, state.abort.signal)
@@ -1188,6 +1306,8 @@ export default {
           improved: !improvement.fallback,
           replace: state.lastInsertedText,
         }
+        copyTranscript(text)
+        if (active.send?.requested && improvement.fallback) throw new Error(`Transcript improvement failed; message was not sent${improvement.failureDetail}`)
         setPhase("inserting")
         const inserted = await insertTranscript(active, text, state.lastInsertedText)
         if (operation !== state.operation) return
@@ -1199,13 +1319,20 @@ export default {
           }
           throw new Error(inserted.error || "The improved transcript could not be inserted")
         }
+        if (active.send?.requested) {
+          if (improvement.fallback) throw new Error(`Transcript improvement failed; message was not sent${improvement.failureDetail}`)
+          if (!inserted.insertionReceiptID) throw new Error("Transcript insertion could not be verified")
+          active.send.done.resolve({ ok: true, insertionReceiptID: inserted.insertionReceiptID })
+        }
         state.lastInsertedText = text
         state.lastTranscriptImproved = !improvement.fallback
         state.lastFinishedAt = Date.now()
-        rememberInsertion(active, text)
-        void publishDesktopState(active, "success", improvement.fallback ? "Improvement failed - raw transcript inserted" : "")
+        if (!active.send?.requested) rememberInsertion(active, text)
+        active.send?.dispose()
+        const status = improvement.fallback ? `Improvement failed - raw transcript inserted${improvement.failureDetail}` : ""
+        void publishDesktopState(active, "success", status)
         state.active = undefined
-        setPhase("idle", improvement.fallback ? "Improvement failed - raw transcript inserted" : "")
+        setPhase("idle", status)
       } catch (error) {
         if (operation !== state.operation) return
         if (state.abort?.signal.aborted) {
@@ -1545,6 +1672,8 @@ export default {
     persistApplicationProfiles(api.settings, api.settings.get("applicationProfiles", undefined))
     void refreshDevices().then(scheduleDesktopServiceSync)
     api.lifecycle.onDispose(async () => {
+      state.active?.send?.done.resolve({ ok: false, error: "Speech plugin unloaded" })
+      state.active?.send?.dispose()
       state.disposed = true
       state.recovery = undefined
       if (state.serviceSyncTimer !== undefined) window.clearTimeout(state.serviceSyncTimer)

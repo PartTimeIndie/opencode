@@ -1,14 +1,20 @@
-import { and, asc, desc, eq, gt, gte, lt, lte, ne, or, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { Database } from "../database/database"
 import { MessageDecodeError } from "./error"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
-import { SessionContextEpochTable, SessionMessageTable } from "./sql"
+import { SessionActivityTable, SessionContextEpochTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 
-type DatabaseService = Database.Interface["db"]
+type DatabaseService = Pick<Database.Interface["db"], "select">
 
 const decode = Schema.decodeUnknownEffect(SessionMessage.Message)
+
+const inheritedBoundary = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+  const row = yield* db.select({ through: SessionTable.fork_history_seq }).from(SessionTable)
+    .where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
+  return row?.through ?? undefined
+})
 
 const latestCompaction = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
   return yield* db
@@ -26,6 +32,7 @@ const messageRows = Effect.fnUntraced(function* (
   sessionID: SessionSchema.ID,
   compaction: { readonly seq: number } | undefined,
   baselineSeq?: number,
+  inheritedThroughSeq?: number,
 ) {
   const rows = yield* db
     .select()
@@ -36,6 +43,9 @@ const messageRows = Effect.fnUntraced(function* (
         compaction
           ? or(
               gte(SessionMessageTable.seq, compaction.seq),
+              inheritedThroughSeq === undefined
+                ? undefined
+                : and(eq(SessionMessageTable.type, "system"), lte(SessionMessageTable.seq, inheritedThroughSeq)),
               baselineSeq === undefined
                 ? undefined
                 : and(eq(SessionMessageTable.type, "system"), gt(SessionMessageTable.seq, baselineSeq)),
@@ -43,7 +53,14 @@ const messageRows = Effect.fnUntraced(function* (
           : undefined,
         baselineSeq === undefined
           ? undefined
-          : or(ne(SessionMessageTable.type, "system"), gt(SessionMessageTable.seq, baselineSeq)),
+          : or(
+              ne(SessionMessageTable.type, "system"),
+              gt(SessionMessageTable.seq, baselineSeq),
+              inheritedThroughSeq === undefined ? undefined : lte(SessionMessageTable.seq, inheritedThroughSeq),
+              // Operational notices are not replacement system-context baselines.
+              // Keep them until normal compaction, even if an epoch is rebuilt after a crash.
+              sql`json_extract(${SessionMessageTable.data}, '$.metadata.systemNotice') = 'server-recovery'`,
+            ),
       ),
     )
     .orderBy(asc(SessionMessageTable.seq))
@@ -64,7 +81,7 @@ const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =>
   )
 
 export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
-  const [epoch, compaction] = yield* Effect.all(
+  const [epoch, compaction, inherited] = yield* Effect.all(
     [
       db
         .select({ baselineSeq: SessionContextEpochTable.baseline_seq })
@@ -73,10 +90,11 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
         .get()
         .pipe(Effect.orDie),
       latestCompaction(db, sessionID),
+      inheritedBoundary(db, sessionID),
     ],
     { concurrency: "unbounded" },
   )
-  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), decodeMessageRow)
+  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq, inherited), decodeMessageRow)
 })
 
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
@@ -92,7 +110,8 @@ export const entriesForRunner = Effect.fn("SessionHistory.entriesForRunner")(fun
   sessionID: SessionSchema.ID,
   baselineSeq: number,
 ) {
-  const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID), baselineSeq)
+  const inherited = yield* inheritedBoundary(db, sessionID)
+  const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID), baselineSeq, inherited)
   return yield* Effect.forEach(rows, (row) =>
     decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
   )
@@ -124,6 +143,51 @@ export const entryForMessage = Effect.fn("SessionHistory.entryForMessage")(funct
     .pipe(Effect.orDie)
   if (!row) return
   return yield* decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message })))
+})
+
+// Task collection uses durable prompt boundaries, not the compacted provider
+// working set. Preserve receipt-bound structured attempts as well as the final
+// assistant: a later closure or correction must not erase original findings.
+export const loadForTask = Effect.fn("SessionHistory.loadForTask")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  promptID: SessionMessage.ID,
+) {
+  const anchor = yield* entryForMessage(db, sessionID, promptID)
+  if (anchor?.message.type !== "user") return []
+  // A promoted steer refines the running assignment, not a later task. Only
+  // durable input + closed activity evidence may extend the result window.
+  // Legacy/unattested history retains the strict next-User boundary.
+  const input = yield* db.select({ id: SessionInputTable.id }).from(SessionInputTable).where(and(
+    eq(SessionInputTable.session_id, sessionID), eq(SessionInputTable.id, promptID),
+    eq(SessionInputTable.promoted_seq, anchor.seq),
+  )).get().pipe(Effect.orDie)
+  const activity = input ? yield* db.select({ closedSeq: SessionActivityTable.closed_seq }).from(SessionActivityTable).where(and(
+    eq(SessionActivityTable.session_id, sessionID), lt(SessionActivityTable.opened_seq, anchor.seq),
+    gte(SessionActivityTable.closed_seq, anchor.seq),
+    inArray(SessionActivityTable.status, ["completed", "failed", "interrupted"]),
+  )).orderBy(asc(SessionActivityTable.closed_seq)).limit(1).get().pipe(Effect.orDie) : undefined
+  const closedSeq = activity?.closedSeq ?? undefined
+  const next = yield* db.select({ seq: SessionMessageTable.seq }).from(SessionMessageTable)
+    .leftJoin(SessionInputTable, and(eq(SessionInputTable.session_id, sessionID),
+      eq(SessionInputTable.id, SessionMessageTable.id), eq(SessionInputTable.promoted_seq, SessionMessageTable.seq)))
+    .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "user"), gt(SessionMessageTable.seq, anchor.seq),
+      closedSeq === undefined ? undefined : or(isNull(SessionInputTable.id), ne(SessionInputTable.delivery, "steer"),
+        gt(SessionMessageTable.seq, closedSeq))))
+    .orderBy(asc(SessionMessageTable.seq)).limit(1).get().pipe(Effect.orDie)
+  const response = yield* db.select().from(SessionMessageTable)
+    .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant"),
+      gt(SessionMessageTable.seq, anchor.seq), next ? lt(SessionMessageTable.seq, next.seq) : undefined,
+      closedSeq === undefined ? undefined : lte(SessionMessageTable.seq, closedSeq)))
+    .orderBy(desc(SessionMessageTable.seq)).limit(1).get().pipe(Effect.orDie)
+  const attempts = yield* db.select().from(SessionMessageTable).where(and(
+    eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant"),
+    gt(SessionMessageTable.seq, anchor.seq), next ? lt(SessionMessageTable.seq, next.seq) : undefined,
+    closedSeq === undefined ? undefined : lte(SessionMessageTable.seq, closedSeq),
+    sql`json_extract(${SessionMessageTable.data}, '$.structuredOutputAttempt.inputID') = ${promptID}`,
+  )).orderBy(asc(SessionMessageTable.seq)).all().pipe(Effect.orDie)
+  const rows = response && !attempts.some((row) => row.id === response.id) ? [...attempts, response] : attempts
+  return [anchor.message, ...yield* Effect.forEach(rows, decodeMessageRow)]
 })
 
 // Permission authority must survive model-context compaction without trusting

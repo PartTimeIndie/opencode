@@ -27,6 +27,15 @@ export const read = (db: Database.Interface["db"], sessionID: SessionSchema.ID) 
     .get()
     .pipe(Effect.map((row) => decode(row?.metadata?.[MetadataKey])), Effect.orDie)
 
+// Goal ownership is durable session metadata, not merely a plugin
+// registration. While a non-empty Goal condition is stored, the generic host
+// must neither arm nor run its own continuation for the session, even when the
+// plugin registration is temporarily absent (reload, eviction, restart).
+const goalMetadataOwns = (metadata: Record<string, unknown> | null | undefined) => {
+  const goal = metadata?.["opencode.session.goal"]
+  return typeof goal === "string" && goal.trim().length > 0
+}
+
 export const pending = (db: Database.Interface["db"], sessionID: SessionSchema.ID) =>
   db.transaction(
     (tx) =>
@@ -39,8 +48,13 @@ export const pending = (db: Database.Interface["db"], sessionID: SessionSchema.I
           .pipe(Effect.orDie)
         const current = decode(row?.metadata?.[MetadataKey])
         if (!row || !current) return
-        if (Date.now() - current.timeCreated <= LineageTtlMs)
+        if (Date.now() - current.timeCreated <= LineageTtlMs) {
+          // A marker armed before a Goal became active must not run generically
+          // while the Goal owns the session; it resumes only if the Goal is
+          // cleared within the lineage TTL.
+          if (goalMetadataOwns(row.metadata)) return
           return current.consumedAt === undefined ? current : undefined
+        }
 
         const metadata = { ...(row.metadata ?? {}) }
         delete metadata[MetadataKey]
@@ -71,6 +85,7 @@ export const arm = (
             .get()
             .pipe(Effect.orDie)
           if (!row) return
+          if (goalMetadataOwns(row.metadata)) return
           const now = Date.now()
           const current = decode(row.metadata?.[MetadataKey])
           const stale = current !== undefined && now - current.timeCreated > LineageTtlMs

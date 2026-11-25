@@ -72,8 +72,27 @@ export interface Options {
   readonly stdin?: ChildProcess.CommandInput
 }
 
+export interface StreamedOptions extends Options {
+  /** Receives every stdout chunk exactly once, before any capture ceiling. */
+  readonly onChunk: (chunk: Uint8Array) => void
+}
+
+export interface StreamedResult {
+  readonly exitCode: number
+  readonly stderr: Buffer
+  readonly truncated: boolean
+  readonly eofTimeout: boolean
+}
+
 export interface Interface {
   readonly run: (args: string[], opts: Options) => Effect.Effect<Result>
+  /**
+   * Runs Git while streaming stdout chunks to `onChunk` before the small
+   * capture ceiling applies. Use for bounded incremental parsing of large
+   * outputs (for example `cat-file --batch`) where the raw buffer must not
+   * accumulate.
+   */
+  readonly runStreamed: (args: string[], opts: StreamedOptions) => Effect.Effect<StreamedResult>
   readonly branch: (cwd: string) => Effect.Effect<string | undefined>
   readonly prefix: (cwd: string) => Effect.Effect<string>
   readonly defaultBranch: (cwd: string) => Effect.Effect<Base | undefined>
@@ -129,6 +148,39 @@ export const layer = Layer.effect(
         } satisfies Result
       },
       Effect.catch((err) => Effect.succeed(fail(err))),
+    )
+
+    const runStreamed = Effect.fn("Git.runStreamed")(
+      function* (args: string[], opts: StreamedOptions) {
+        const result = yield* appProcess.run(
+          ChildProcess.make("git", [...cfg, ...args], {
+            cwd: opts.cwd,
+            env: opts.env,
+            extendEnv: true,
+            stdin: opts.stdin ?? "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+          }),
+          {
+            maxOutputBytes: opts.maxOutputBytes ?? 256 * 1024,
+            spoolStdout: opts.onChunk,
+          },
+        )
+        return {
+          exitCode: result.exitCode,
+          stderr: result.stderr,
+          truncated: result.stdoutTruncated,
+          eofTimeout: result.stdoutEofTimeout === true,
+        } satisfies StreamedResult
+      },
+      Effect.catch((err) =>
+        Effect.succeed({
+          exitCode: 1,
+          stderr: Buffer.from(err instanceof Error ? err.message : String(err)),
+          truncated: false,
+          eofTimeout: false,
+        } satisfies StreamedResult),
+      ),
     )
 
     const text = Effect.fn("Git.text")(function* (args: string[], opts: Options) {
@@ -328,6 +380,7 @@ export const layer = Layer.effect(
 
     return Service.of({
       run,
+      runStreamed,
       branch,
       prefix,
       defaultBranch,

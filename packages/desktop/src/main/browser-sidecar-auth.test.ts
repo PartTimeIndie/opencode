@@ -1,9 +1,17 @@
 import { describe, expect, test } from "bun:test"
-import { sidecarBrowserAuthorization } from "./browser-sidecar-auth"
+import { ownsSidecarLogin, sidecarBrowserAuthorization } from "./browser-sidecar-auth"
 
 describe("browser sidecar authorization", () => {
   const sidecar = { url: "http://127.0.0.1:4098", username: "opencode", password: "secret" }
   const expected = "Basic b3BlbmNvZGU6c2VjcmV0"
+
+  test("declines utility-process, foreign-session and proxy login challenges", () => {
+    const session = {}
+    expect(ownsSidecarLogin(null, session, false)).toBe(false)
+    expect(ownsSidecarLogin({ session: {} }, session, false)).toBe(false)
+    expect(ownsSidecarLogin({ session }, session, true)).toBe(false)
+    expect(ownsSidecarLogin({ session }, session, false)).toBe(true)
+  })
 
   test("allows the current sidecar origin", () => {
     expect(sidecarBrowserAuthorization("http://127.0.0.1:4098/session", sidecar)).toBe(expected)

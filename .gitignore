@@ -124,12 +124,16 @@ docs/plugin-audit/**/*.aac
 docs/plugin-audit/**/*.pdf
 
 # Personal documents and installed workflows are not fork source.
+# Keep local originals. Tracked files still need an index-only removal;
+# staged deletions stay visible against the old HEAD despite these rules.
+# Never force-add these paths; see .agents/instructions/fork-publication.md.
 /docs/plans/prototype-fund*
 /skills/
 /.opencode/skills/*
 !/.opencode/skills/composer-toolbar-plugin/
 !/.opencode/skills/effect/
 /.opencode/scripts/
+/.opencode/tool/
 /.opencode/tools/
 /.opencode/agent/
 /.opencode/agents/
@@ -198,3 +202,15 @@ docs/qa/**/*.diff
 /packages/core/test/normalAdmission-evidence.md
 /packages/core/test/persisted-chain-evidence.md
 /packages/opencode/src/server/routes/instance/httpapi/diagnosis-loading-gate.md
+
+# Local integrations and one-off repairs can also sit outside workflow folders.
+/packages/app/e2e/regression/question-daily-review-import.spec.ts
+/packages/app/e2e/run-with-vite-server.local.ts
+/packages/app/src/context/global-sync/_patch_*.py
+/packages/core/test/clean_fixture.py
+/packages/core/test/dedupe_tests.py
+/packages/core/test/final_close.py
+/packages/core/test/find_dup.py
+/packages/core/test/fix_fixture.py
+/packages/core/script/fixtures/pu-skill-groups.json
+/docs/visual-qa-smoke-*.md

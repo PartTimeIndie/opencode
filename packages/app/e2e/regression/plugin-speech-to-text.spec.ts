@@ -8,6 +8,34 @@ const directory = "C:/OpenCode/speech-desktop-service"
 const server = "http://127.0.0.1:4096"
 const sessionID = "ses_speech_desktop_service"
 
+test("automatic transcript clipboard copy can be disabled in plugin settings", async ({ page }, testInfo) => {
+  const errors: string[] = []
+  page.on("pageerror", (error) => errors.push(error.message))
+  await mockOpenCodeServer(page, {
+    directory,
+    project: { id: "project-speech-desktop-service", name: "Speech Desktop Service", worktree: directory, vcs: "git" },
+    provider: { all: [], connected: [], default: {} },
+    sessions: [{ id: sessionID, slug: sessionID, projectID: "project-speech-desktop-service", directory, title: "Speech desktop service", version: "dev", time: { created: 1_700_000_000_000, updated: 1_700_000_000_000 } }],
+    pageMessages: () => ({ items: [] }),
+  })
+  await mockSpeechPlugin(page)
+  await page.addInitScript(({ directory, encoded, server, sessionID }) => {
+    localStorage.setItem("settings.v3", JSON.stringify({}))
+    localStorage.setItem("opencode.global.dat:server", JSON.stringify({ projects: { [server]: [{ worktree: directory, expanded: true }] }, lastProject: { [server]: directory } }))
+    localStorage.setItem("opencode.global.dat:tabs", JSON.stringify([{ type: "session", server, dirBase64: encoded, sessionId: sessionID }]))
+  }, { directory, encoded: base64Encode(directory), server, sessionID })
+  await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+  await page.getByRole("button", { name: "Open settings", exact: true }).click()
+  await page.getByRole("tab", { name: "Skills & Plugins", exact: true }).click()
+  const toggle = page.getByRole("switch", { name: "Copy transcripts to clipboard" })
+  await expect(toggle).toBeChecked()
+  await toggle.locator("..").locator('[data-slot="switch-control"]').click()
+  await expect(toggle).not.toBeChecked()
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("opencode.app-plugin.speech-to-text-app.settings.copyTranscriptsToClipboard"))).toBe("false")
+  await page.screenshot({ path: testInfo.outputPath("clipboard-setting-off.png") })
+  expect(errors).toEqual([])
+})
+
 test("Speech to Text settings own the optional global desktop service", async ({ page }, testInfo) => {
   const consoleErrors: string[] = []
   const failedResponses: string[] = []

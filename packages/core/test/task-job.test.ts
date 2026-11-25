@@ -7,6 +7,7 @@ import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { TaskJob } from "@opencode-ai/core/tool/task-job"
 import { eq } from "drizzle-orm"
 import { Context, Deferred, Effect, Exit, Layer, Scope } from "effect"
+import { TestClock } from "effect/testing"
 import { testEffect } from "./lib/effect"
 
 const database = Database.layerFromPath(":memory:")
@@ -16,15 +17,15 @@ const events = Layer.mock(EventV2.Service, {
     Effect.sync(() => {
       settled.push({
         type: definition.type,
-        sessionID: typeof data === "object" && data !== null && "sessionID" in data ? String(data.sessionID) : undefined,
+        sessionID:
+          typeof data === "object" && data !== null && "sessionID" in data ? String(data.sessionID) : undefined,
       })
       return { id: EventV2.ID.create(), type: definition.type, data }
     }),
 })
-const jobs = TaskJob.layer.pipe(
-  Layer.provide(Layer.mergeAll(database, BackgroundJob.defaultLayer.pipe(Layer.provide(database)), events)),
-)
-const it = testEffect(Layer.mergeAll(database, jobs))
+const background = BackgroundJob.defaultLayer
+const jobs = TaskJob.layer.pipe(Layer.provide(Layer.mergeAll(database, background, events)))
+const it = testEffect(Layer.mergeAll(database, background, jobs))
 const memoryIt = testEffect(TaskJob.memory)
 const parentID = SessionSchema.ID.make("ses_task_job_parent")
 const rootID = SessionSchema.ID.make("ses_task_job_root")
@@ -88,6 +89,148 @@ describe("TaskJob.memory", () => {
 })
 
 describe("TaskJob", () => {
+  it.live("refuses a launch not installed by the background registry and stops its reserved lease", () =>
+    Effect.gen(function* () {
+      const service = yield* TaskJob.Service
+      const background = yield* BackgroundJob.Service
+      const db = (yield* Database.Service).db
+      const cleanup = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      yield* background.start({ id: firstID, type: "test",
+        run: Effect.addFinalizer(() => Deferred.succeed(cleanup, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        )).pipe(Effect.as("prior job")),
+      })
+      yield* Deferred.await(cleanup).pipe(Effect.timeout("1 second"))
+      yield* service.reserve(reserve(firstID))
+      let runs = 0
+      const launch = yield* service.launch(firstID, Effect.sync(() => { runs++; return "not accepted" })).pipe(Effect.exit)
+      expect(Exit.isFailure(launch)).toBe(true)
+      expect(runs).toBe(0)
+      expect(yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get())
+        .toMatchObject({ status: "error", lease_until: null, time_owner_settled: expect.any(Number) })
+    }),
+  )
+
+  it.live("settles a never-launched reservation when its real service scope closes", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const scope = yield* Scope.make()
+      const shared = Layer.succeed(Database.Service, yield* Database.Service)
+      const service = Context.get(yield* Layer.buildWithScope(
+        TaskJob.defaultLayer.pipe(Layer.provide(shared), Layer.fresh), scope,
+      ), TaskJob.Service)
+      yield* service.reserve(reserve(secondID))
+      yield* Scope.close(scope, Exit.void)
+      expect(yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, secondID)).get())
+        .toMatchObject({ status: "cancelled", lease_until: null, time_owner_settled: expect.any(Number) })
+    }),
+  )
+
+  it.effect("renews a preparing reservation before any runner exists", () =>
+    Effect.gen(function* () {
+      const service = yield* TaskJob.Service
+      const db = (yield* Database.Service).db
+      yield* service.reserve(reserve(firstID, 1))
+      for (let tick = 0; tick < 5; tick++) {
+        yield* TestClock.adjust(5_000)
+        // A separate observer must see a live lease, not a process-local exemption.
+        expect(yield* TaskJob.recoverStale(db, firstID)).toEqual([])
+      }
+      expect(yield* service.get(firstID)).toMatchObject({ status: "running" })
+      expect(yield* service.reserve(reserve(secondID, 1)).pipe(Effect.flip)).toBeInstanceOf(TaskJob.LimitError)
+      yield* service.launch(firstID, Effect.succeed("prepared result"))
+      expect((yield* service.wait(firstID, 1_000)).info).toMatchObject({ status: "completed", output: "prepared result" })
+    }),
+  )
+
+  it.live("does not acknowledge cancelled preparation until its owner finishes", () =>
+    Effect.gen(function* () {
+      const service = yield* TaskJob.Service
+      const db = (yield* Database.Service).db
+      yield* service.reserve(reserve(firstID))
+      yield* service.cancel(firstID)
+      expect((yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get())?.time_owner_settled).toBeNull()
+      yield* service.fail(firstID, "preparation stopped")
+      expect((yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get())?.time_owner_settled).not.toBeNull()
+    }),
+  )
+
+  it.effect("never renews, launches, settles or acknowledges a replaced cleanup generation", () =>
+    Effect.gen(function* () {
+      const service = yield* TaskJob.Service
+      const db = (yield* Database.Service).db
+      yield* service.reserve(reserve(firstID))
+      yield* db.update(BackgroundJobTable).set({ cleanup_token: "replacement-generation", heartbeat_at: 123, lease_until: 60_000 })
+        .where(eq(BackgroundJobTable.id, firstID)).run()
+      yield* TestClock.adjust(5_000)
+      const launch = yield* service.launch(firstID, Effect.die("must not run")).pipe(Effect.exit)
+      expect(Exit.isFailure(launch)).toBe(true)
+      yield* service.fail(firstID, "stale setup failure")
+      expect(yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get())
+        .toMatchObject({ status: "running", cleanup_token: "replacement-generation", heartbeat_at: 123, time_owner_settled: null })
+    }),
+  )
+
+  it.live("keeps durable cleanup unknown while job-scope finalizers still run", () =>
+    Effect.gen(function* () {
+      const service = yield* TaskJob.Service
+      const db = (yield* Database.Service).db
+      const cleanup = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      yield* service.reserve(reserve(firstID))
+      yield* service.launch(
+        firstID,
+        Effect.addFinalizer(() =>
+          Deferred.succeed(cleanup, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(Effect.as("done")),
+      )
+      yield* Deferred.await(cleanup).pipe(Effect.timeout("1 second"))
+      const row = yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get()
+      expect(row?.status).toBe("completed")
+      expect(row?.cleanup_token).toBeTruthy()
+      expect(row?.time_owner_settled).toBeNull()
+      expect(yield* service.reserve(reserve(firstID)).pipe(Effect.flip)).toBeInstanceOf(TaskJob.AlreadyRunningError)
+      yield* Deferred.succeed(release, undefined)
+      yield* Effect.gen(function* () {
+        while (
+          !(yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get())
+            ?.time_owner_settled
+        )
+          yield* Effect.sleep("5 millis")
+      }).pipe(Effect.timeout("1 second"))
+      expect(yield* service.reserve(reserve(firstID))).toMatchObject({ status: "running" })
+    }),
+  )
+
+  it.live("never attests expired or remotely cancelled owner cleanup", () =>
+    Effect.gen(function* () {
+      const service = yield* TaskJob.Service
+      const db = (yield* Database.Service).db
+      yield* db
+        .insert(BackgroundJobTable)
+        .values({
+          id: firstID,
+          type: "task",
+          status: "running",
+          child_session_id: firstID,
+          parent_session_id: parentID,
+          owner_id: "foreign",
+          cleanup_token: "foreign-generation",
+          lease_until: 1,
+        })
+        .run()
+      expect(yield* service.get(firstID)).toMatchObject({ status: "error" })
+      yield* service.cancel(firstID)
+      expect(
+        (yield* db.select().from(BackgroundJobTable).where(eq(BackgroundJobTable.id, firstID)).get())
+          ?.time_owner_settled,
+      ).toBeNull()
+    }),
+  )
+
   it.live("persists a completed result for later reads", () =>
     Effect.gen(function* () {
       const service = yield* TaskJob.Service
@@ -96,7 +239,10 @@ describe("TaskJob", () => {
       yield* service.launch(firstID, Effect.succeed("durable result"))
 
       const result = yield* service.wait(firstID, 1_000)
-      expect(result).toMatchObject({ timedOut: false, info: { taskID: firstID, status: "completed", output: "durable result" } })
+      expect(result).toMatchObject({
+        timedOut: false,
+        info: { taskID: firstID, status: "completed", output: "durable result" },
+      })
       expect(yield* service.get(firstID)).toMatchObject({ status: "completed", output: "durable result" })
       expect(settled).toContainEqual({ sessionID: firstID, type: TaskJob.Settled.type })
     }),
@@ -154,10 +300,7 @@ describe("TaskJob", () => {
       yield* service.reserve(reserve(firstID))
       yield* service.launch(
         firstID,
-        Deferred.succeed(started, undefined).pipe(
-          Effect.andThen(Deferred.await(release)),
-          Effect.as("late result"),
-        ),
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as("late result")),
       )
       yield* Deferred.await(started)
 
@@ -206,7 +349,10 @@ describe("TaskJob", () => {
 
       const service = yield* TaskJob.Service
       expect(yield* service.reserve(reserve(secondID, 1))).toMatchObject({ taskID: secondID, status: "running" })
-      expect(yield* service.get(firstID)).toMatchObject({ status: "error", error: expect.stringContaining("lease expired") })
+      expect(yield* service.get(firstID)).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("lease expired"),
+      })
     }),
   )
 
@@ -274,45 +420,47 @@ describe("TaskJob", () => {
     }),
   )
 
-  it.live("interrupts the owner run when another service cancels the durable task", () =>
-    Effect.gen(function* () {
-      const sharedDatabase = Layer.succeed(Database.Service, yield* Database.Service)
-      const firstScope = yield* Scope.make()
-      const secondScope = yield* Scope.make()
-      yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void))
-      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void))
-      const first = Context.get(
-        yield* Layer.buildWithScope(
-          TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
-          firstScope,
-        ),
-        TaskJob.Service,
-      )
-      const second = Context.get(
-        yield* Layer.buildWithScope(
-          TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
-          secondScope,
-        ),
-        TaskJob.Service,
-      )
-      const started = yield* Deferred.make<void>()
-      const interrupted = yield* Deferred.make<void>()
+  it.live(
+    "interrupts the owner run when another service cancels the durable task",
+    () =>
+      Effect.gen(function* () {
+        const sharedDatabase = Layer.succeed(Database.Service, yield* Database.Service)
+        const firstScope = yield* Scope.make()
+        const secondScope = yield* Scope.make()
+        yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void))
+        yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void))
+        const first = Context.get(
+          yield* Layer.buildWithScope(
+            TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
+            firstScope,
+          ),
+          TaskJob.Service,
+        )
+        const second = Context.get(
+          yield* Layer.buildWithScope(
+            TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
+            secondScope,
+          ),
+          TaskJob.Service,
+        )
+        const started = yield* Deferred.make<void>()
+        const interrupted = yield* Deferred.make<void>()
 
-      yield* first.reserve(reserve(firstID))
-      yield* first.launch(
-        firstID,
-        Deferred.succeed(started, undefined).pipe(
-          Effect.andThen(Effect.never),
-          Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
-        ),
-      )
-      yield* Deferred.await(started)
+        yield* first.reserve(reserve(firstID))
+        yield* first.launch(
+          firstID,
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+          ),
+        )
+        yield* Deferred.await(started)
 
-      expect(yield* second.cancel(firstID)).toMatchObject({ status: "cancelled" })
-      yield* Deferred.await(interrupted).pipe(Effect.timeout("7 seconds"))
-      expect(yield* first.get(firstID)).toMatchObject({ status: "cancelled" })
-      expect(yield* second.get(firstID)).toMatchObject({ status: "cancelled" })
-    }),
+        expect(yield* second.cancel(firstID)).toMatchObject({ status: "cancelled" })
+        yield* Deferred.await(interrupted).pipe(Effect.timeout("7 seconds"))
+        expect(yield* first.get(firstID)).toMatchObject({ status: "cancelled" })
+        expect(yield* second.get(firstID)).toMatchObject({ status: "cancelled" })
+      }),
     10_000,
   )
 
@@ -323,17 +471,11 @@ describe("TaskJob", () => {
       const secondScope = yield* Scope.make()
       yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void))
       const first = Context.get(
-        yield* Layer.buildWithScope(
-          TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
-          firstScope,
-        ),
+        yield* Layer.buildWithScope(TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh), firstScope),
         TaskJob.Service,
       )
       const second = Context.get(
-        yield* Layer.buildWithScope(
-          TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
-          secondScope,
-        ),
+        yield* Layer.buildWithScope(TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh), secondScope),
         TaskJob.Service,
       )
       const started = yield* Deferred.make<void>()
@@ -364,17 +506,11 @@ describe("TaskJob", () => {
       const secondScope = yield* Scope.make()
       yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void))
       const first = Context.get(
-        yield* Layer.buildWithScope(
-          TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
-          firstScope,
-        ),
+        yield* Layer.buildWithScope(TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh), firstScope),
         TaskJob.Service,
       )
       const second = Context.get(
-        yield* Layer.buildWithScope(
-          TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh),
-          secondScope,
-        ),
+        yield* Layer.buildWithScope(TaskJob.defaultLayer.pipe(Layer.provide(sharedDatabase), Layer.fresh), secondScope),
         TaskJob.Service,
       )
       const started = yield* Deferred.make<void>()

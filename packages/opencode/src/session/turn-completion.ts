@@ -233,7 +233,7 @@ function messageText(message: CompletionMessage | undefined) {
     .trim()
 }
 
-function latestUserTask(messages: CompletionMessage[]) {
+function latestUserTask(messages: CompletionMessage[], full = false) {
   // A later admitted prompt belongs to the next answer. Continuations retain
   // their original user task even when it falls outside the eight-message tail.
   const lastAssistant = messages.findLastIndex((message) => message.info.role === "assistant")
@@ -241,7 +241,7 @@ function latestUserTask(messages: CompletionMessage[]) {
     .slice(0, lastAssistant < 0 ? messages.length : lastAssistant)
     .findLast((message) => message.info.role === "user")
   const text = messageText(task)
-  if (text.length <= 12_000) return text
+  if (full || text.length <= 12_000) return text
   return `${text.slice(0, 8_000)}\n[${text.length - 12_000} characters omitted from the middle of the user task]\n${text.slice(-4_000)}`
 }
 
@@ -272,7 +272,7 @@ export function historyStatus(messages: CompletionMessage[], agent?: string): St
 
 function isReportOnlyReviewTask(messages: CompletionMessage[]) {
   // Restrict the exception to the admitted report contract, before quoted evidence/schema.
-  const header = latestUserTask(messages).split(/\nSchema:/i, 1)[0] ?? ""
+  const header = latestUserTask(messages, true).split(/\nSchema:/i, 1)[0] ?? ""
   return (
     /\b(?:strikt|strict(?:ly)?)\s+report-only\b/i.test(header) &&
     /\b(?:antworte|respond|return)[^\n]{0,100}\b(?:ausschlie(?:ß|ss)lich|only|exactly)[^\n]{0,50}\bjson\b/i.test(header)
@@ -299,25 +299,67 @@ const ReviewReport = Schema.Struct({
   rejected: Schema.optional(Schema.Array(Schema.Struct({ title: Schema.NonEmptyString, reason: Schema.NonEmptyString }))),
 })
 
+const CommittedReviewReport = Schema.Struct({
+  reviewedCommitShas: Schema.Array(Schema.NonEmptyString),
+  reviewedPatchPages: Schema.optional(Schema.Array(Schema.NonEmptyString)),
+  findings: Schema.Array(Schema.Struct({
+    commitSha: Schema.NonEmptyString,
+    file: Schema.NonEmptyString,
+    title: Schema.NonEmptyString,
+    evidence: Schema.NonEmptyString,
+    suggestedFix: Schema.NonEmptyString,
+    testRequirement: Schema.NonEmptyString,
+  })),
+  notes: Schema.Array(Schema.String),
+})
+
+function ownReviewPromise(text: string) {
+  return /(?:^|[.!?]\s+)(?:ich|wir|i|we)\s+(?:werde[n]?|will|must|need|still)\b/i.test(text) ||
+    (/\b(?:ich|wir|i|we)\b/i.test(text) && explicitlyIncompleteReport(text))
+}
+
+function committedReviewNoteIncomplete(text: string) {
+  // Committed reviews are read-only. Saying that runtime tests were not run
+  // records the review boundary; it does not leave the requested review open.
+  const reviewText = text
+    .replace(/\b(?:laufzeit)?tests? wurden nicht ausgef(?:ü|ue)hrt\b/gi, "")
+    .replace(/\b(?:ihre )?visuellen auswirkungen und bin(?:ä|ae)ren nutzdaten wurden nicht verifiziert\b/gi, "")
+  return /\b(?:kontextl(?:ü|ue)cke|unvollst(?:ä|ae)ndiger kontext|review-fehler|missing context|unreadable context)\b/i.test(reviewText) ||
+    ownReviewPromise(reviewText) || explicitlyIncompleteReport(reviewText)
+}
+
 function reviewReport(messages: CompletionMessage[]) {
   const last = messages.toReversed().find((message) => message.info.role === "assistant")
   const parsed = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(messageText(last))
   if (Option.isNone(parsed)) return
+  const header = latestUserTask(messages, true).split(/\nSchema:/i, 1)[0] ?? ""
+  const bindings = [...header.matchAll(/^Ausgewaehlte Commits: (.+)$/gm)]
+  if (bindings.length) {
+    if (bindings.length !== 1) return
+    const expected = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Array(Schema.String)))(bindings[0][1])
+    const decoded = Schema.decodeUnknownOption(CommittedReviewReport, { onExcessProperty: "error" })(parsed.value)
+    if (Option.isNone(expected) || Option.isNone(decoded)) return
+    const shas = expected.value
+    const report = decoded.value
+    if (!shas.length || shas.some((sha) => !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) || new Set(shas).size !== shas.length) return
+    if (report.reviewedCommitShas.length !== shas.length || new Set(report.reviewedCommitShas).size !== shas.length ||
+      report.reviewedCommitShas.some((sha) => !shas.includes(sha))) return
+    if (report.notes.some(committedReviewNoteIncomplete)) return
+    if (report.findings.some((finding) => !shas.includes(finding.commitSha) || Object.values(finding).some(ownReviewPromise))) return
+    return report
+  }
   const decoded = Schema.decodeUnknownOption(ReviewReport, { onExcessProperty: "error" })(parsed.value)
   if (Option.isNone(decoded)) return
   const report = decoded.value
   // Test requirements and review questions describe findings. Actual promises remain open;
   // inspect each leaf separately so a word in one field cannot match another field's result.
-  const ownPromise = (text: string) =>
-    /(?:^|[.!?]\s+)(?:ich|wir|i|we)\s+(?:werde[n]?|will|must|need|still)\b/i.test(text) ||
-    (/\b(?:ich|wir|i|we)\b/i.test(text) && explicitlyIncompleteReport(text))
-  if (report.notes.some((text) => ownPromise(text) || explicitlyIncompleteReport(text))) return
+  if (report.notes.some((text) => ownReviewPromise(text) || explicitlyIncompleteReport(text))) return
   if (report.findings.some((finding) =>
     !Number.isFinite(finding.confidence) || finding.confidence < 0 || finding.confidence > 1 ||
-    Object.values(finding).some((value) => typeof value === "string" && ownPromise(value)) ||
-    finding.changeOptions.some((option) => ownPromise(option.label) || ownPromise(option.description))
+    Object.values(finding).some((value) => typeof value === "string" && ownReviewPromise(value)) ||
+    finding.changeOptions.some((option) => ownReviewPromise(option.label) || ownReviewPromise(option.description))
   )) return
-  if (report.rejected?.some((finding) => ownPromise(finding.title) || ownPromise(finding.reason))) return
+  if (report.rejected?.some((finding) => ownReviewPromise(finding.title) || ownReviewPromise(finding.reason))) return
   return report
 }
 

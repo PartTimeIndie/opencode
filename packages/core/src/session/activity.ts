@@ -15,6 +15,8 @@ import { QuestionV2 } from "../question"
 import { QuestionTransaction } from "../question/transaction"
 import { QuestionWakeup } from "../question/wakeup"
 import { SessionMessage } from "./message"
+import { LegacyDelegationGuard } from "./legacy-delegation/guard"
+import { CrashGuard } from "./crash-guard"
 
 export type Status = "running" | "recovering" | "completed" | "failed" | "interrupted"
 export type Kind = "prompt" | "queue" | "resume" | "recovery"
@@ -30,6 +32,7 @@ export type Info = {
   readonly heartbeatAt?: number
   readonly recoveryAttempts: number
   readonly lastError?: string
+  readonly turnCompletionResult?: "done" | "incomplete" | "unknown" | "skipped"
   readonly openedSeq?: number
   readonly closedSeq?: number
   readonly timeCreated: number
@@ -44,8 +47,9 @@ export interface Interface {
     readonly ownerID: string
     readonly leaseDurationMs?: number
     readonly openedSeq: number
+    readonly crash?: { readonly activityID: string; readonly previousOwner: string }
     readonly onClaim?: (info: Info) => void
-  }) => Effect.Effect<Info>
+  }) => Effect.Effect<Info, LegacyDelegationGuard.Blocked>
   readonly heartbeat: (id: string, ownerID: string, leaseDurationMs?: number) => Effect.Effect<boolean>
   readonly complete: (id: string, ownerID: string, closedSeq: number) => Effect.Effect<void>
   readonly fail: (
@@ -139,6 +143,7 @@ const fromRow = (row: typeof SessionActivityTable.$inferSelect): Info => ({
   ...(row.heartbeat_at === null ? {} : { heartbeatAt: row.heartbeat_at }),
   recoveryAttempts: row.recovery_attempts,
   ...(row.last_error === null ? {} : { lastError: row.last_error }),
+  ...(row.turn_completion_result === null ? {} : { turnCompletionResult: row.turn_completion_result }),
   ...(row.opened_seq === null ? {} : { openedSeq: row.opened_seq }),
   ...(row.closed_seq === null ? {} : { closedSeq: row.closed_seq }),
   timeCreated: row.time_created,
@@ -161,6 +166,7 @@ export const layer = Layer.effect(
         .transaction(
           (tx) =>
             Effect.gen(function* () {
+              yield* LegacyDelegationGuard.assertAdmissible(tx, input.sessionID)
               const current = yield* tx
                 .select()
                 .from(SessionActivityTable)
@@ -172,9 +178,33 @@ export const layer = Layer.effect(
                 )
                 .orderBy(asc(SessionActivityTable.time_created))
                 .get()
+              if (
+                input.crash &&
+                (!current || current.id !== input.crash.activityID || current.owner_id !== input.crash.previousOwner)
+              )
+                return { _tag: "Skip" as const }
               if (current && locallyActive.has(current.id)) return { _tag: "Wait" as const, delay: 250 }
               if (current && current.lease_until !== null && current.lease_until > ts)
                 return { _tag: "Wait" as const, delay: Math.min(250, current.lease_until - ts) }
+              if (current && input.crash) {
+                const blocked = yield* CrashGuard.inspect(tx, current)
+                if (blocked) {
+                  yield* tx
+                    .update(SessionActivityTable)
+                    .set({
+                      status: "interrupted",
+                      reason: "desktop-crash-blocked",
+                      last_error: blocked,
+                      owner_id: null,
+                      lease_until: null,
+                      heartbeat_at: null,
+                      time_updated: ts,
+                    })
+                    .where(eq(SessionActivityTable.id, current.id))
+                    .run()
+                  return { _tag: "Blocked" as const, row: current, blocked }
+                }
+              }
               if (current) {
                 const row = yield* tx
                   .update(SessionActivityTable)
@@ -182,6 +212,7 @@ export const layer = Layer.effect(
                     status: "recovering",
                     kind: "recovery",
                     ...(input.reason === undefined ? {} : { reason: input.reason }),
+                    ...(input.crash ? { reason: `desktop-crash:${input.crash.previousOwner}` } : {}),
                     owner_id: input.ownerID,
                     recovery_attempts: current.recovery_attempts + 1,
                     lease_until: ts + leaseDuration,
@@ -224,10 +255,12 @@ export const layer = Layer.effect(
         )
         .pipe(
           Effect.retry({ while: isRetryableLock, schedule: lockRetrySchedule }),
-          Effect.orDie,
+          Effect.catch((error) =>
+            error instanceof LegacyDelegationGuard.Blocked ? Effect.fail(error) : Effect.die(error),
+          ),
           Effect.flatMap((result) =>
             Effect.sync(() => {
-              if (result._tag === "Wait") return result
+              if (result._tag === "Wait" || result._tag === "Skip" || result._tag === "Blocked") return result
               const info = fromRow(result.row)
               input.onClaim?.(info)
               return result
@@ -239,6 +272,27 @@ export const layer = Layer.effect(
         )
       if (acquired._tag === "Wait")
         return yield* Effect.sleep(`${Math.max(1, acquired.delay)} millis`).pipe(Effect.andThen(open(input)))
+      if (acquired._tag === "Skip") return yield* Effect.interrupt
+      if (input.crash) {
+        yield* events.publish(SessionEvent.ContextUpdated, {
+          sessionID: input.sessionID,
+          messageID: SessionMessage.ID.make(`msg_crash_${input.crash.activityID}_${input.ownerID}`),
+          timestamp: yield* DateTime.now,
+          text:
+            acquired._tag === "Blocked"
+              ? `Der lokale Server wurde neu gestartet. Automatische Fortsetzung pausiert: ${acquired.blocked}. Bitte zuerst prüfen; keine ungeklärten Aktionen wiederholen.`
+              : "Der lokale Server wurde unerwartet beendet und neu gestartet. Ich setze die unterbrochene Arbeit mit dem gespeicherten Stand fort. Bereits abgeschlossene Aktionen nicht wiederholen; dieser Systemhinweis erteilt keine neue Berechtigung.",
+        })
+      }
+      if (acquired._tag === "Blocked") {
+        yield* events.publish(SessionEvent.Activity.Interrupted, {
+          sessionID: input.sessionID,
+          activityID: acquired.row.id,
+          timestamp: yield* DateTime.now,
+          reason: "desktop-crash-blocked",
+        })
+        return yield* Effect.interrupt
+      }
       if (acquired._tag === "Recovered") {
         yield* events.publish(SessionEvent.Activity.Recovered, {
           sessionID: input.sessionID,

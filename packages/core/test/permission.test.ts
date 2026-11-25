@@ -293,6 +293,33 @@ function waitForRequest(input: Partial<PermissionV2.AssertInput> = {}) {
 }
 
 describe("PermissionV2", () => {
+  it.effect("snapshots configured, inherited, access-mode and remembered permission inputs without asking", () =>
+    Effect.gen(function* () {
+      const rules: PermissionV2.Ruleset = [{ action: "read", resource: "*", effect: "ask" }]
+      yield* setup(rules)
+      yield* setAccessControl({ mode: "ask" })
+      const service = yield* PermissionV2.Service
+      const saved = yield* PermissionSaved.Service
+      const snapshot = service.policySnapshot
+      if (!snapshot) return yield* Effect.die("Production permission policy snapshot is missing")
+      const input = { sessionID: SessionV2.ID.make("ses_test") }
+      const initial = yield* snapshot(input)
+      expect(initial).toMatchObject({ configured: rules, inherited: [], accessControl: { mode: "ask" }, remembered: [], reviewed: [], rejected: [] })
+      yield* setAccessControl({ mode: "full_access" })
+      expect((yield* snapshot(input)).accessControl.mode).toBe("full_access")
+      const inherited: PermissionV2.Ruleset = [{ action: "write", resource: "*", effect: "deny" }]
+      yield* setInheritedPermissions([inherited])
+      expect((yield* snapshot(input)).inherited).toEqual([inherited])
+      yield* saved.add({ projectID: Project.ID.global, action: "read", resources: ["z.txt", "a.txt"] })
+      expect((yield* snapshot(input)).remembered).toEqual([
+        { action: "read", resource: "a.txt", effect: "allow" },
+        { action: "read", resource: "z.txt", effect: "allow" },
+      ])
+      for (const grant of yield* saved.list({ projectID: Project.ID.global })) yield* saved.remove(grant.id)
+      expect((yield* snapshot(input)).remembered).toEqual([])
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])
@@ -413,6 +440,33 @@ describe("PermissionV2", () => {
   }
 
   for (const mode of ["ask", "full_access", "approve_for_me"] as const) {
+    itWithSafety.effect(`Main task consent returns an actual host receipt under ${mode}`, () => Effect.gen(function* () {
+      yield* setup([{ action: "*", resource: "*", effect: "allow" }])
+      yield* setAccessControl({ mode })
+      yield* (yield* PermissionSaved.Service).add({ projectID: Project.ID.global, action: "task_main_write", resources: ["*"] })
+      const service = yield* PermissionV2.Service
+      const authorize = service.assertSingleUse
+      if (!authorize) return yield* Effect.die("Native receipt support missing")
+      const events = yield* EventV2.Service
+      const asked = yield* Deferred.make<PermissionV2.Request>()
+      const unsubscribe = yield* events.listen((event) => event.type === PermissionV2.Event.Asked.type
+        ? Deferred.succeed(asked, Schema.decodeUnknownSync(PermissionV2.Request)(event.data)).pipe(Effect.asVoid) : Effect.void)
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const input = assertion({ action: "task_main_write", resources: ["task:fixture:exact-digest"], save: ["*"] })
+      const fiber = yield* authorize(input).pipe(Effect.forkChild)
+      const request = yield* Deferred.await(asked)
+      expect(request.metadata?.[PermissionV2.SINGLE_USE_METADATA_KEY]).toBe(true)
+      expect(request.save).toBeUndefined()
+      expect(yield* service.reply({ requestID: request.id, reply: "always" }).pipe(Effect.flip)).toBeInstanceOf(PermissionV2.RejectedError)
+      yield* service.reply({ requestID: request.id, reply: "once" })
+      expect(yield* Fiber.join(fiber)).toBe(request.id)
+      expect(yield* service.list()).toEqual([])
+      yield* setRules([{ action: "task_main_write", resource: "*", effect: "deny" }])
+      expect(yield* authorize(input).pipe(Effect.flip)).toBeInstanceOf(PermissionV2.DeniedError)
+    }))
+  }
+
+  for (const mode of ["ask", "full_access", "approve_for_me"] as const) {
     itWithSafety.effect(`spawn requires a fresh host click under ${mode}, preserving Deny`, () =>
       Effect.gen(function* () {
         yield* setup([{ action: "spawn_agent", resource: "*", effect: "ask" }])
@@ -507,6 +561,25 @@ describe("PermissionV2", () => {
       expect(yield* service.list()).toEqual([])
     }),
   )
+
+  for (const mode of ["full_access", "ask", "approve_for_me"] as const) {
+    itWithSafety.effect(`routes external directory approval through ${mode}`, () =>
+      Effect.gen(function* () {
+        safetyReviews.length = 0
+        safetyDecision.value = true
+        yield* setup([{ action: "external_directory", resource: "*", effect: "ask" }])
+        yield* setAccessControl({ mode, safety_review: { model: "test/model" } })
+        const service = yield* PermissionV2.Service
+        const resources = ["/external/dir/*"]
+        const result = yield* service.ask(assertion({ action: "external_directory", resources }))
+        expect(result.effect).toBe(mode === "ask" ? "ask" : "allow")
+        expect(yield* service.list()).toHaveLength(mode === "ask" ? 1 : 0)
+        expect(safetyReviews).toHaveLength(mode === "approve_for_me" ? 1 : 0)
+        if (mode === "approve_for_me")
+          expect(safetyReviews[0]).toMatchObject({ action: "external_directory", resources })
+      }),
+    )
+  }
 
   itWithSafety.effect("approve_for_me auto-approves approval-required calls after safety review", () =>
     Effect.gen(function* () {

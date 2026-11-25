@@ -7,6 +7,8 @@ import { FileMutation } from "../file-mutation"
 import { FSUtil } from "../fs-util"
 import { LocationMutation } from "../location-mutation"
 import { Patch } from "../patch"
+import { WorkspaceCheckout } from "../session/workspace/checkout"
+import { LegacyDelegationGuard } from "../session/legacy-delegation/guard"
 import { PermissionV2 } from "../permission"
 import { SessionFileMutation } from "../session/file-mutation"
 import { KnownFileMutation } from "./known-file-mutation"
@@ -23,12 +25,10 @@ export const Input = Schema.Struct({
   patchText: Schema.String.pipe(Schema.check(Schema.isMaxLength(MAX_PATCH_CHARS))).annotate({
     description: "One patch with add, update and delete operations, below one million characters.",
   }),
-  expectedStates: Schema.Record(Schema.String, ExpectedState)
-    .pipe(Schema.optional)
-    .annotate({
-      description:
-        "Optional additional expected-state checks by patch path. Session read evidence is enforced automatically and cannot be replaced by these values.",
-    }),
+  expectedStates: Schema.Record(Schema.String, ExpectedState).pipe(Schema.optional).annotate({
+    description:
+      "Optional additional expected-state checks by patch path. Session read evidence is enforced automatically and cannot be replaced by these values.",
+  }),
 })
 export const Applied = Schema.Struct({
   type: Schema.Literals(["add", "update", "delete"]),
@@ -55,6 +55,7 @@ export const layer = Layer.effectDiscard(
     const permission = yield* PermissionV2.Service
     const journal = Option.getOrUndefined(yield* Effect.serviceOption(SessionFileMutation.Service))
     const database = Option.getOrUndefined(yield* Effect.serviceOption(Database.Service))
+    const checkouts = Option.getOrUndefined(yield* Effect.serviceOption(WorkspaceCheckout.Service))
     yield* tools
       .register({
         [name]: Tool.withPermission(
@@ -75,7 +76,9 @@ export const layer = Layer.effectDiscard(
                 if (hunks.some((hunk) => hunk.type === "update" && hunk.movePath !== undefined))
                   return yield* new ToolFailure({ message: "apply_patch moves are not supported yet" })
                 const targets = yield* Effect.forEach(hunks, (hunk) =>
-                  mutation.resolve({ path: hunk.path, kind: "file" }).pipe(Effect.map((target) => ({ hunk, target }))),
+                  mutation
+                    .resolve({ path: hunk.path, kind: "file" }, LocationMutation.guardedPaths)
+                    .pipe(Effect.map((target) => ({ hunk, target }))),
                 )
                 const duplicate = targets.find(
                   (item, index) =>
@@ -85,6 +88,16 @@ export const layer = Layer.effectDiscard(
                   return yield* new ToolFailure({
                     message: `apply_patch repeated target is not supported: ${duplicate.target.resource}`,
                   })
+                yield* Effect.forEach(
+                  targets,
+                  ({ target }) =>
+                    LegacyDelegationGuard.assertFileWrite(
+                      { db: database?.db, checkouts },
+                      context.sessionID,
+                      target.canonical,
+                    ).pipe(Effect.mapError((error) => new ToolFailure({ message: error.message }))),
+                  { discard: true },
+                )
                 const source = {
                   type: "tool" as const,
                   messageID: context.assistantMessageID,
@@ -164,6 +177,7 @@ export const layer = Layer.effectDiscard(
                   files,
                   resolution: mutation,
                   journal,
+                  checkouts,
                   operations,
                 })
                 return {

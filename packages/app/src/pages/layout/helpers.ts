@@ -1,6 +1,6 @@
 import { getFilename } from "@opencode-ai/core/util/path"
 import { type Project, type Session, type SessionStatus } from "@opencode-ai/sdk/v2/client"
-import { directoryKey, pathKey } from "@/utils/path-key"
+import { directoryKey, pathKey, projectWorktreeKey } from "@/utils/path-key"
 import type { ServerConnection } from "@/context/server"
 
 type SessionStore = {
@@ -10,6 +10,19 @@ type SessionStore = {
 }
 
 const activeSessionSortTimes = new Map<string, number>()
+
+export function resumedProjectDirectories(input: {
+  current?: string
+  projects: readonly string[]
+  questions: readonly string[]
+  loaded: (directory: string) => boolean
+}) {
+  const directories = [input.current, ...input.questions, ...input.projects.filter(input.loaded)]
+  return directories.filter(
+    (directory, index): directory is string =>
+      !!directory && directories.findIndex((item) => item && directoryKey(item) === directoryKey(directory)) === index,
+  )
+}
 
 function sessionUpdated(session: Session) {
   return session.time.updated ?? session.time.created
@@ -95,15 +108,25 @@ export const displayName = (project: { name?: string; worktree: string }) =>
 export type HomeProjectSelection = { server: ServerConnection.Key; directory?: string }
 type HomeProject = Partial<Project> & { worktree: string; expanded: boolean }
 
+export function projectInventory<T extends Partial<Project> & { worktree: string }>(projects: readonly T[]) {
+  const byPath = new Map<string, T>()
+  for (const project of projects) {
+    const key = projectWorktreeKey(project.worktree)
+    const previous = byPath.get(key)
+    if (!previous || (project.time?.updated ?? 0) > (previous.time?.updated ?? 0)) byPath.set(key, project)
+  }
+  return [...byPath.values()]
+}
+
 export function homeProjectsFor(
   persisted: HomeProject[],
   api: Array<Partial<Project> & { worktree?: string }>,
 ): HomeProject[] {
   if (persisted.length > 0) return persisted
-  return api.flatMap((project): HomeProject[] => {
+  return projectInventory(api.flatMap((project): HomeProject[] => {
     if (!project.worktree) return []
     return [{ ...project, worktree: project.worktree, expanded: true }]
-  })
+  }))
 }
 
 export function projectsForDirectorySelection(
@@ -183,14 +206,14 @@ export function getProjectAvatarSource(
   id?: string,
   icon?: { color?: string; url?: string; override?: string; generated?: string },
 ) {
-  if (id === OPENCODE_PROJECT_ID) return OPENCODE_PROJECT_AVATAR
   if (icon?.override) return icon.override
+  if (id === OPENCODE_PROJECT_ID) return OPENCODE_PROJECT_AVATAR
   if (icon?.url && !icon.color) return icon.url
   return icon?.generated
 }
 
-export function getProjectAvatarMonochrome(id?: string) {
-  return id === OPENCODE_PROJECT_ID
+export function getProjectAvatarMonochrome(id?: string, icon?: { override?: string }) {
+  return id === OPENCODE_PROJECT_ID && !icon?.override
 }
 
 export function projectForSession<T extends { id?: string; worktree: string; sandboxes?: string[] }>(

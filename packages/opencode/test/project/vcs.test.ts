@@ -1,4 +1,5 @@
-import { afterEach, describe, expect } from "bun:test"
+﻿import { afterEach, describe, expect } from "bun:test"
+import { spawnSync } from "node:child_process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { parsePatch } from "diff"
 import { Deferred, Effect, Layer } from "effect"
@@ -481,6 +482,64 @@ describe("Vcs git actions", () => {
   )
 
   it.instance(
+    "pull and sync explain unrelated histories without changing either branch tip",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const remote = yield* tmpdirScoped({ git: true })
+        yield* git(remote, ["branch", "-M", "main"])
+        // Ensure the upstream root differs even if both fixtures were created in the same second.
+        yield* git(remote, ["commit", "--amend", "--allow-empty", "--no-gpg-sign", "-m", "upstream root"])
+        yield* git(test.directory, ["branch", "-M", "local"])
+        yield* git(test.directory, ["remote", "add", "origin", remote])
+        yield* git(test.directory, ["config", "branch.local.remote", "origin"])
+        yield* git(test.directory, ["config", "branch.local.merge", "refs/heads/main"])
+        yield* git(test.directory, ["config", "pull.rebase", "false"])
+        yield* git(test.directory, ["config", "pull.ff", "true"])
+        const localTip = yield* gitText(test.directory, ["rev-parse", "HEAD"])
+        const remoteTip = yield* gitText(remote, ["rev-parse", "HEAD"])
+
+        const vcs = yield* init()
+        for (const input of [{ action: "pull" }, { action: "sync", remote: "origin", branch: "main" }] as const) {
+          const result = yield* vcs.gitAction(input)
+          expect(result.ok).toBe(false)
+          expect(result.message).toMatch(/no common commit.*check out a branch/i)
+          expect(result.output).toBeUndefined()
+        }
+        yield* git(test.directory, ["config", "pull.ff", "only"])
+        const fastForwardOnly = yield* vcs.gitAction({ action: "pull" })
+        expect(fastForwardOnly.ok).toBe(false)
+        expect(fastForwardOnly.message).toMatch(/cannot be fast-forwarded/i)
+        expect(yield* gitText(test.directory, ["rev-parse", "HEAD"])).toBe(localTip)
+        expect(yield* gitText(remote, ["rev-parse", "HEAD"])).toBe(remoteTip)
+        expect(yield* gitText(test.directory, ["status", "--porcelain"])).toBe("")
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
+    "pull guides users through missing upstream tracking and withholds raw remote errors",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const vcs = yield* init()
+        const untracked = yield* vcs.gitAction({ action: "pull" })
+        expect(untracked.ok).toBe(false)
+        expect(untracked.message).toMatch(/no upstream branch/i)
+
+        const missing = path.join(test.directory, "missing-private-remote-fixture")
+        const result = yield* vcs.gitAction({ action: "pull", remote: missing, branch: "main" })
+        expect(result.ok).toBe(false)
+        expect(result.message).toMatch(/pull failed.*check/i)
+        expect(result.output).toBeUndefined()
+        expect(JSON.stringify(result)).not.toContain("missing-private-remote-fixture")
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
     "commitAuto commits with a local fallback when the configured model is unavailable",
     () =>
       Effect.gen(function* () {
@@ -783,6 +842,340 @@ describe("Vcs git actions", () => {
         const lock = yield* appendGitignoreWithLockState(test.directory, "/lock.txt", lockState)
         expect(lock.ok).toBe(false)
         expect(lock.message).toMatch(/could not update .gitignore/i)
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+})
+
+describe("Vcs git history", () => {
+  afterEach(async () => {
+    await disposeAllInstances()
+  })
+
+  const fastImport = (cwd: string, stream: string) => {
+    const result = spawnSync("git", ["fast-import", "--quiet"], { cwd, input: stream })
+    if (result.status !== 0) throw new Error(`git fast-import failed: ${result.stderr.toString()}`)
+  }
+
+  const gitSpawn = (cwd: string, args: string[]) => {
+    const result = spawnSync("git", args, { cwd })
+    if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`)
+    return result.stdout.toString().trim()
+  }
+
+  const currentBranch = (cwd: string) => gitSpawn(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])
+
+  const commitBlock = (
+    mark: number,
+    message: string,
+    options: { from?: number; merge?: number; branch?: string; fromRef?: string } = {},
+  ) => {
+    const data = Buffer.from(message, "utf8")
+    const fromLine = options.from ? `from :${options.from}` : options.fromRef ? `from ${options.fromRef}` : ""
+    return [
+      `commit refs/heads/${options.branch ?? ""}`.trimEnd(),
+      `mark :${mark}`,
+      "committer Test User <test@example.com> 1700000000 +0000",
+      `data ${data.length}`,
+      message,
+      ...(fromLine ? [fromLine] : []),
+      ...(options.merge ? [`merge :${options.merge}`] : []),
+      "",
+    ].join("\n")
+  }
+
+  const resetBlock = (branch: string, mark: number) => [`reset refs/heads/${branch}`, `from :${mark}`, ""].join("\n")
+
+  const subjects = (page: { commits: ReadonlyArray<{ subject: string }> }) => page.commits.map((commit) => commit.subject)
+
+  it.instance(
+    "filters history per branch and exposes canonical refs",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        const stream = [
+          commitBlock(1, "A root", { branch, fromRef: "HEAD" }),
+          commitBlock(2, "B base", { from: 1, branch }),
+          commitBlock(3, "S side", { from: 2, branch: "side" }),
+          commitBlock(4, "M merge", { from: 2, merge: 3, branch }),
+          commitBlock(5, "C tip", { from: 4, branch }),
+          commitBlock(6, "I island", { branch: "island" }),
+          resetBlock("topic/HEAD", 2),
+          resetBlock("release", 5),
+        ].join("\n")
+        fastImport(test.directory, stream)
+        gitSpawn(test.directory, ["tag", "release", "HEAD"])
+
+        const vcs = yield* init()
+        const rootMatcher = expect.stringMatching(/^root commit/)
+        const head = yield* vcs.gitHistory({ selector: "head", limit: 50 })
+        expect(subjects(head)).toEqual(["C tip", "M merge", "S side", "B base", "A root", rootMatcher])
+
+        const firstParent = yield* vcs.gitHistory({ selector: "head", firstParent: true, limit: 50 })
+        expect(subjects(firstParent)).toEqual(["C tip", "M merge", "B base", "A root", rootMatcher])
+
+        const island = yield* vcs.gitHistory({ selector: "branch", ref: "refs/heads/island", limit: 50 })
+        expect(subjects(island)).toEqual(["I island"])
+
+        const all = yield* vcs.gitHistory({ selector: "all", limit: 50 })
+        expect(subjects(all)).toContain("I island")
+        expect(subjects(all)).toContain("C tip")
+        expect(head.headOid).toBeDefined()
+
+        const allFirstParent = yield* Effect.flip(vcs.gitHistory({ selector: "all", firstParent: true, limit: 10 }))
+        expect(allFirstParent.code).toBe("invalid_ref")
+
+        const snapshot = yield* vcs.gitSnapshot({ limit: 10 })
+        const topicHead = snapshot.branches.find((branch) => branch.name === "topic/HEAD")
+        expect(topicHead?.ref).toBe("refs/heads/topic/HEAD")
+        const release = snapshot.branches.find((branch) => branch.ref === "refs/heads/release")
+        // With the tag "release" present, git disambiguates the display short
+        // name; the canonical ref must stay exact.
+        expect(release?.name).toBe("heads/release")
+        expect(release?.ref).toBe("refs/heads/release")
+        expect(snapshot.branches.map((branch) => branch.name)).not.toContain("origin/HEAD")
+
+        gitSpawn(test.directory, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/main"])
+        const snapshotWithAlias = yield* vcs.gitSnapshot({ limit: 10 })
+        expect(snapshotWithAlias.branches.map((branch) => branch.name)).not.toContain("origin/HEAD")
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
+    "pages through more than 1000 commits without gaps",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        const blocks: string[] = []
+        for (let mark = 1; mark <= 1200; mark++) {
+          blocks.push(commitBlock(mark, `chain ${mark}`, mark === 1 ? { branch, fromRef: "HEAD" } : { from: mark - 1, branch }))
+        }
+        fastImport(test.directory, blocks.join("\n"))
+
+        const vcs = yield* init()
+        const collected: string[] = []
+        let cursor: string | undefined
+        let pages = 0
+        for (;;) {
+          const page = cursor
+            ? yield* vcs.gitHistory({ cursor })
+            : yield* vcs.gitHistory({ selector: "head", limit: 200 })
+          pages += 1
+          for (const commit of page.commits) {
+            expect(collected).not.toContain(commit.hash)
+            collected.push(commit.hash)
+          }
+          if (!page.hasMore) {
+            expect(page.nextCursor).toBeUndefined()
+            break
+          }
+          expect(page.nextCursor).toBeDefined()
+          cursor = page.nextCursor
+          expect(pages).toBeLessThan(50)
+        }
+        expect(collected).toHaveLength(1201)
+        const expected = gitSpawn(test.directory, [
+          "--no-replace-objects",
+          "rev-list",
+          "--topo-order",
+          "HEAD",
+        ]).split("\n")
+        expect(collected).toEqual(expected)
+        expect(pages).toBe(7)
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT * 3,
+  )
+
+  it.instance(
+    "keeps continuation pages frozen while refs move",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        fastImport(
+          test.directory,
+          [
+            commitBlock(1, "one", { branch, fromRef: "HEAD" }),
+            commitBlock(2, "two", { from: 1, branch }),
+            commitBlock(3, "three", { from: 2, branch }),
+            commitBlock(4, "four", { from: 3, branch }),
+          ].join("\n"),
+        )
+
+        const vcs = yield* init()
+        const firstPage = yield* vcs.gitHistory({ selector: "head", limit: 2 })
+        expect(subjects(firstPage)).toEqual(["four", "three"])
+        expect(firstPage.hasMore).toBe(true)
+        const cursor = firstPage.nextCursor
+        expect(cursor).toBeDefined()
+
+        fastImport(
+          test.directory,
+          [commitBlock(5, "five", { fromRef: "HEAD", branch })].join("\n"),
+        )
+        const frozenPage = yield* vcs.gitHistory({ cursor })
+        expect(subjects(frozenPage)).toEqual(["two", "one"])
+        expect(frozenPage.hasMore).toBe(true)
+        const frozenTail = yield* vcs.gitHistory({ cursor: frozenPage.nextCursor })
+        expect(subjects(frozenTail)).toEqual([expect.stringMatching(/^root commit/)])
+        expect(frozenTail.hasMore).toBe(false)
+
+        const refreshed = yield* vcs.gitHistory({ selector: "head", limit: 2 })
+        expect(subjects(refreshed)).toEqual(["five", "four"])
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
+    "continues frozen pages after branch deletion and fails initial requests for deleted branches",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        fastImport(
+          test.directory,
+          [
+            commitBlock(1, "a", { branch, fromRef: "HEAD" }),
+            commitBlock(2, "b", { from: 1, branch }),
+            commitBlock(3, "c", { from: 2, branch }),
+            resetBlock("tmp", 2),
+          ].join("\n"),
+        )
+
+        const vcs = yield* init()
+        const firstPage = yield* vcs.gitHistory({ selector: "branch", ref: "refs/heads/tmp", limit: 1 })
+        expect(subjects(firstPage)).toEqual(["b"])
+        const cursor = firstPage.nextCursor
+        expect(cursor).toBeDefined()
+
+        yield* git(test.directory, ["branch", "-D", "tmp"])
+        const frozenPage = yield* vcs.gitHistory({ cursor })
+        expect(subjects(frozenPage)).toEqual(["a"])
+
+        const failed = yield* Effect.flip(vcs.gitHistory({ selector: "branch", ref: "refs/heads/tmp", limit: 10 }))
+        expect(failed.code).toBe("invalid_ref")
+        expect(failed.recovery).toBe("change-selection")
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
+    "requires refresh when the shallow boundary changes",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        fastImport(
+          test.directory,
+          [
+            commitBlock(1, "a", { branch, fromRef: "HEAD" }),
+            commitBlock(2, "b", { from: 1, branch }),
+            commitBlock(3, "c", { from: 2, branch }),
+          ].join("\n"),
+        )
+        const gitDir = gitSpawn(test.directory, ["rev-parse", "--git-dir"])
+        const shallowPath = path.isAbsolute(gitDir) ? path.join(gitDir, "shallow") : path.join(test.directory, gitDir, "shallow")
+        const headBefore = gitSpawn(test.directory, ["rev-parse", "HEAD~1"])
+        yield* Effect.promise(() => Bun.write(shallowPath, `${headBefore}\n`))
+
+        const vcs = yield* init()
+        const firstPage = yield* vcs.gitHistory({ selector: "head", limit: 1 })
+        expect(subjects(firstPage)).toEqual(["c"])
+        expect(firstPage.hasMore).toBe(true)
+        const cursor = firstPage.nextCursor
+        expect(cursor).toBeDefined()
+
+        const boundary = gitSpawn(test.directory, ["rev-parse", "HEAD"])
+        yield* Effect.promise(() => Bun.write(shallowPath, `${boundary}\n`))
+
+        const failed = yield* Effect.flip(vcs.gitHistory({ cursor }))
+        expect(failed.code).toBe("shallow_changed")
+        expect(failed.recovery).toBe("refresh")
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
+    "keeps large commit messages readable without blocking the page",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        const bigBody = "x".repeat(1_500_000)
+        const bigMessage = `big subject\n\n${bigBody}\n`
+        const stream = [
+          `commit refs/heads/${branch}`,
+          "mark :1",
+          "committer Test User <test@example.com> 1700000000 +0000",
+          `data ${Buffer.from(bigMessage, "utf8").length}`,
+          bigMessage,
+          "from HEAD",
+          "",
+          commitBlock(2, "after big", { from: 1, branch }),
+        ].join("\n")
+        fastImport(test.directory, stream)
+
+        const vcs = yield* init()
+        const page = yield* vcs.gitHistory({ selector: "head", limit: 10 })
+        expect(page.commits).toHaveLength(3)
+        const bigCommit = page.commits.find((commit) => commit.subject === "big subject")
+        expect(bigCommit).toBeDefined()
+        expect(bigCommit?.bodyTruncated).toBe(true)
+        expect(Buffer.byteLength(bigCommit?.body ?? "", "utf8")).toBeLessThanOrEqual(16 * 1024)
+        expect(subjects(page)).toContain("after big")
+
+        let text = ""
+        let cursor: string | undefined
+        for (let rounds = 0; rounds < 200; rounds += 1) {
+          const chunk = cursor
+            ? yield* vcs.gitCommitMessage({ cursor })
+            : yield* vcs.gitCommitMessage({ hash: bigCommit?.hash })
+          text += chunk.text
+          if (!chunk.truncated) {
+            expect(chunk.nextCursor).toBeUndefined()
+            break
+          }
+          cursor = chunk.nextCursor
+        }
+        expect(text).toBe(bigMessage)
+      }),
+    { git: true },
+    GIT_TEST_TIMEOUT,
+  )
+
+  it.instance(
+    "handles detached repositories predictably",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = currentBranch(test.directory)
+        const vcs = yield* init()
+        const initial = yield* vcs.gitHistory({ selector: "head", limit: 10 })
+        expect(initial.commits).toHaveLength(1)
+        expect(initial.hasMore).toBe(false)
+        expect(initial.selector).toBe("head")
+
+        fastImport(
+          test.directory,
+          [commitBlock(2, "second", { fromRef: "HEAD", branch })].join("\n"),
+        )
+        const headOidBefore = gitSpawn(test.directory, ["rev-parse", "HEAD"])
+        yield* git(test.directory, ["checkout", "--detach", "HEAD~1"])
+        const detached = yield* vcs.gitHistory({ selector: "head", limit: 10 })
+        expect(detached.commits.map((commit) => commit.subject)).toHaveLength(1)
+        expect(detached.commits[0].subject).not.toContain("second")
+        expect(detached.headOid).toBe(gitSpawn(test.directory, ["rev-parse", "HEAD"]))
+        expect(detached.headOid).not.toBe(headOidBefore)
+        expect(detached.hasMore).toBe(false)
       }),
     { git: true },
     GIT_TEST_TIMEOUT,

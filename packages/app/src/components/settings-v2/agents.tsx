@@ -3,7 +3,7 @@ import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Switch } from "@opencode-ai/ui/v2/switch-v2"
 import { TextareaV2 } from "@opencode-ai/ui/v2/textarea-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
-import { For, Show, createEffect, createMemo, onCleanup } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
@@ -12,6 +12,7 @@ import { useLayout } from "@/context/layout"
 import { projectDirectoryKey } from "@/utils/path-key"
 import { SettingsModelTargetPickerV2 } from "../settings-model-target-picker"
 import {
+  agentSkills,
   completionPolicy,
   configuredAgents,
   filterToolCatalog,
@@ -22,6 +23,7 @@ import {
   normalizeAgentID,
   normalizeToolCatalog,
   saveAgent,
+  setAgentSkillEntry,
   setAgentToolEntry,
   setAgentToolProjectScope,
   setAgentToolProjectPermission,
@@ -32,10 +34,12 @@ import {
   type AgentChoice,
   type AgentCompletionPolicy,
   type AgentInstructionPolicy,
+  type AgentSkillEntry,
   type AgentSystemPolicy,
   type AgentToolEntry,
   type AgentToolPolicy,
   type ConfigurableAgent,
+  type SkillInvocationMode,
   type ToolCatalogEntry,
 } from "./agents-model"
 import "./settings-v2.css"
@@ -67,7 +71,7 @@ const blankDraft = (id: string): Draft => ({
   id,
   existing: false,
   builtIn: false,
-  config: { tools: { mode: "explicit", entries: {} } },
+  config: { tools: { mode: "inherit", entries: {} } },
   description: "",
   model: "",
   variant: "",
@@ -256,16 +260,13 @@ export const SettingsAgentsV2 = (props: Props) => {
     materializeToolEntries(config, store.toolCatalog)
 
   const updateTool = (tool: string, entry: { visible?: boolean; permission?: "allow" | "ask" | "deny" }) => {
-    const base = toolPolicy(store.draft.config).mode === "inherit" ? materializeExplicitTools(store.draft.config) : store.draft.config
-    setStore("draft", "config", setAgentToolEntry(base, tool, entry))
+    setStore("draft", "config", setAgentToolEntry(store.draft.config, tool, entry))
   }
   const updateScope = (tool: string, scope: NonNullable<AgentToolEntry["scope"]>) => {
-    const base = toolPolicy(store.draft.config).mode === "inherit" ? materializeExplicitTools(store.draft.config) : store.draft.config
-    setStore("draft", "config", setAgentToolProjectScope(base, tool, scope))
+    setStore("draft", "config", setAgentToolProjectScope(store.draft.config, tool, scope))
   }
   const updateProjectPermission = (tool: string, project: string, action: "inherit" | "allow" | "ask" | "deny") => {
-    const base = toolPolicy(store.draft.config).mode === "inherit" ? materializeExplicitTools(store.draft.config) : store.draft.config
-    setStore("draft", "config", setAgentToolProjectPermission(base, tool, project, action))
+    setStore("draft", "config", setAgentToolProjectPermission(store.draft.config, tool, project, action))
   }
 
   const updateToolVisibility = (tool: string, visible: boolean) => {
@@ -448,8 +449,8 @@ export const SettingsAgentsV2 = (props: Props) => {
                      return <div class="settings-v2-agent-tool-row" data-tool={tool.id}>
                       <div class="settings-v2-agent-tool-identity"><span><code>{tool.id}</code><Show when={tool.scope === "location"}><span class="settings-v2-agent-tool-badge">{tool.project || "Project"}</span></Show></span><Show when={tool.description}><small>{tool.description}</small></Show></div>
                        <div class="settings-v2-agent-tool-controls">
-                        <Switch disabled={toolPolicy(store.draft.config).mode === "inherit"} checked={isCatalogToolVisible(store.draft.config, tool)} onChange={(visible) => updateToolVisibility(tool.id, visible)}>Visible</Switch>
-                        <select disabled={toolPolicy(store.draft.config).mode === "inherit" || entry().visible === false} value={entry().permission ?? "ask"} onChange={(event) => updateToolPermission(tool.id, event.currentTarget.value as "allow" | "ask" | "deny")} aria-label={`${tool.id} permission`}><option value="ask">Ask before use</option><option value="allow">Allow</option><option value="deny">Deny</option></select>
+                         <Switch checked={isCatalogToolVisible(store.draft.config, tool)} onChange={(visible) => updateToolVisibility(tool.id, visible)}>Visible</Switch>
+                         <select disabled={entry().visible === false} value={entry().permission ?? "ask"} onChange={(event) => updateToolPermission(tool.id, event.currentTarget.value as "allow" | "ask" | "deny")} aria-label={`${tool.id} permission`}><option value="ask">Ask before use</option><option value="allow">Allow</option><option value="deny">Deny</option></select>
                        </div>
                        <details class="settings-v2-agent-tool-scope">
                          <summary>Verfügbar in: {entry().scope?.mode === "projects" ? `Projekt (${entry().scope?.projects?.length ?? 0})` : "Global (auch neue Projekte)"}</summary>
@@ -476,6 +477,12 @@ export const SettingsAgentsV2 = (props: Props) => {
             </div>
           </PolicySection>
 
+          <AgentSkillPolicySection
+            agentId={store.draft.id}
+            config={store.draft.config}
+            onChange={(config) => setStore("draft", "config", config)}
+          />
+
           <PolicySection title="Completion evaluation" description="Use the global evaluator or a focused evaluator prompt for this agent.">
             <select value={store.draft.completion.mode} onChange={(event) => setStore("draft", "completion", "mode", event.currentTarget.value as AgentCompletionPolicy["mode"])} aria-label="Completion mode"><option value="inherit">Inherit</option><option value="custom">Custom evaluator</option></select>
             <Show when={store.draft.completion.mode === "custom"}><>
@@ -493,4 +500,128 @@ export const SettingsAgentsV2 = (props: Props) => {
 
 function PolicySection(props: { title: string; description: string; children: unknown }) {
   return <section class="settings-v2-agent-policy"><div><h3>{props.title}</h3><p>{props.description}</p></div>{props.children as never}</section>
+}
+
+type AgentSkillRow = {
+  name: string
+  description?: string
+  effective?: { visible: boolean; invocation: string; sources: { visible: string; invocation: string } }
+}
+
+const skillInvocationOptions: Array<{ value: SkillInvocationMode | "inherit"; label: string }> = [
+  { value: "inherit", label: "Inherit" },
+  { value: "allow", label: "Allow" },
+  { value: "ask", label: "Ask" },
+  { value: "manual", label: "Manual" },
+  { value: "deny", label: "Deny" },
+]
+
+const skillVisibilityOptions: Array<{ value: "inherit" | "true" | "false"; label: string }> = [
+  { value: "inherit", label: "Inherit" },
+  { value: "true", label: "Shown" },
+  { value: "false", label: "Hidden" },
+]
+
+/**
+ * Per-agent skill policy overrides. Visibility and invocation stay independent
+ * fields; "Inherit" removes exactly that field and never materializes other
+ * skills. Saved with the agent through the normal save flow.
+ */
+function AgentSkillPolicySection(props: {
+  agentId: string
+  config: ConfigurableAgent
+  onChange: (config: ConfigurableAgent) => void
+}) {
+  const serverSDK = useServerSDK()
+  const layout = useLayout()
+  const [rows, setRows] = createSignal<AgentSkillRow[]>([])
+  const [search, setSearch] = createSignal("")
+
+  onMount(() => {
+    const directory = layout.projects.list()[0]?.worktree
+    if (!directory) return
+    const id = normalizeAgentID(props.agentId)
+    void serverSDK()
+      .client.v2.skill.list({ location: { directory }, agent: id || undefined })
+      .then((response) => setRows(response.data?.data ?? []))
+      .catch(() => setRows([]))
+  })
+
+  const overrides = createMemo(() => agentSkills(props.config))
+  const filtered = createMemo(() => {
+    const query = search().trim().toLowerCase()
+    if (!query) return rows()
+    return rows().filter((item) => item.name.toLowerCase().includes(query) || item.description?.toLowerCase().includes(query))
+  })
+
+  const update = (skill: string, patch: { visible?: boolean | undefined; invocation?: SkillInvocationMode | undefined }) => {
+    props.onChange(setAgentSkillEntry(props.config, skill, patch))
+  }
+
+  return (
+    <PolicySection
+      title="Skill policy for this agent"
+      description="Overrides for this agent only. Inherit follows the global skill settings; overrides cannot lift tool or permission blocks."
+    >
+      <TextInputV2 type="search" appearance="base" value={search()} onInput={(event) => setSearch(event.currentTarget.value)} placeholder="Filter skills" aria-label="Filter agent skills" />
+      <div class="settings-v2-agent-tool-list">
+        <Show when={rows().length > 0} fallback={<div class="settings-v2-agent-tool-empty">Loading skills...</div>}>
+          <For each={filtered()} fallback={<div class="settings-v2-agent-tool-empty">No skills found.</div>}>
+            {(row) => {
+              const override = (): AgentSkillEntry | undefined => overrides()[row.name]
+              const invocation = () => override()?.invocation ?? "inherit"
+              const visible = () => (override()?.visible === undefined ? "inherit" : override()!.visible ? "true" : "false")
+              const source = (field: "visible" | "invocation") =>
+                override()?.[field] !== undefined
+                  ? "local draft"
+                  : row.effective
+                    ? row.effective.sources[field] === "agent-entry"
+                      ? "saved override"
+                      : row.effective.sources[field] === "global-entry"
+                        ? "global setting"
+                        : row.effective.sources[field] === "legacy-manual"
+                          ? "legacy list"
+                          : "skill metadata"
+                    : "default"
+              return (
+                <div class="settings-v2-agent-tool-row" data-agent-skill={row.name}>
+                  <div class="settings-v2-agent-tool-identity">
+                    <span><code>/{row.name}</code></span>
+                    <Show when={row.description}><small>{row.description}</small></Show>
+                  </div>
+                  <div class="settings-v2-agent-tool-controls">
+                    <select
+                      value={visible()}
+                      aria-label={`${row.name} catalog visibility`}
+                      onChange={(event) =>
+                        update(row.name, {
+                          visible: event.currentTarget.value === "inherit" ? undefined : event.currentTarget.value === "true",
+                        })
+                      }
+                    >
+                      <For each={skillVisibilityOptions}>{(option) => <option value={option.value}>{`${option.label} (${source("visible")})`}</option>}</For>
+                    </select>
+                    <select
+                      value={invocation()}
+                      aria-label={`${row.name} invocation`}
+                      onChange={(event) =>
+                        update(row.name, {
+                          invocation:
+                            event.currentTarget.value === "inherit"
+                              ? undefined
+                              : (event.currentTarget.value as SkillInvocationMode),
+                        })
+                      }
+                    >
+                      <For each={skillInvocationOptions}>{(option) => <option value={option.value}>{`${option.label} (${source("invocation")})`}</option>}</For>
+                    </select>
+                  </div>
+                </div>
+              )
+            }}
+          </For>
+        </Show>
+      </div>
+    </PolicySection>
+  )
 }

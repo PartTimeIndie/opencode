@@ -25,6 +25,7 @@ import { ConfigLSPV1 } from "./lsp"
 import { ConfigLogging } from "../../config/logging"
 import { ConfigMCPV1 } from "./mcp"
 import { ConfigMultiAgent } from "../../config/multi-agent"
+import { ConfigDelegation } from "../../config/delegation"
 import { ConfigModelChain } from "../../config/model-chain"
 import { ConfigPermissionV1 } from "./permission"
 import { ConfigPluginV1 } from "./plugin"
@@ -140,6 +141,9 @@ export const Info = Schema.Struct({
   }),
   project_icon_generation: Schema.optional(ConfigProjectIconGeneration.Info).annotate({
     description: "Automatic generated project icon behavior",
+  }),
+  delegation: Schema.optional(ConfigDelegation.Info).annotate({
+    description: "Scoped delegation advice and binding rules; not permissions or workspace grants",
   }),
   multi_agent: Schema.optional(ConfigMultiAgent.Info).annotate({
     description: "Multi-agent skill reviewer configuration",
@@ -269,8 +273,8 @@ export const Info = Schema.Struct({
   ),
   experimental: Schema.optional(
     Schema.Struct({
-      session_orchestrator: Schema.optional(Schema.Boolean).annotate({
-        description: "Allow session orchestrator admission when supported by the host; disabled by default",
+      tool_live_progress: Schema.optional(Schema.Boolean).annotate({
+        description: "Publish bounded live shell and fanout progress; enabled by default",
       }),
       disable_paste_summary: Schema.optional(Schema.Boolean),
       batch_tool: Schema.optional(Schema.Boolean).annotate({ description: "Enable the batch tool" }),
@@ -300,11 +304,28 @@ export type Info = DeepMutable<Schema.Schema.Type<typeof Info>>
  * that `default_model_chain` also accepts `null` as an explicit clear: a JSON
  * body cannot express "remove this key" with `undefined`, so clients unset the
  * default by sending null and the server deletes the stored key.
+ *
+ * `skill_policy` carries skill invocation/visibility changes. Its per-field
+ * `null` values are the only deletion markers: the writer removes exactly that
+ * field from the stored entry and never persists null.
  */
+export const SkillEntryPatch = Schema.Struct({
+  visible: Schema.optional(Schema.NullOr(Schema.Boolean)),
+  invocation: Schema.optional(Schema.NullOr(Schema.Literals(["allow", "ask", "manual", "deny"]))),
+})
+
+export const SkillPolicyPatch = Schema.Struct({
+  global: Schema.optional(Schema.Record(Schema.String, SkillEntryPatch)),
+  agents: Schema.optional(Schema.Record(Schema.String, Schema.Record(Schema.String, SkillEntryPatch))),
+})
+
 export const UpdateInfo = Schema.Struct({
   ...Info.fields,
   default_model_chain: Schema.optional(Schema.NullOr(Schema.String)).annotate({
     description: "Default model fallback chain for new sessions; null clears the stored default",
+  }),
+  skill_policy: Schema.optional(SkillPolicyPatch).annotate({
+    description: "Skill visibility/invocation changes; null deletes exactly that stored field",
   }),
 }).annotate({ identifier: "ConfigUpdate" })
 

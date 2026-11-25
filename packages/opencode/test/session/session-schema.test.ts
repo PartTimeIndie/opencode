@@ -100,6 +100,8 @@ describe("Session schema", () => {
     const projected = Session.fromRow({
       ...Session.toRow({ ...info, model }),
       agent_policy: null,
+      fork_dispatch_digest: null,
+      fork_history_seq: null,
       generation_ms: 0,
     } as Parameters<typeof Session.fromRow>[0])
     const encoded = Schema.encodeUnknownSync(Session.Info)(projected)
@@ -117,6 +119,8 @@ describe("Session schema", () => {
     const projected = Session.fromRow({
       ...Session.toRow({ ...info, model }),
       agent_policy: null,
+      fork_dispatch_digest: null,
+      fork_history_seq: null,
       generation_ms: 0,
     } as Parameters<typeof Session.fromRow>[0])
     const encoded = Schema.encodeUnknownSync(Session.Info)(projected)

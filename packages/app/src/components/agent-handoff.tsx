@@ -13,6 +13,7 @@ import { showToast } from "@/utils/toast"
 import { uuid } from "@/utils/uuid"
 import type { HandoffRequestIdentity } from "@/utils/handoff-request"
 import type { SwitchAgentAndPromptStep } from "@/components/control-surface-runtime"
+import type { SessionSelectionHandoffSnapshot } from "@/context/session-selection-handoff"
 import {
   implementationModelPreferenceKey,
   initialHandoffModelMode,
@@ -115,8 +116,27 @@ export function AgentHandoffForm(props: {
       setError("Choose a valid model before starting the next turn.")
       return
     }
+    // The exact confirmed selection; every composer of this session adopts it
+    // through the shared handoff owner without a second switch mutation.
+    const snapshot: SessionSelectionHandoffSnapshot = "chain" in resolved && resolved.chain
+      ? { agent, chainID: resolved.chain.id }
+      : { agent, model: { providerID: resolved.providerID, modelID: resolved.id }, variant: resolved.variant ?? null }
+    if (!local.session.handoff.begin(sessionID, snapshot)) {
+      setError("An agent switch for this session is already running.")
+      return
+    }
     setSending(true)
     setError("")
+    try {
+      // Serialized picker writes started before the lock must settle first; a
+      // rejected write means the switch was not started.
+      await local.session.settled()
+    } catch (cause) {
+      local.session.handoff.fail(sessionID)
+      setSending(false)
+      setError(`A pending selection write failed; the switch was not started: ${cause instanceof Error ? cause.message : String(cause)}`)
+      return
+    }
     try {
       const headers = new Headers({ "content-type": "application/json", "x-opencode-directory": sdk().directory })
       const http = serverSDK().server.http
@@ -142,7 +162,16 @@ export function AgentHandoffForm(props: {
       )
       if (!response.ok) throw new Error((await response.text()) || response.statusText)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      // A transport-level rejection leaves the server outcome unknown: no retry,
+      // a visible uncertain state, and a targeted canonical read to converge.
+      if (cause instanceof TypeError) {
+        local.session.handoff.uncertain(sessionID)
+        void sync().session.info(sessionID, { force: true })
+        setError(`The switch request did not complete; checking the session state: ${cause.message}`)
+      } else {
+        local.session.handoff.fail(sessionID)
+        setError(cause instanceof Error ? cause.message : String(cause))
+      }
       setSending(false)
       return
     }
@@ -159,6 +188,7 @@ export function AgentHandoffForm(props: {
     }
     setStarted(true)
     try {
+      local.session.handoff.commit(sessionID, snapshot)
       local.session.restore(
         {
           sessionID,

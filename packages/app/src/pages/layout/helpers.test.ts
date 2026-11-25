@@ -23,9 +23,11 @@ import {
   homeProjectsFor,
   homeSessionServerStatus,
   getProjectAvatarSource,
+  getProjectAvatarMonochrome,
   latestRootSession,
   projectForSession,
   projectsForDirectorySelection,
+  resumedProjectDirectories,
   selectHomeProjectSelection,
   sortedRootSessions,
   visibleRootSessions,
@@ -35,7 +37,37 @@ import { ServerConnection } from "@/context/server"
 
 const serverKey = ServerConnection.Key.make
 
+describe("window restore project refresh", () => {
+  test("does not cold-bootstrap saved inactive projects", () => {
+    const projects = Array.from({ length: 29 }, (_, index) => `E:/projects/${index}`)
+    expect(resumedProjectDirectories({
+      current: projects[4], projects, questions: [], loaded: () => false,
+    })).toEqual([projects[4]!])
+  })
+
+  test("preserves already loaded projects and pending questions", () => {
+    expect(resumedProjectDirectories({
+      current: "E:/active", projects: ["E:/cold", "E:/loaded"], questions: ["E:/question"],
+      loaded: (directory) => directory === "E:/loaded",
+    })).toEqual(["E:/active", "E:/question", "E:/loaded"])
+  })
+
+  test("deduplicates Windows aliases without creating a project on home", () => {
+    expect(resumedProjectDirectories({
+      projects: ["E:/Loaded"], questions: ["e:\\loaded"], loaded: () => true,
+    })).toEqual(["e:\\loaded"])
+    expect(resumedProjectDirectories({ projects: ["E:/cold"], questions: [], loaded: () => false })).toEqual([])
+  })
+})
+
 describe("project avatar source", () => {
+  test("uses a user image instead of the built-in monochrome OpenCode mark", () => {
+    const openCode = "4b0ea68d7af9a6031a7ffda7ad66e0cb83315750"
+    expect(getProjectAvatarSource(openCode)).toStartWith("data:image/svg+xml,")
+    expect(getProjectAvatarSource(openCode, { override: "manual" })).toBe("manual")
+    expect(getProjectAvatarMonochrome(openCode, { override: "manual" })).toBe(false)
+  })
+
   test("preserves existing layers and replaces only the letter fallback", () => {
     expect(getProjectAvatarSource("project", { override: "manual", url: "favicon", color: "pink", generated: "ai" })).toBe("manual")
     expect(getProjectAvatarSource("project", { url: "favicon", generated: "ai" })).toBe("favicon")
@@ -418,6 +450,16 @@ describe("layout workspace helpers", () => {
     ])
     expect(homeProjectsFor([{ worktree: "/persisted", expanded: false }], api)).toEqual([
       { worktree: "/persisted", expanded: false },
+    ])
+  })
+
+  test("keeps one project per equivalent path, not per name or Git history", () => {
+    const first = { id: "old", worktree: "C:/Projects/PU/./", name: "PU", time: { created: 1, updated: 2 } }
+    const current = { id: "current", worktree: "c:\\projects\\pu", name: "PU", time: { created: 3, updated: 4 }, icon: { override: "custom" } }
+    const separate = { ...current, worktree: "D:/Projects/PU" }
+    expect(homeProjectsFor([], [first, current, separate])).toEqual([
+      { ...current, expanded: true },
+      { ...separate, expanded: true },
     ])
   })
 

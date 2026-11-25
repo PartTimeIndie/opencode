@@ -68,6 +68,7 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
     logging: info.logging,
     maintenance: info.maintenance,
     multi_agent: info.multi_agent,
+    delegation: info.delegation,
     permissions: permissions(info.permission, info.tools),
     agents: agents(info),
     snapshots: info.snapshot,
@@ -95,7 +96,7 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
     ),
     experimental: info.experimental && {
       policies: info.experimental.policies,
-      session_orchestrator: info.experimental.session_orchestrator,
+      tool_live_progress: info.experimental.tool_live_progress,
     },
     providers: providers(info.provider),
   }
@@ -196,6 +197,7 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
     tool_budget: info.tool_budget,
     disabled: info.disable,
     permissions: switches.permissions.length > 0 ? switches.permissions : undefined,
+    ...(info.skills === undefined ? {} : { skills: info.skills }),
   }
 }
 

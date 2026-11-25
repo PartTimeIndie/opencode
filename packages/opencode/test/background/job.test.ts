@@ -172,10 +172,10 @@ describe("background.job", () => {
       yield* Deferred.succeed(fail, undefined)
       expect((yield* jobs.wait({ id })).info?.status).toBe("error")
       yield* Deferred.await(interrupted)
-      yield* jobs.start({ id, type: "test", run: Effect.never })
-
       yield* Deferred.succeed(release, undefined)
-      yield* Effect.yieldNow
+      // A failed generation is replaceable only after its scope has drained.
+      yield* jobs.cancel(id)
+      expect((yield* jobs.start({ id, type: "test", run: Effect.never })).accepted).toBe(true)
       expect((yield* jobs.get(id))?.status).toBe("running")
       yield* jobs.cancel(id)
     }),

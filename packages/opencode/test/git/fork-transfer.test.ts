@@ -102,6 +102,17 @@ describe("fork tree transfer implementation", () => {
         ".opencode/plugin-sources/pu-agent-mirror-app/index.js",
         "packages/core/.tmp-patch-test.py",
         "packages/app/head-raw.tsx",
+        "packages/app/e2e/regression/question-daily-review-import.spec.ts",
+        "packages/app/e2e/run-with-vite-server.local.ts",
+        "packages/app/src/context/global-sync/_patch_idle.py",
+        "packages/app/src/context/global-sync/_patch_test.py",
+        "packages/core/test/clean_fixture.py",
+        "packages/core/test/dedupe_tests.py",
+        "packages/core/test/final_close.py",
+        "packages/core/test/find_dup.py",
+        "packages/core/test/fix_fixture.py",
+        "packages/core/script/fixtures/pu-skill-groups.json",
+        "docs/visual-qa-smoke-2026-06-27.md",
       ]
       expect(git(input.source, "check-ignore", "--no-index", "--", ...excluded).split("\n").sort()).toEqual(excluded.sort())
       const maintained = [
@@ -114,6 +125,50 @@ describe("fork tree transfer implementation", () => {
       const result = Bun.spawnSync(["git", "-C", input.source, "check-ignore", "--no-index", "--", ...maintained])
       expect(result.exitCode).toBe(1)
       expect(result.stdout.toString()).toBe("")
+    } finally {
+      rmSync(input.root, { recursive: true, force: true })
+    }
+  })
+
+  test("local workflow exclusions preserve files while staged removals stay visible until committed", () => {
+    const input = fixture()
+    const files = [
+      ".opencode/tool/daily_review_implementation.ts",
+      ".opencode/tools/daily_review_review.ts",
+      ".opencode/tools/tests/scheduler_watchdog_report.test.ts",
+      ".opencode/scripts/daily-review-tool.ts",
+      ".opencode/agents/scheduler-watchdog.md",
+      ".opencode/skills/visual-qa-testing/agents/openai.yaml",
+      ".opencode/skills/video-on-demand-vidmd-cut-preview/SKILL.md",
+      ".opencode/prompts/scheduler-nightly-failure-watchdog.md",
+      ".opencode/themes/mytheme.json",
+      ".opencode/app.jsonc",
+    ]
+    try {
+      for (const file of files) {
+        mkdirSync(join(input.source, file, ".."), { recursive: true })
+        writeFileSync(join(input.source, file), "local workflow\n")
+      }
+      git(input.source, "add", "--", ...files)
+      git(input.source, "commit", "-m", "previously tracked local workflows")
+      writeFileSync(join(input.source, ".gitignore"), readFileSync(new URL("../../../../.gitignore", import.meta.url)))
+      expect(git(input.source, "check-ignore", "--no-index", "--", ...files).split("\n").sort()).toEqual([...files].sort())
+      expect(git(input.source, "ls-files", "--", ...files).split("\n").sort()).toEqual([...files].sort())
+
+      git(input.source, "rm", "--cached", "--", ...files)
+      git(input.source, "add", "--", ".gitignore")
+      expect(git(input.source, "diff", "--cached", "--name-only", "--diff-filter=D").split("\n").sort()).toEqual([...files].sort())
+      expect(git(input.source, "ls-files", "--", ...files)).toBe("")
+      for (const file of files) {
+        expect(readFileSync(join(input.source, file), "utf8")).toBe("local workflow\n")
+      }
+
+      git(input.source, "commit", "-m", "exclude local workflows without deleting originals")
+      expect(git(input.source, "status", "--porcelain", "--", ...files)).toBe("")
+      writeFileSync(join(input.source, files[0]), "updated local workflow\n")
+      git(input.source, "add", "--all")
+      expect(git(input.source, "diff", "--cached", "--name-only")).toBe("")
+      expect(readFileSync(join(input.source, files[0]), "utf8")).toBe("updated local workflow\n")
     } finally {
       rmSync(input.root, { recursive: true, force: true })
     }

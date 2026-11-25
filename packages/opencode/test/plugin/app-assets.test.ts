@@ -2,11 +2,65 @@ import { describe, expect, spyOn, test } from "bun:test"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { Global } from "@opencode-ai/core/global"
 import { tmpdir } from "../fixture/fixture"
 
 const { AppPluginAssets } = await import("../../src/plugin/app/assets")
 
 describe("plugin.app.assets", () => {
+  test("recovers a service caller policy after manifest invalidation", async () => {
+    await using tmp = await tmpdir()
+    await using foreign = await tmpdir()
+    const plugin = path.join(tmp.path, "runtime-app")
+    const capability = "services:runtime-server:list"
+    await createAppPlugin(plugin, "runtime-app", 'export default { id: "runtime-app", app: async () => {} }\n', [capability])
+    await writeAppConfig(tmp.path, plugin)
+
+    try {
+      AppPluginAssets.resetForTesting()
+      const caller = (await AppPluginAssets.clientManifest(tmp.path)).plugins.find((item) => item.id === "runtime-app")!
+      AppPluginAssets.invalidate()
+
+      expect(await AppPluginAssets.hostPolicy(caller.id, caller.version, caller.hash)).toBeUndefined()
+      expect(await AppPluginAssets.hostPolicy(caller.id, caller.version, caller.hash, tmp.path)).toMatchObject({
+        capabilities: [capability],
+      })
+      expect(await AppPluginAssets.hostPolicy(caller.id, caller.version, "invalid", tmp.path)).toBeUndefined()
+      expect(await AppPluginAssets.hostPolicy(caller.id, caller.version, caller.hash, foreign.path)).toBeUndefined()
+    } finally {
+      AppPluginAssets.resetForTesting()
+    }
+  })
+
+  test("loads a global app plugin in unrelated projects without duplicate local registrations", async () => {
+    await using tmp = await tmpdir()
+    const config = path.join(tmp.path, "global")
+    const plugin = path.join(tmp.path, "plugin")
+    const first = path.join(tmp.path, "first-project")
+    const second = path.join(tmp.path, "second-project")
+    const originalConfig = Global.Path.config
+
+    await createAppPlugin(plugin, "important-results-app", 'export default { id: "important", app: async () => {} }\n')
+    await fs.mkdir(config, { recursive: true })
+    await fs.mkdir(second, { recursive: true })
+    await Bun.write(path.join(config, "app.jsonc"), JSON.stringify({ plugin: [plugin] }))
+    await writeAppConfig(first, plugin)
+
+    try {
+      Global.Path.config = config
+      AppPluginAssets.resetForTesting()
+
+      const firstManifest = await AppPluginAssets.clientManifest(first)
+      const secondManifest = await AppPluginAssets.clientManifest(second)
+      expect(firstManifest.plugins.filter((item) => item.id === "important-results-app")).toHaveLength(1)
+      expect(secondManifest.plugins.map((item) => item.id)).toContain("important-results-app")
+      expect(firstManifest.plugins[0]?.module).toBe(secondManifest.plugins[0]?.module)
+    } finally {
+      Global.Path.config = originalConfig
+      AppPluginAssets.resetForTesting()
+    }
+  })
+
   test("freezes app plugin assets and rejects path or hash drift", async () => {
     await using tmp = await tmpdir()
     const cwd = process.cwd()

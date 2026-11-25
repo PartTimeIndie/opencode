@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from "node:util"
 import { EventV2 } from "./event"
 import { Identifier } from "./id/id"
 import { SessionFailure } from "./session/failure"
-import { NonNegativeInt, withStatics } from "./schema"
+import { AbsolutePath, NonNegativeInt, withStatics } from "./schema"
 import { SessionSchema } from "./session/schema"
 import { Control } from "./control"
 import { ControlSurface } from "./control-surface"
@@ -20,6 +20,7 @@ import { QuestionTable } from "./question/sql"
 import { SurfaceActionInvocationTable, SurfaceToolTable } from "./surface-tool.sql"
 import { QuestionTransaction } from "./question/transaction"
 import { QuestionWakeup } from "./question/wakeup"
+// Historical delegated question links remain readable; no legacy answer authority is retained.
 
 export const ID = Schema.String.check(Schema.isStartsWith("que")).pipe(
   Schema.brand("QuestionV2.ID"),
@@ -31,8 +32,12 @@ export const Option = Schema.Struct({
   id: Schema.String.pipe(Schema.optional).annotate({ description: "Stable option identifier" }),
   label: Schema.String.annotate({ description: "Display text (1-5 words, concise)" }),
   description: Schema.String.pipe(Schema.optional).annotate({ description: "Explanation of choice" }),
-  pros: Schema.Array(Schema.String).pipe(Schema.optional).annotate({ description: "Advantages for structured option review" }),
-  cons: Schema.Array(Schema.String).pipe(Schema.optional).annotate({ description: "Disadvantages for structured option review" }),
+  pros: Schema.Array(Schema.String)
+    .pipe(Schema.optional)
+    .annotate({ description: "Advantages for structured option review" }),
+  cons: Schema.Array(Schema.String)
+    .pipe(Schema.optional)
+    .annotate({ description: "Disadvantages for structured option review" }),
   details: Schema.Unknown.pipe(Schema.optional).annotate({ description: "Additional structured-review details" }),
   finalizeRemaining: Schema.Boolean.pipe(Schema.optional).annotate({
     description:
@@ -52,9 +57,11 @@ export const Section: Schema.Codec<Section> = Schema.Struct({
   id: Schema.String,
   title: Schema.String,
   content: Schema.String,
-  children: Schema.Array(Schema.suspend((): Schema.Codec<Section> => Section)).pipe(Schema.optional).annotate({
-    description: "Nested sections enabling tree/accordion drill-down exploration",
-  }),
+  children: Schema.Array(Schema.suspend((): Schema.Codec<Section> => Section))
+    .pipe(Schema.optional)
+    .annotate({
+      description: "Nested sections enabling tree/accordion drill-down exploration",
+    }),
   meta: Schema.Unknown.pipe(Schema.optional).annotate({
     description: "Generic structured payload, e.g. table { columns: string[], rows: string[][] }",
   }),
@@ -109,7 +116,9 @@ const sharedBase = {
   maxLength: Schema.Number.pipe(Schema.optional).annotate({ description: "Maximum free-text length" }),
   placeholder: Schema.String.pipe(Schema.optional).annotate({ description: "Free-text placeholder" }),
   language: Schema.String.pipe(Schema.optional).annotate({ description: "Code input language hint" }),
-  sections: Schema.Array(Section).pipe(Schema.optional).annotate({ description: "Plan or document sections for review" }),
+  sections: Schema.Array(Section)
+    .pipe(Schema.optional)
+    .annotate({ description: "Plan or document sections for review" }),
   before: Schema.String.pipe(Schema.optional).annotate({ description: "Original content for diff review" }),
   after: Schema.String.pipe(Schema.optional).annotate({ description: "Modified content for diff review" }),
   filePath: Schema.String.pipe(Schema.optional).annotate({ description: "File path for diff/code context" }),
@@ -117,6 +126,22 @@ const sharedBase = {
   form: Control.FormDefinition.pipe(Schema.optional).annotate({
     description: "Versioned form spec for stack-based multi-field input UIs",
   }),
+  chatSend: Schema.Struct({
+    text: Schema.String.check(Schema.isNonEmpty()).annotate({
+      description: "Exact text sent into the session chat verbatim, including slash commands",
+    }),
+    label: Schema.String.pipe(Schema.optional).annotate({
+      description: "Optional approval button label; the host localizes the default",
+    }),
+    description: Schema.String.pipe(Schema.optional).annotate({
+      description: "Optional tooltip explaining what this approval sends",
+    }),
+  })
+    .pipe(Schema.optional)
+    .annotate({
+      description:
+        "One-click chat approval: the host renders an approval button that sends this text into the session chat and answers the question with it",
+    }),
 }
 
 const legacyVisibleContent = {
@@ -179,6 +204,14 @@ const request = {
   revision: Schema.Int.check(Schema.isGreaterThan(0)),
   actions: Schema.Array(ActionMetadata),
   tool: Tool.pipe(Schema.optional),
+  // Managed-child delegation. The source row carries `delegatedTo` (its
+  // Main-side mirror id); the mirror row carries `delegatedFrom` (the child
+  // provenance). Both fields are additive and absent for ordinary questions.
+  delegatedFrom: Schema.Struct({
+    sessionID: SessionSchema.ID,
+    requestID: ID,
+  }).pipe(Schema.optional),
+  delegatedTo: ID.pipe(Schema.optional),
 }
 
 export const BlockingRequest = Schema.Struct({
@@ -283,6 +316,8 @@ export type AnswerItem = typeof AnswerItem.Type
 
 export const Answer = Schema.Array(AnswerItem).annotate({ identifier: "QuestionV2.Answer" })
 export type Answer = typeof Answer.Type
+export const AnswerSource = Schema.Literals(["user", "main", "recommended"])
+export type AnswerSource = typeof AnswerSource.Type
 
 export const Reply = Schema.Struct({
   answers: Schema.Array(Answer).annotate({
@@ -315,6 +350,7 @@ export const Event = {
       sessionID: SessionSchema.ID,
       requestID: ID,
       answers: Schema.Array(Answer),
+      source: AnswerSource.pipe(Schema.optional),
     },
   }),
   Dismissed: EventV2.define({
@@ -421,10 +457,12 @@ export function validateToolInput(input: unknown) {
 
     for (const [optionIndex, option] of question.options.entries()) {
       const optionPath = `${questionPath}["options"][${optionIndex}]`
-      if (!isRecord(option)) return `Invalid option at ${optionPath}. Use an object like { "label": "Yes" }, not a string or primitive.`
+      if (!isRecord(option))
+        return `Invalid option at ${optionPath}. Use an object like { "label": "Yes" }, not a string or primitive.`
       const optionField = unknownField(option, optionKeys, optionPath)
       if (optionField) return optionField
-      if (typeof option.label !== "string" || !option.label.trim()) return `Invalid field ${optionPath}["label"]. A non-empty label is required.`
+      if (typeof option.label !== "string" || !option.label.trim())
+        return `Invalid field ${optionPath}["label"]. A non-empty label is required.`
     }
   }
 }
@@ -507,7 +545,8 @@ function validateBody(input: unknown, path: string) {
       if (itemField) return itemField
       if (typeof item.id !== "string" || !stableID.test(item.id))
         return `Invalid field ${itemPath}["id"]. A stable non-empty media item id is required.`
-      if (itemIDs.has(item.id)) return `Invalid field ${itemPath}["id"]. Media item ids must be unique within their block.`
+      if (itemIDs.has(item.id))
+        return `Invalid field ${itemPath}["id"]. Media item ids must be unique within their block.`
       itemIDs.add(item.id)
       if (typeof item.label !== "string" || !item.label.trim())
         return `Invalid field ${itemPath}["label"]. Media item label must not be empty.`
@@ -536,7 +575,8 @@ function allowedActionHref(value: string) {
 function allowedMediaSource(value: string) {
   const source = value.trim()
   if (!source) return false
-  if (/^[A-Za-z]:[\\/]/.test(source) || source.startsWith("/") || source.startsWith("./") || source.startsWith("../")) return true
+  if (/^[A-Za-z]:[\\/]/.test(source) || source.startsWith("/") || source.startsWith("./") || source.startsWith("../"))
+    return true
   try {
     return ["http:", "https:", "file:", "data:", "blob:"].includes(new URL(source).protocol)
   } catch {
@@ -548,7 +588,8 @@ function unknownField(input: Record<string, unknown>, allowed: Set<string>, path
   const key = Object.keys(input).find((key) => !allowed.has(key))
   if (!key) return
   const location = `${path}[${JSON.stringify(key)}]`
-  if (key === "choices") return `Unexpected field ${location}. Use "options": [{ "label": "..." }] instead; "choices" is not part of the question schema.`
+  if (key === "choices")
+    return `Unexpected field ${location}. Use "options": [{ "label": "..." }] instead; "choices" is not part of the question schema.`
   if (key === "actions")
     return `Unexpected field ${location}. Blocking questions cannot declare actions. Put explicit form events in "form.actions" or use an interactive Control surface.`
   if (key === "context" || key === "content" || key === "markdown")
@@ -578,6 +619,14 @@ export interface PresentInput {
 export interface ReplyInput {
   readonly requestID: ID
   readonly sessionID?: SessionSchema.ID
+  readonly answers: ReadonlyArray<Answer>
+}
+
+export interface DelegatedReplyInput {
+  readonly mainSessionID: SessionSchema.ID
+  readonly requestID: ID
+  readonly expectedRevision: number
+  readonly source: "main" | "recommended"
   readonly answers: ReadonlyArray<Answer>
 }
 
@@ -629,7 +678,12 @@ export interface Interface {
   readonly open: (input: AskInput) => Effect.Effect<Request, ConflictError>
   readonly present: (input: PresentInput) => Effect.Effect<ControlRequest, ConflictError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError | ConflictError>
-  readonly reject: (requestID: ID, sessionID?: SessionSchema.ID) => Effect.Effect<boolean, NotFoundError | ConflictError>
+  readonly replyFromMain: (input: DelegatedReplyInput) => Effect.Effect<void, NotFoundError | ConflictError>
+  readonly answerSourceForTool?: (input: { readonly sessionID: SessionSchema.ID; readonly messageID: string; readonly callID: string }) => Effect.Effect<AnswerSource | null>
+  readonly reject: (
+    requestID: ID,
+    sessionID?: SessionSchema.ID,
+  ) => Effect.Effect<boolean, NotFoundError | ConflictError>
   readonly dismissSession: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   readonly dismissFollowups: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   readonly settlementTarget: (
@@ -688,12 +742,23 @@ export const layer = Layer.effect(
             process.platform === "win32"
               ? sql`lower(replace(${SessionTable.directory}, char(92), '/')) = ${location.directory.replaceAll("\\", "/").toLowerCase()}`
               : eq(SessionTable.directory, location.directory),
-            location.workspaceID ? eq(SessionTable.workspace_id, location.workspaceID) : isNull(SessionTable.workspace_id),
+            location.workspaceID
+              ? eq(SessionTable.workspace_id, location.workspaceID)
+              : isNull(SessionTable.workspace_id),
           )
         : undefined
 
     const publish = <D extends EventV2.Definition>(definition: D, data: EventV2.Data<D>) =>
-      events.publish(definition, data, { isolateListeners: true }).pipe(
+      Effect.gen(function* () {
+        const sessionID = data && typeof data === "object" && "sessionID" in data && typeof data.sessionID === "string"
+          ? SessionSchema.ID.make(data.sessionID) : undefined
+        const owner = sessionID ? yield* db.select({ directory: SessionTable.directory, workspaceID: SessionTable.workspace_id })
+          .from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie) : undefined
+        return yield* events.publish(definition, data, {
+          isolateListeners: true,
+          ...(owner ? { location: { directory: AbsolutePath.make(owner.directory), workspaceID: owner.workspaceID ?? undefined } } : {}),
+        })
+      }).pipe(
         Effect.catchCause((cause) =>
           Effect.logError("QuestionV2: lifecycle event delivery failed after durable commit", {
             type: definition.type,
@@ -757,10 +822,7 @@ export const layer = Layer.effect(
       return found?.request
     })
 
-    const promote = Effect.fn("QuestionV2.promote")(function* (
-      tx: Transaction,
-      sessionID: SessionSchema.ID,
-    ) {
+    const promote = Effect.fn("QuestionV2.promote")(function* (tx: Transaction, sessionID: SessionSchema.ID) {
       const current = yield* tx
         .select({ id: QuestionTable.id })
         .from(QuestionTable)
@@ -786,13 +848,87 @@ export const layer = Layer.effect(
         .orderBy(asc(QuestionTable.seq))
         .get()
       if (!next) return
-      return yield* tx
+      const updated = yield* tx
         .update(QuestionTable)
         .set({ state: "active", time_updated: yield* Clock.currentTimeMillis })
         .where(and(eq(QuestionTable.id, next.id), eq(QuestionTable.state, "queued")))
         .returning({ request: QuestionTable.request })
         .get()
         .pipe(Effect.map((row) => row?.request))
+      if (updated?.delegatedTo)
+        yield* tx
+          .update(QuestionTable)
+          .set({ state: "active", time_updated: yield* Clock.currentTimeMillis })
+          .where(and(eq(QuestionTable.id, updated.delegatedTo), eq(QuestionTable.state, "queued")))
+          .run()
+      return updated
+    })
+
+    // Only reciprocal durable links permit an internal cross-Location lookup.
+    // The source receipt and its peer receipt commit together or not at all.
+    const settlePeer = Effect.fn("QuestionV2.settlePeer")(function* (
+      tx: Transaction,
+      request: Request,
+      state: "replied" | "rejected",
+      answers?: ReadonlyArray<Answer>,
+      source?: AnswerSource,
+    ) {
+      const peerID = request.delegatedTo ?? request.delegatedFrom?.requestID
+      if (!peerID) return
+      const peer = yield* tx.select().from(QuestionTable).where(eq(QuestionTable.id, peerID)).get()
+      const reciprocal = request.delegatedFrom
+        ? peer?.session_id === request.delegatedFrom.sessionID && peer.request.delegatedTo === request.id
+        : peer?.request.delegatedFrom?.requestID === request.id &&
+          peer.request.delegatedFrom.sessionID === request.sessionID
+      const conflict = (reason: string) => new ConflictError({ requestID: request.id, reason })
+      if (!peer || !reciprocal || peer.request.revision !== request.revision)
+        return yield* conflict("Delegated question binding changed; no receipt was committed")
+      if (peer.state === state && (state === "rejected" || isDeepStrictEqual(peer.answers, answers))) return
+      if (peer.state !== "active" && peer.state !== "queued")
+        return yield* conflict("Delegated question already has a different durable receipt")
+      if (answers) {
+        if (peer.state !== "active") return yield* conflict("The delegated question is not active yet")
+        const source = request.delegatedFrom
+          ? peer
+          : yield* tx.select().from(QuestionTable).where(eq(QuestionTable.id, request.id)).get()
+        const activity = source?.activity_id
+          ? yield* tx
+              .select({ status: SessionActivityTable.status })
+              .from(SessionActivityTable)
+              .where(eq(SessionActivityTable.id, source.activity_id))
+              .get()
+          : undefined
+        if (!activity || !["running", "recovering"].includes(activity.status))
+          return yield* conflict("The delegated provider activity ended before the answer")
+      }
+      const now = yield* Clock.currentTimeMillis
+      yield* tx
+        .update(QuestionTable)
+        .set({
+          state,
+          answers: answers ? answers.map((answer) => [...answer]) : null,
+          answer_source: answers ? source ?? "user" : null,
+          receipt: `qrc_${randomUUID()}`,
+          time_settled: now,
+          time_updated: now,
+        })
+        .where(eq(QuestionTable.id, peer.id))
+        .run()
+      const promoted =
+        peer.state === "active" && !peer.allow_concurrent ? yield* promote(tx, peer.session_id) : undefined
+      return { request: peer.request, promoted }
+    })
+
+    const publishRequested = Effect.fn("QuestionV2.publishRequested")(function* (request: Request) {
+      yield* publish(Event.Requested, request)
+      if (!request.delegatedTo) return
+      const peer = yield* db
+        .select({ request: QuestionTable.request })
+        .from(QuestionTable)
+        .where(and(eq(QuestionTable.id, request.delegatedTo), eq(QuestionTable.state, "active")))
+        .get()
+        .pipe(Effect.orDie)
+      if (peer) yield* publish(Event.Requested, peer.request)
     })
 
     const legacyActivity = Effect.fn("QuestionV2.legacyActivity")(function* (input: {
@@ -894,89 +1030,87 @@ export const layer = Layer.effect(
 
     const reconcileOrphans = Effect.fn("QuestionV2.reconcileOrphans")(function* () {
       yield* reconcileLegacyActivities()
-      const outcome = yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            const repair = (
-              yield* tx
-                .select({
-                  request: QuestionTable.request,
-                  messageID: SessionMessageTable.id,
-                  messageType: SessionMessageTable.type,
-                  messageData: SessionMessageTable.data,
-                })
-                .from(QuestionTable)
-                .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
-                .innerJoin(
-                  SessionMessageTable,
-                  and(
-                    eq(SessionMessageTable.session_id, QuestionTable.session_id),
-                    eq(SessionMessageTable.id, QuestionTable.assistant_message_id),
-                  ),
-                )
-                .where(and(eq(QuestionTable.state, "orphaned"), ...(inLocation() ? [inLocation()!] : [])))
-                .all()
-            ).flatMap((row) => {
-              const decoded = Schema.decodeUnknownOption(SessionMessage.Message)({
-                ...row.messageData,
-                id: row.messageID,
-                type: row.messageType,
-              })
-              const message = decoded._tag === "Some" ? decoded.value : undefined
-              const binding = row.request.tool
-              if (!message || message.type !== "assistant" || !binding) return []
-              const tool = message.content.find(
-                (item): item is SessionMessage.AssistantTool => item.type === "tool" && item.id === binding.callID,
-              )
-              if (!tool || (tool.state.status !== "pending" && tool.state.status !== "running")) return []
-              return [row.request]
+      const outcome = yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          const repair = (yield* tx
+            .select({
+              request: QuestionTable.request,
+              messageID: SessionMessageTable.id,
+              messageType: SessionMessageTable.type,
+              messageData: SessionMessageTable.data,
             })
-            const rows = yield* tx
-              .select({ question: QuestionTable, activityStatus: SessionActivityTable.status })
-              .from(QuestionTable)
-              .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
-              .leftJoin(SessionActivityTable, eq(SessionActivityTable.id, QuestionTable.activity_id))
-              .where(
-                and(
-                  inArray(QuestionTable.state, ["queued", "active"]),
-                  eq(QuestionTable.detached, false),
-                  ...(inLocation() ? [inLocation()!] : []),
-                ),
-              )
-              .all()
-            const stale = rows.filter(
-              (row) =>
-                row.question.activity_id === null ||
-                row.activityStatus === null ||
-                !["running", "recovering"].includes(row.activityStatus),
+            .from(QuestionTable)
+            .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
+            .innerJoin(
+              SessionMessageTable,
+              and(
+                eq(SessionMessageTable.session_id, QuestionTable.session_id),
+                eq(SessionMessageTable.id, QuestionTable.assistant_message_id),
+              ),
             )
-            const rejected: Request[] = []
-            const sessions = new Set<SessionSchema.ID>()
-            for (const row of stale) {
-              const updated = yield* tx
-                .update(QuestionTable)
-                .set({
-                  state: "orphaned",
-                  receipt: `qrc_${randomUUID()}`,
-                  time_settled: yield* Clock.currentTimeMillis,
-                  time_updated: yield* Clock.currentTimeMillis,
-                })
-                .where(and(eq(QuestionTable.id, row.question.id), inArray(QuestionTable.state, ["queued", "active"])))
-                .returning({ request: QuestionTable.request, state: QuestionTable.state })
-                .get()
-              if (!updated) continue
-              rejected.push(updated.request)
-              if (row.question.state === "active" && !row.question.allow_concurrent)
-                sessions.add(SessionSchema.ID.make(row.question.session_id))
-            }
-            const promoted: Request[] = []
-            for (const sessionID of sessions) {
-              const request = yield* promote(tx, sessionID)
-              if (request) promoted.push(request)
-            }
-            return { rejected, promoted, repair }
-          }),
+            .where(and(eq(QuestionTable.state, "orphaned"), ...(inLocation() ? [inLocation()!] : [])))
+            .all()).flatMap((row) => {
+            const decoded = Schema.decodeUnknownOption(SessionMessage.Message)({
+              ...row.messageData,
+              id: row.messageID,
+              type: row.messageType,
+            })
+            const message = decoded._tag === "Some" ? decoded.value : undefined
+            const binding = row.request.tool
+            if (!message || message.type !== "assistant" || !binding) return []
+            const tool = message.content.find(
+              (item): item is SessionMessage.AssistantTool => item.type === "tool" && item.id === binding.callID,
+            )
+            if (!tool || (tool.state.status !== "pending" && tool.state.status !== "running")) return []
+            return [row.request]
+          })
+          const rows = yield* tx
+            .select({ question: QuestionTable, activityStatus: SessionActivityTable.status })
+            .from(QuestionTable)
+            .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
+            .leftJoin(SessionActivityTable, eq(SessionActivityTable.id, QuestionTable.activity_id))
+            .where(
+              and(
+                inArray(QuestionTable.state, ["queued", "active"]),
+                eq(QuestionTable.detached, false),
+                ...(inLocation() ? [inLocation()!] : []),
+              ),
+            )
+            .all()
+          const stale = rows.filter(
+            (row) =>
+              row.question.activity_id === null ||
+              row.activityStatus === null ||
+              !["running", "recovering"].includes(row.activityStatus),
+          )
+          const rejected: Request[] = []
+          const sessions = new Set<SessionSchema.ID>()
+          for (const row of stale) {
+            const updated = yield* tx
+              .update(QuestionTable)
+              .set({
+                state: "orphaned",
+                receipt: `qrc_${randomUUID()}`,
+                time_settled: yield* Clock.currentTimeMillis,
+                time_updated: yield* Clock.currentTimeMillis,
+              })
+              .where(and(eq(QuestionTable.id, row.question.id), inArray(QuestionTable.state, ["queued", "active"])))
+              .returning({ request: QuestionTable.request, state: QuestionTable.state })
+              .get()
+            if (!updated) continue
+            rejected.push(updated.request)
+            const peer = yield* settlePeer(tx, updated.request, "rejected")
+            if (peer) rejected.push(peer.request)
+            if (row.question.state === "active" && !row.question.allow_concurrent)
+              sessions.add(SessionSchema.ID.make(row.question.session_id))
+          }
+          const promoted: Request[] = []
+          for (const sessionID of sessions) {
+            const request = yield* promote(tx, sessionID)
+            if (request) promoted.push(request)
+          }
+          return { rejected, promoted, repair }
+        }),
       ).pipe(Effect.orDie)
       yield* Effect.forEach(
         outcome.rejected,
@@ -989,7 +1123,7 @@ export const layer = Layer.effect(
         { discard: true },
       )
       yield* Effect.forEach(outcome.repair, failOrphanedTool, { discard: true })
-      yield* Effect.forEach(outcome.promoted, (request) => publish(Event.Requested, request), { discard: true })
+      yield* Effect.forEach(outcome.promoted, publishRequested, { discard: true })
     })
 
     const enqueue = Effect.fn("QuestionV2.enqueue")(function* (input: AskInput, detached: boolean) {
@@ -1012,61 +1146,62 @@ export const layer = Layer.effect(
         ...(input.tool ? { tool: input.tool } : {}),
         ...(detached ? { detached: true } : {}),
       }
-      const outcome = yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            if (input.tool) {
-              const tool = input.tool
-              const retry = yield* tx
-                .select()
-                .from(QuestionTable)
+      const outcome = yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          if (input.tool) {
+            const tool = input.tool
+            const retry = yield* tx
+              .select()
+              .from(QuestionTable)
+              .where(
+                and(
+                  eq(QuestionTable.session_id, input.sessionID),
+                  eq(QuestionTable.assistant_message_id, tool.messageID),
+                  eq(QuestionTable.tool_call_id, tool.callID),
+                ),
+              )
+              .get()
+            if (retry) {
+              const expected = {
+                ...request,
+                id: retry.request.id,
+                ...(retry.request.delegatedTo ? { delegatedTo: retry.request.delegatedTo } : {}),
+              }
+              if (!isDeepStrictEqual(retry.request, expected))
+                return yield* new ConflictError({
+                  requestID: retry.request.id,
+                  reason: "The tool retry key is already bound to a different question payload",
+                })
+              return { request: retry.request, asked: false, mirror: undefined }
+            }
+          }
+
+          const activity = detached
+            ? undefined
+            : yield* tx
+                .select({ id: SessionActivityTable.id })
+                .from(SessionActivityTable)
                 .where(
                   and(
-                    eq(QuestionTable.session_id, input.sessionID),
-                    eq(QuestionTable.assistant_message_id, tool.messageID),
-                    eq(QuestionTable.tool_call_id, tool.callID),
+                    eq(SessionActivityTable.session_id, input.sessionID),
+                    inArray(SessionActivityTable.status, ["running", "recovering"]),
                   ),
                 )
+                .orderBy(desc(SessionActivityTable.time_created), desc(SessionActivityTable.id))
                 .get()
-              if (retry) {
-                const expected = { ...request, id: retry.request.id }
-                if (!isDeepStrictEqual(retry.request, expected))
-                  return yield* new ConflictError({
-                    requestID: retry.request.id,
-                    reason: "The tool retry key is already bound to a different question payload",
-                  })
-                return { request: retry.request, asked: false }
-              }
-            }
+          if (!detached && !activity)
+            return yield* new ConflictError({
+              requestID: id,
+              reason: "A blocking question requires a live Session activity",
+            })
 
-            const activity = detached
-              ? undefined
-              : yield* tx
-                  .select({ id: SessionActivityTable.id })
-                  .from(SessionActivityTable)
-                  .where(
-                    and(
-                      eq(SessionActivityTable.session_id, input.sessionID),
-                      inArray(SessionActivityTable.status, ["running", "recovering"]),
-                    ),
-                  )
-                  .orderBy(desc(SessionActivityTable.time_created), desc(SessionActivityTable.id))
-                  .get()
-            if (!detached && !activity)
-              return yield* new ConflictError({
-                requestID: id,
-                reason: "A blocking question requires a live Session activity",
-              })
-
-            const sequence = yield* tx
-              .select({ value: max(QuestionTable.seq) })
-              .from(QuestionTable)
-              .where(eq(QuestionTable.session_id, input.sessionID))
-              .get()
-            const active = input.allowConcurrent
-              || sequence?.value === null
-              || sequence?.value === undefined
+          const sequence = yield* tx
+            .select({ value: max(QuestionTable.seq) })
+            .from(QuestionTable)
+            .where(eq(QuestionTable.session_id, input.sessionID))
+            .get()
+          const active =
+            input.allowConcurrent || sequence?.value === null || sequence?.value === undefined
               ? undefined
               : yield* tx
                   .select({ id: QuestionTable.id })
@@ -1079,33 +1214,32 @@ export const layer = Layer.effect(
                     ),
                   )
                   .get()
-            const state = input.allowConcurrent || !active ? "active" : "queued"
-            const now = yield* Clock.currentTimeMillis
-            yield* tx
-              .insert(QuestionTable)
-              .values({
-                id,
-                session_id: input.sessionID,
-                seq: (sequence?.value ?? 0) + 1,
-                state,
-                request,
-                mode: request.mode,
-                revision: request.revision,
-                action_metadata: request.actions,
-                detached,
-                allow_concurrent: input.allowConcurrent === true,
-                activity_id: activity?.id,
-                assistant_message_id: input.tool?.messageID,
-                tool_call_id: input.tool?.callID,
-                time_created: now,
-                time_updated: now,
-              })
-              .run()
-            return { request, asked: state === "active" }
-          }),
-      ).pipe(
-        Effect.catch((error) => (error instanceof ConflictError ? Effect.fail(error) : Effect.die(error))),
-      )
+          const state = input.allowConcurrent || !active ? "active" : "queued"
+          const now = yield* Clock.currentTimeMillis
+          const stored = request
+          yield* tx
+            .insert(QuestionTable)
+            .values({
+              id,
+              session_id: input.sessionID,
+              seq: (sequence?.value ?? 0) + 1,
+              state,
+              request: stored,
+              mode: request.mode,
+              revision: request.revision,
+              action_metadata: request.actions,
+              detached,
+              allow_concurrent: input.allowConcurrent === true,
+              activity_id: activity?.id,
+              assistant_message_id: input.tool?.messageID,
+              tool_call_id: input.tool?.callID,
+              time_created: now,
+              time_updated: now,
+            })
+            .run()
+          return { request: stored, asked: state === "active" }
+        }),
+      ).pipe(Effect.catch((error) => (error instanceof ConflictError ? Effect.fail(error) : Effect.die(error))))
       if (outcome.asked) yield* publish(Event.Requested, outcome.request)
       return outcome.request
     })
@@ -1124,132 +1258,145 @@ export const layer = Layer.effect(
         surface: input.surface,
         ...(input.tool ? { tool: input.tool } : {}),
       }
-      const outcome = yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            if (input.tool) {
-              const retry = yield* tx
-                .select()
-                .from(QuestionTable)
-                .where(
-                  and(
-                    eq(QuestionTable.session_id, input.sessionID),
-                    eq(QuestionTable.assistant_message_id, input.tool.messageID),
-                    eq(QuestionTable.tool_call_id, input.tool.callID),
-                  ),
-                )
-                .get()
-              if (retry) {
-                const expected = { ...request, id: retry.request.id }
-                if (!isDeepStrictEqual(retry.request, expected))
-                  return yield* new ConflictError({
-                    requestID: retry.request.id,
-                    reason: "The tool retry key is already bound to a different surface payload",
-                  })
-                if (retry.request.mode === "blocking")
-                  return yield* new ConflictError({
-                    requestID: retry.request.id,
-                    reason: "The tool retry key is already bound to a blocking surface",
-                  })
-                return { request: retry.request, requested: false }
-              }
-            }
-
-            const sequence = yield* tx
-              .select({ value: max(QuestionTable.seq) })
+      const outcome = yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          if (input.tool) {
+            const retry = yield* tx
+              .select()
               .from(QuestionTable)
-              .where(eq(QuestionTable.session_id, input.sessionID))
+              .where(
+                and(
+                  eq(QuestionTable.session_id, input.sessionID),
+                  eq(QuestionTable.assistant_message_id, input.tool.messageID),
+                  eq(QuestionTable.tool_call_id, input.tool.callID),
+                ),
+              )
               .get()
-            const now = yield* Clock.currentTimeMillis
-            yield* tx
-              .insert(QuestionTable)
-              .values({
-                id,
-                session_id: input.sessionID,
-                seq: (sequence?.value ?? 0) + 1,
-                state: "active",
-                request,
-                mode: request.mode,
-                revision: request.revision,
-                action_metadata: request.actions,
-                detached: true,
-                allow_concurrent: true,
-                assistant_message_id: input.tool?.messageID,
-                tool_call_id: input.tool?.callID,
-                time_created: now,
-                time_updated: now,
-              })
-              .run()
-            return { request, requested: true }
-          }),
+            if (retry) {
+              const expected = { ...request, id: retry.request.id }
+              if (!isDeepStrictEqual(retry.request, expected))
+                return yield* new ConflictError({
+                  requestID: retry.request.id,
+                  reason: "The tool retry key is already bound to a different surface payload",
+                })
+              if (retry.request.mode === "blocking")
+                return yield* new ConflictError({
+                  requestID: retry.request.id,
+                  reason: "The tool retry key is already bound to a blocking surface",
+                })
+              return { request: retry.request, requested: false }
+            }
+          }
+
+          const sequence = yield* tx
+            .select({ value: max(QuestionTable.seq) })
+            .from(QuestionTable)
+            .where(eq(QuestionTable.session_id, input.sessionID))
+            .get()
+          const now = yield* Clock.currentTimeMillis
+          yield* tx
+            .insert(QuestionTable)
+            .values({
+              id,
+              session_id: input.sessionID,
+              seq: (sequence?.value ?? 0) + 1,
+              state: "active",
+              request,
+              mode: request.mode,
+              revision: request.revision,
+              action_metadata: request.actions,
+              detached: true,
+              allow_concurrent: true,
+              assistant_message_id: input.tool?.messageID,
+              tool_call_id: input.tool?.callID,
+              time_created: now,
+              time_updated: now,
+            })
+            .run()
+          return { request, requested: true }
+        }),
       ).pipe(Effect.catch((error) => (error instanceof ConflictError ? Effect.fail(error) : Effect.die(error))))
       if (outcome.requested) yield* publish(Event.Requested, outcome.request)
       return outcome.request
     })
 
-    const settle = Effect.fn("QuestionV2.settle")(function* (input: {
+    const settle: (input: {
       requestID: ID
       sessionID?: SessionSchema.ID
       answers?: ReadonlyArray<Answer>
       includeQueued?: boolean
+      delegated?: DelegatedReplyInput
+    }) => Effect.Effect<boolean, NotFoundError | ConflictError> = Effect.fn("QuestionV2.settle")(function* (input: {
+      requestID: ID
+      sessionID?: SessionSchema.ID
+      answers?: ReadonlyArray<Answer>
+      includeQueued?: boolean
+      delegated?: DelegatedReplyInput
     }) {
       yield* reconcileOrphans()
-      const outcome = yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            const found = yield* find(tx, input.requestID, input.sessionID)
-            if (!found) return yield* new NotFoundError({ requestID: input.requestID })
-            const row = found.question
-            if (input.answers) {
-              if (row.request.mode !== "blocking")
-                return yield* new ConflictError({
-                  requestID: input.requestID,
-                  reason: "Only blocking surfaces accept answer replies",
-                })
-              if (input.answers.length !== row.request.questions.length)
-                return yield* new ConflictError({
-                  requestID: input.requestID,
-                  reason: `Expected ${row.request.questions.length} answers but received ${input.answers.length}`,
-                })
-            }
-            if (row.state === "replied") {
-              if (input.answers && isDeepStrictEqual(row.answers, input.answers)) return { settled: false as const }
+      const outcome = yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          const found = yield* find(tx, input.requestID, input.sessionID)
+          if (!found) return yield* new NotFoundError({ requestID: input.requestID })
+          const row = found.question
+          const source = input.delegated?.source ?? "user"
+          if (input.delegated)
+            return yield* new ConflictError({ requestID: input.requestID, reason: "Legacy delegated automated answers have been removed" })
+          if (input.answers) {
+            if (row.request.mode !== "blocking")
               return yield* new ConflictError({
                 requestID: input.requestID,
-                reason: "The question already has a different durable receipt",
+                reason: "Only blocking surfaces accept answer replies",
               })
-            }
-            if (row.state === "rejected" && input.answers === undefined) return { settled: false as const }
-            if (row.state === "orphaned")
+            if (input.answers.length !== row.request.questions.length)
               return yield* new ConflictError({
                 requestID: input.requestID,
-                reason: "The provider activity ended before this blocking question was answered",
+                reason: `Expected ${row.request.questions.length} answers but received ${input.answers.length}`,
               })
-            if (row.state === "rejected")
-              return yield* new ConflictError({ requestID: input.requestID, reason: "The question was already rejected" })
-            if (row.state === "queued" && !input.includeQueued)
-              return yield* new ConflictError({ requestID: input.requestID, reason: "The question is not active yet" })
+          }
+          if (row.state === "replied") {
+            if (input.answers && isDeepStrictEqual(row.answers, input.answers) && row.answer_source === source) return { settled: false as const }
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: "The question already has a different durable receipt",
+            })
+          }
+          if (row.state === "rejected" && input.answers === undefined) return { settled: false as const }
+          if (row.state === "orphaned")
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: "The provider activity ended before this blocking question was answered",
+            })
+          if (row.state === "rejected")
+            return yield* new ConflictError({ requestID: input.requestID, reason: "The question was already rejected" })
+          if (row.state === "queued" && !input.includeQueued)
+            return yield* new ConflictError({ requestID: input.requestID, reason: "The question is not active yet" })
 
-            const state = input.answers ? "replied" : "rejected"
-            const now = yield* Clock.currentTimeMillis
-            const updated = yield* tx
-              .update(QuestionTable)
-              .set({
-                state,
-                answers: input.answers ? input.answers.map((answer) => [...answer]) : null,
-                receipt: `qrc_${randomUUID()}`,
-                time_settled: now,
-                time_updated: now,
-              })
-              .where(and(eq(QuestionTable.id, input.requestID), inArray(QuestionTable.state, ["queued", "active"])))
-              .returning({ request: QuestionTable.request })
-              .get()
-            if (!updated) return yield* new ConflictError({ requestID: input.requestID, reason: "The question changed while settling" })
-            const promoted = row.state === "active" && !row.allow_concurrent ? yield* promote(tx, row.session_id) : undefined
-            return { settled: true as const, request: updated.request, promoted }
-          }),
+          const state = input.answers ? "replied" : "rejected"
+          const now = yield* Clock.currentTimeMillis
+          const updated = yield* tx
+            .update(QuestionTable)
+            .set({
+              state,
+              answers: input.answers ? input.answers.map((answer) => [...answer]) : null,
+              answer_source: input.answers ? source : null,
+              receipt: `qrc_${randomUUID()}`,
+              time_settled: now,
+              time_updated: now,
+            })
+            .where(and(eq(QuestionTable.id, input.requestID), inArray(QuestionTable.state, ["queued", "active"])))
+            .returning({ request: QuestionTable.request })
+            .get()
+          if (!updated)
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: "The question changed while settling",
+            })
+          const promoted =
+            row.state === "active" && !row.allow_concurrent ? yield* promote(tx, row.session_id) : undefined
+          const peer = yield* settlePeer(tx, updated.request, state, input.answers, source)
+          return { settled: true as const, request: updated.request, promoted, peer }
+        }),
       ).pipe(
         Effect.catch((error) =>
           error instanceof NotFoundError || error instanceof ConflictError ? Effect.fail(error) : Effect.die(error),
@@ -1257,15 +1404,29 @@ export const layer = Layer.effect(
       )
       if (!outcome.settled) return false
       yield* Effect.sync(() => QuestionWakeup.wake(outcome.request.id))
+      if (outcome.peer) {
+        const peer = outcome.peer
+        yield* Effect.sync(() => QuestionWakeup.wake(peer.request.id))
+        yield* input.answers
+          ? publish(Event.Replied, {
+              sessionID: peer.request.sessionID,
+              requestID: peer.request.id,
+              answers: input.answers.map((answer) => [...answer]),
+              source: input.delegated?.source ?? "user",
+            })
+          : publish(Event.Dismissed, { sessionID: peer.request.sessionID, requestID: peer.request.id })
+        if (peer.promoted) yield* publishRequested(peer.promoted)
+      }
       if (input.answers)
         yield* publish(Event.Replied, {
           sessionID: outcome.request.sessionID,
           requestID: outcome.request.id,
           answers: input.answers.map((answer) => [...answer]),
+          source: input.delegated?.source ?? "user",
         })
       if (!input.answers)
         yield* publish(Event.Dismissed, { sessionID: outcome.request.sessionID, requestID: outcome.request.id })
-      if (outcome.promoted) yield* publish(Event.Requested, outcome.promoted)
+      if (outcome.promoted) yield* publishRequested(outcome.promoted)
       return true
     })
 
@@ -1306,7 +1467,9 @@ export const layer = Layer.effect(
           Effect.flatMap((request) =>
             restore(awaitSettlement(request.id)).pipe(
               Effect.onInterrupt(() =>
-                settle({ requestID: request.id, sessionID: request.sessionID, includeQueued: true }).pipe(Effect.ignore),
+                settle({ requestID: request.id, sessionID: request.sessionID, includeQueued: true }).pipe(
+                  Effect.ignore,
+                ),
               ),
             ),
           ),
@@ -1315,73 +1478,70 @@ export const layer = Layer.effect(
     )
 
     const askDurable = Effect.fn("QuestionV2.askDurable")((input: AskInput) =>
-      Effect.uninterruptible(
-        enqueue(input, false).pipe(Effect.flatMap((request) => awaitSettlement(request.id))),
-      ),
+      Effect.uninterruptible(enqueue(input, false).pipe(Effect.flatMap((request) => awaitSettlement(request.id)))),
     )
 
     const askDetached = Effect.fn("QuestionV2.askDetached")((input: AskInput) =>
-      Effect.uninterruptible(
-        enqueue(input, true).pipe(Effect.flatMap((request) => awaitSettlement(request.id))),
-      ),
+      Effect.uninterruptible(enqueue(input, true).pipe(Effect.flatMap((request) => awaitSettlement(request.id)))),
     )
 
     const open = Effect.fn("QuestionV2.open")((input: AskInput) => enqueue(input, true))
 
     const reply = Effect.fn("QuestionV2.reply")((input: ReplyInput) => settle(input).pipe(Effect.asVoid))
+    const replyFromMain = Effect.fn("QuestionV2.replyFromMain")((input: DelegatedReplyInput) =>
+      settle({ requestID: input.requestID, sessionID: input.mainSessionID, answers: input.answers, delegated: input }).pipe(Effect.asVoid))
 
     const reject = Effect.fn("QuestionV2.reject")((requestID: ID, sessionID?: SessionSchema.ID) =>
       settle({ requestID, sessionID }),
     )
 
-    const dismiss = Effect.fn("QuestionV2.dismiss")(function* (
-      sessionID: SessionSchema.ID,
-      followupsOnly: boolean,
-    ) {
-      const outcome = yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            const rows = yield* tx
-              .select({ question: QuestionTable })
-              .from(QuestionTable)
-              .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
-              .where(
-                and(
-                  eq(QuestionTable.session_id, sessionID),
-                  inArray(QuestionTable.state, ["queued", "active"]),
-                  ...(inLocation() ? [inLocation()!] : []),
-                ),
-              )
-              .orderBy(asc(QuestionTable.seq))
-              .all()
-            const selected = rows
-              .map((row) => row.question)
-              .filter(
-                (row) =>
-                  (!followupsOnly && row.request.mode === "blocking") ||
-                  (followupsOnly &&
-                    row.request.mode === "blocking" &&
-                    row.detached &&
-                    row.request.phase === "implementation_complete_followup"),
-              )
-            const now = yield* Clock.currentTimeMillis
-            const rejected: Request[] = []
-            for (const row of selected) {
-              const updated = yield* tx
-                .update(QuestionTable)
-                .set({ state: "rejected", receipt: `qrc_${randomUUID()}`, time_settled: now, time_updated: now })
-                .where(and(eq(QuestionTable.id, row.id), inArray(QuestionTable.state, ["queued", "active"])))
-                .returning({ request: QuestionTable.request })
-                .get()
-              if (updated) rejected.push(updated.request)
+    const dismiss = Effect.fn("QuestionV2.dismiss")(function* (sessionID: SessionSchema.ID, followupsOnly: boolean) {
+      const outcome = yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          const rows = yield* tx
+            .select({ question: QuestionTable })
+            .from(QuestionTable)
+            .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
+            .where(
+              and(
+                eq(QuestionTable.session_id, sessionID),
+                inArray(QuestionTable.state, ["queued", "active"]),
+                ...(inLocation() ? [inLocation()!] : []),
+              ),
+            )
+            .orderBy(asc(QuestionTable.seq))
+            .all()
+          const selected = rows
+            .map((row) => row.question)
+            .filter(
+              (row) =>
+                (!followupsOnly && row.request.mode === "blocking") ||
+                (followupsOnly &&
+                  row.request.mode === "blocking" &&
+                  row.detached &&
+                  row.request.phase === "implementation_complete_followup"),
+            )
+          const now = yield* Clock.currentTimeMillis
+          const rejected: Request[] = []
+          for (const row of selected) {
+            const updated = yield* tx
+              .update(QuestionTable)
+              .set({ state: "rejected", receipt: `qrc_${randomUUID()}`, time_settled: now, time_updated: now })
+              .where(and(eq(QuestionTable.id, row.id), inArray(QuestionTable.state, ["queued", "active"])))
+              .returning({ request: QuestionTable.request })
+              .get()
+            if (updated) {
+              rejected.push(updated.request)
+              const peer = yield* settlePeer(tx, updated.request, "rejected")
+              if (peer) rejected.push(peer.request)
             }
-            const promoted =
-              followupsOnly && selected.some((row) => row.state === "active" && !row.allow_concurrent)
-                ? yield* promote(tx, sessionID)
-                : undefined
-            return { rejected, promoted }
-          }),
+          }
+          const promoted =
+            followupsOnly && selected.some((row) => row.state === "active" && !row.allow_concurrent)
+              ? yield* promote(tx, sessionID)
+              : undefined
+          return { rejected, promoted }
+        }),
       ).pipe(Effect.orDie)
       yield* Effect.forEach(
         outcome.rejected,
@@ -1391,7 +1551,7 @@ export const layer = Layer.effect(
           ),
         { discard: true },
       )
-      if (outcome.promoted) yield* publish(Event.Requested, outcome.promoted)
+      if (outcome.promoted) yield* publishRequested(outcome.promoted)
     })
 
     const dismissSession = Effect.fn("QuestionV2.dismissSession")((sessionID: SessionSchema.ID) =>
@@ -1482,88 +1642,83 @@ export const layer = Layer.effect(
     const createPersistentTool = Effect.fn("Surface.createPersistentTool")(function* (
       input: CreatePersistentToolInput,
     ) {
-      return yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            const source = yield* tx
-              .select({ question: QuestionTable, directory: SessionTable.directory, projectID: SessionTable.project_id })
-              .from(QuestionTable)
-              .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
-              .where(
-                and(
-                  eq(QuestionTable.id, input.requestID),
-                  eq(QuestionTable.session_id, input.sessionID),
-                  ...(inLocation() ? [inLocation()!] : []),
-                ),
-              )
-              .get()
-            if (!source) return yield* new NotFoundError({ requestID: input.requestID })
-            if (source.question.state !== "active")
-              return yield* new ConflictError({
-                requestID: input.requestID,
-                reason: "Only a pending Surface can become a persistent tool",
-              })
-            if (source.question.request.mode === "blocking")
-              return yield* new ConflictError({
-                requestID: input.requestID,
-                reason: "Blocking Surfaces cannot become persistent tools",
-              })
-            if (source.question.revision !== input.expectedRevision)
-              return yield* new ConflictError({
-                requestID: input.requestID,
-                reason: `Surface revision changed from ${input.expectedRevision} to ${source.question.revision}`,
-              })
-            if (
-              input.scope === "global" &&
-              (source.question.request.mode !== "passive" || source.question.action_metadata.length > 0)
+      return yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          const source = yield* tx
+            .select({ question: QuestionTable, directory: SessionTable.directory, projectID: SessionTable.project_id })
+            .from(QuestionTable)
+            .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
+            .where(
+              and(
+                eq(QuestionTable.id, input.requestID),
+                eq(QuestionTable.session_id, input.sessionID),
+                ...(inLocation() ? [inLocation()!] : []),
+              ),
             )
-              return yield* new ConflictError({
-                requestID: input.requestID,
-                reason: "App-global tools must be passive and action-free",
-              })
+            .get()
+          if (!source) return yield* new NotFoundError({ requestID: input.requestID })
+          if (source.question.state !== "active")
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: "Only a pending Surface can become a persistent tool",
+            })
+          if (source.question.request.mode === "blocking")
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: "Blocking Surfaces cannot become persistent tools",
+            })
+          if (source.question.revision !== input.expectedRevision)
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: `Surface revision changed from ${input.expectedRevision} to ${source.question.revision}`,
+            })
+          if (
+            input.scope === "global" &&
+            (source.question.request.mode !== "passive" || source.question.action_metadata.length > 0)
+          )
+            return yield* new ConflictError({
+              requestID: input.requestID,
+              reason: "App-global tools must be passive and action-free",
+            })
 
-            const scopeKey = input.scope === "global" ? "global" : source.projectID
-            const existing = yield* tx
-              .select()
-              .from(SurfaceToolTable)
-              .where(
-                and(
-                  eq(SurfaceToolTable.origin_request_id, input.requestID),
-                  eq(SurfaceToolTable.scope_key, scopeKey),
-                ),
-              )
-              .get()
-            if (existing) return persistentTool(existing)
+          const scopeKey = input.scope === "global" ? "global" : source.projectID
+          const existing = yield* tx
+            .select()
+            .from(SurfaceToolTable)
+            .where(
+              and(eq(SurfaceToolTable.origin_request_id, input.requestID), eq(SurfaceToolTable.scope_key, scopeKey)),
+            )
+            .get()
+          if (existing) return persistentTool(existing)
 
-            const now = yield* Clock.currentTimeMillis
-            const request = source.question.request
-            const row = yield* tx
-              .insert(SurfaceToolTable)
-              .values({
-                id: PersistentToolID.ascending(),
-                scope: input.scope,
-                scope_key: scopeKey,
-                project_id: input.scope === "project" ? source.projectID : null,
-                directory: source.directory,
-                origin_request_id: request.id,
-                origin_session_id: request.sessionID,
-                origin_revision: request.revision,
-                mode: request.mode,
-                definition_revision: request.revision,
-                action_metadata: request.actions,
-                surface: request.surface,
-                state_version: 1,
-                state_revision: 1,
-                state_values: request.surface.values ?? {},
-                hidden: false,
-                time_created: now,
-                time_updated: now,
-              })
-              .returning()
-              .get()
-            return persistentTool(row!)
-          }),
+          const now = yield* Clock.currentTimeMillis
+          const request = source.question.request
+          const row = yield* tx
+            .insert(SurfaceToolTable)
+            .values({
+              id: PersistentToolID.ascending(),
+              scope: input.scope,
+              scope_key: scopeKey,
+              project_id: input.scope === "project" ? source.projectID : null,
+              directory: source.directory,
+              origin_request_id: request.id,
+              origin_session_id: request.sessionID,
+              origin_revision: request.revision,
+              mode: request.mode,
+              definition_revision: request.revision,
+              action_metadata: request.actions,
+              surface: request.surface,
+              state_version: 1,
+              state_revision: 1,
+              state_values: request.surface.values ?? {},
+              hidden: false,
+              time_created: now,
+              time_updated: now,
+            })
+            .returning()
+            .get()
+          return persistentTool(row!)
+        }),
       ).pipe(
         Effect.catch((error) =>
           error instanceof NotFoundError || error instanceof ConflictError ? Effect.fail(error) : Effect.die(error),
@@ -1673,12 +1828,7 @@ export const layer = Layer.effect(
           ),
         )
         .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
-        .where(
-          and(
-            eq(QuestionTable.session_id, sessionID),
-            ...(inLocation() ? [inLocation()!] : []),
-          ),
-        )
+        .where(and(eq(QuestionTable.session_id, sessionID), ...(inLocation() ? [inLocation()!] : [])))
         .orderBy(asc(SurfaceActionInvocationTable.time_created))
         .all()
         .pipe(Effect.orDie)
@@ -1688,93 +1838,85 @@ export const layer = Layer.effect(
     const beginActionInvocation = Effect.fn("Surface.beginActionInvocation")(function* (
       input: BeginActionInvocationInput,
     ) {
-      return yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            const hash = actionInvocationHash(input)
-            const existing = yield* tx
-              .select()
-              .from(SurfaceActionInvocationTable)
-              .where(eq(SurfaceActionInvocationTable.id, input.id))
-              .get()
-            if (existing) {
-              if (existing.payload_hash !== hash)
-                return yield* new ConflictError({
-                  requestID: ID.make("que_surface_action"),
-                  reason: "Surface action invocation id is already bound to a different payload",
-                })
-              return { invocation: invocation(existing), claimed: false }
-            }
+      return yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          const hash = actionInvocationHash(input)
+          const existing = yield* tx
+            .select()
+            .from(SurfaceActionInvocationTable)
+            .where(eq(SurfaceActionInvocationTable.id, input.id))
+            .get()
+          if (existing) {
+            if (existing.payload_hash !== hash)
+              return yield* new ConflictError({
+                requestID: ID.make("que_surface_action"),
+                reason: "Surface action invocation id is already bound to a different payload",
+              })
+            return { invocation: invocation(existing), claimed: false }
+          }
 
-            const actions =
-              input.target.kind === "request"
-                ? yield* tx
-                    .select({
-                      revision: QuestionTable.revision,
-                      actions: QuestionTable.action_metadata,
-                      state: QuestionTable.state,
-                    })
-                    .from(QuestionTable)
-                    .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
-                    .where(
-                      and(
-                        eq(QuestionTable.id, ID.make(input.target.id)),
-                        ...(inLocation() ? [inLocation()!] : []),
-                      ),
-                    )
-                    .get()
-                : yield* tx
-                    .select({
-                      revision: SurfaceToolTable.definition_revision,
-                      actions: SurfaceToolTable.action_metadata,
-                      state: SurfaceToolTable.hidden,
-                    })
-                    .from(SurfaceToolTable)
-                    .where(
-                      and(
-                        eq(SurfaceToolTable.id, PersistentToolID.make(input.target.id)),
-                        ...(inToolLocation() ? [inToolLocation()!] : []),
-                      ),
-                    )
-                    .get()
-            if (!actions)
-              return yield* new ActionInvocationNotFoundError({ invocationID: input.id })
-            if (input.target.kind === "request" && actions.state !== "active")
-              return yield* new ConflictError({
-                requestID: ID.make(input.target.id),
-                reason: "Surface action request is no longer pending",
-              })
-            if (actions.revision !== input.target.revision)
-              return yield* new ConflictError({
-                requestID: input.target.kind === "request" ? ID.make(input.target.id) : ID.make("que_surface_action"),
-                reason: `Surface action revision changed from ${input.target.revision} to ${actions.revision}`,
-              })
-            if (!actions.actions.some((action) => action.id === input.actionID))
-              return yield* new ConflictError({
-                requestID: input.target.kind === "request" ? ID.make(input.target.id) : ID.make("que_surface_action"),
-                reason: `Surface action is not authorized by revision ${actions.revision}`,
-              })
+          const actions =
+            input.target.kind === "request"
+              ? yield* tx
+                  .select({
+                    revision: QuestionTable.revision,
+                    actions: QuestionTable.action_metadata,
+                    state: QuestionTable.state,
+                  })
+                  .from(QuestionTable)
+                  .innerJoin(SessionTable, eq(SessionTable.id, QuestionTable.session_id))
+                  .where(and(eq(QuestionTable.id, ID.make(input.target.id)), ...(inLocation() ? [inLocation()!] : [])))
+                  .get()
+              : yield* tx
+                  .select({
+                    revision: SurfaceToolTable.definition_revision,
+                    actions: SurfaceToolTable.action_metadata,
+                    state: SurfaceToolTable.hidden,
+                  })
+                  .from(SurfaceToolTable)
+                  .where(
+                    and(
+                      eq(SurfaceToolTable.id, PersistentToolID.make(input.target.id)),
+                      ...(inToolLocation() ? [inToolLocation()!] : []),
+                    ),
+                  )
+                  .get()
+          if (!actions) return yield* new ActionInvocationNotFoundError({ invocationID: input.id })
+          if (input.target.kind === "request" && actions.state !== "active")
+            return yield* new ConflictError({
+              requestID: ID.make(input.target.id),
+              reason: "Surface action request is no longer pending",
+            })
+          if (actions.revision !== input.target.revision)
+            return yield* new ConflictError({
+              requestID: input.target.kind === "request" ? ID.make(input.target.id) : ID.make("que_surface_action"),
+              reason: `Surface action revision changed from ${input.target.revision} to ${actions.revision}`,
+            })
+          if (!actions.actions.some((action) => action.id === input.actionID))
+            return yield* new ConflictError({
+              requestID: input.target.kind === "request" ? ID.make(input.target.id) : ID.make("que_surface_action"),
+              reason: `Surface action is not authorized by revision ${actions.revision}`,
+            })
 
-            const now = yield* Clock.currentTimeMillis
-            const created = yield* tx
-              .insert(SurfaceActionInvocationTable)
-              .values({
-                id: input.id,
-                target_kind: input.target.kind,
-                target_id: input.target.id,
-                target_revision: input.target.revision,
-                action_id: input.actionID,
-                source: input.source,
-                payload_hash: hash,
-                state: "pending",
-                time_created: now,
-                time_updated: now,
-              })
-              .returning()
-              .get()
-            return { invocation: invocation(created!), claimed: true }
-          }),
+          const now = yield* Clock.currentTimeMillis
+          const created = yield* tx
+            .insert(SurfaceActionInvocationTable)
+            .values({
+              id: input.id,
+              target_kind: input.target.kind,
+              target_id: input.target.id,
+              target_revision: input.target.revision,
+              action_id: input.actionID,
+              source: input.source,
+              payload_hash: hash,
+              state: "pending",
+              time_created: now,
+              time_updated: now,
+            })
+            .returning()
+            .get()
+          return { invocation: invocation(created!), claimed: true }
+        }),
       ).pipe(
         Effect.catch((error) =>
           error instanceof ConflictError || error instanceof ActionInvocationNotFoundError
@@ -1811,69 +1953,66 @@ export const layer = Layer.effect(
     // the first invocation to bind the key wins, later invocations of the same
     // intent observe the winner instead of producing a second side effect.
     const beginActionEffect = Effect.fn("Surface.beginActionEffect")(function* (input: BeginActionEffectInput) {
-      return yield* QuestionTransaction.run(
-        db,
-        (tx) =>
-          Effect.gen(function* () {
-            const invocationRow = yield* tx
+      return yield* QuestionTransaction.run(db, (tx) =>
+        Effect.gen(function* () {
+          const invocationRow = yield* tx
+            .select()
+            .from(SurfaceActionInvocationTable)
+            .where(eq(SurfaceActionInvocationTable.id, input.invocationID))
+            .get()
+            .pipe(Effect.orDie)
+          if (!invocationRow) return yield* new ActionInvocationNotFoundError({ invocationID: input.invocationID })
+          if (invocationRow.execution_key && invocationRow.execution_key !== input.executionKey)
+            return yield* new ConflictError({
+              requestID: ID.make("que_surface_action"),
+              reason: "Surface action invocation is already bound to a different execution key",
+            })
+
+          const bound = yield* tx
+            .select()
+            .from(SurfaceActionInvocationTable)
+            .where(eq(SurfaceActionInvocationTable.execution_key, input.executionKey))
+            .get()
+            .pipe(Effect.orDie)
+          if (bound && bound.id !== invocationRow.id) {
+            if (bound.payload_hash !== invocationRow.payload_hash)
+              return yield* new ConflictError({
+                requestID: ID.make("que_surface_action"),
+                reason: "Surface action execution key is already bound to a different payload",
+              })
+            return { invocation: invocation(bound), claimed: false }
+          }
+          if (invocationRow.execution_key === input.executionKey) {
+            // Same invocation retrying its own effect claim: the side effect
+            // slot is already held, so the caller must not run it again.
+            return { invocation: invocation(invocationRow), claimed: false }
+          }
+
+          const now = yield* Clock.currentTimeMillis
+          const updated = yield* tx
+            .update(SurfaceActionInvocationTable)
+            .set({ execution_key: input.executionKey, effect_started_at: now, time_updated: now })
+            .where(
+              and(
+                eq(SurfaceActionInvocationTable.id, input.invocationID),
+                isNull(SurfaceActionInvocationTable.execution_key),
+              ),
+            )
+            .returning()
+            .get()
+            .pipe(Effect.orDie)
+          if (!updated) {
+            const raced = yield* tx
               .select()
               .from(SurfaceActionInvocationTable)
               .where(eq(SurfaceActionInvocationTable.id, input.invocationID))
               .get()
               .pipe(Effect.orDie)
-            if (!invocationRow)
-              return yield* new ActionInvocationNotFoundError({ invocationID: input.invocationID })
-            if (invocationRow.execution_key && invocationRow.execution_key !== input.executionKey)
-              return yield* new ConflictError({
-                requestID: ID.make("que_surface_action"),
-                reason: "Surface action invocation is already bound to a different execution key",
-              })
-
-            const bound = yield* tx
-              .select()
-              .from(SurfaceActionInvocationTable)
-              .where(eq(SurfaceActionInvocationTable.execution_key, input.executionKey))
-              .get()
-              .pipe(Effect.orDie)
-            if (bound && bound.id !== invocationRow.id) {
-              if (bound.payload_hash !== invocationRow.payload_hash)
-                return yield* new ConflictError({
-                  requestID: ID.make("que_surface_action"),
-                  reason: "Surface action execution key is already bound to a different payload",
-                })
-              return { invocation: invocation(bound), claimed: false }
-            }
-            if (invocationRow.execution_key === input.executionKey) {
-              // Same invocation retrying its own effect claim: the side effect
-              // slot is already held, so the caller must not run it again.
-              return { invocation: invocation(invocationRow), claimed: false }
-            }
-
-            const now = yield* Clock.currentTimeMillis
-            const updated = yield* tx
-              .update(SurfaceActionInvocationTable)
-              .set({ execution_key: input.executionKey, effect_started_at: now, time_updated: now })
-              .where(
-                and(
-                  eq(SurfaceActionInvocationTable.id, input.invocationID),
-                  isNull(SurfaceActionInvocationTable.execution_key),
-                ),
-              )
-              .returning()
-              .get()
-              .pipe(Effect.orDie)
-            if (!updated) {
-              const raced = yield* tx
-                .select()
-                .from(SurfaceActionInvocationTable)
-                .where(eq(SurfaceActionInvocationTable.id, input.invocationID))
-                .get()
-                .pipe(Effect.orDie)
-              if (!raced) return yield* new ActionInvocationNotFoundError({ invocationID: input.invocationID })
-              return { invocation: invocation(raced), claimed: false }
-            }
-            return { invocation: invocation(updated), claimed: true }
-          }),
+            if (!raced) return yield* new ActionInvocationNotFoundError({ invocationID: input.invocationID })
+            return { invocation: invocation(raced), claimed: false }
+          }
+          return { invocation: invocation(updated), claimed: true }
+        }),
       ).pipe(
         Effect.catch((error) =>
           error instanceof ConflictError || error instanceof ActionInvocationNotFoundError
@@ -1936,6 +2075,11 @@ export const layer = Layer.effect(
       open,
       present,
       reply,
+      replyFromMain,
+      answerSourceForTool: (input) => db.select({ source: QuestionTable.answer_source }).from(QuestionTable)
+        .where(and(eq(QuestionTable.session_id, input.sessionID), eq(QuestionTable.assistant_message_id, input.messageID),
+          eq(QuestionTable.tool_call_id, input.callID), eq(QuestionTable.state, "replied"))).get()
+        .pipe(Effect.orDie, Effect.map((row) => row?.source ?? null)),
       reject,
       dismissSession,
       dismissFollowups,
@@ -1987,7 +2131,8 @@ function collectActionMetadata(groups: ReadonlyArray<{ path: string; actions: Re
 function actionPermissions(step: Control.SurfaceActionStep): ActionPermission[] {
   if (step.type === "configWrite") return [{ action: "edit", resources: [step.target.path] }]
   if (step.type === "livePublish") return [{ action: "surface.live.publish", resources: [step.topic ?? "*"] }]
-  if (step.type === "command") return [{ action: "bash", resources: [[step.command, ...(step.arguments ?? [])].join(" ")] }]
+  if (step.type === "command")
+    return [{ action: "bash", resources: [[step.command, ...(step.arguments ?? [])].join(" ")] }]
   if (step.type === "gmail") return [{ action: "surface.gmail", resources: [step.mode] }]
   if (step.type === "switchAgentAndPrompt")
     return [
@@ -2003,13 +2148,19 @@ function actionInvocationHash(input: BeginActionInvocationInput) {
   const canonicalize = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonicalize)
     if (!isRecord(value)) return value
-    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]))
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalize(value[key])]),
+    )
   }
   // The id is transport identity, not payload identity: once executions must
   // bind later invocations of the same intent even when they arrive with a new
   // invocation id (fresh popup submit, lost response retry).
   const { id: _invocationID, ...payload } = input
-  return createHash("sha256").update(JSON.stringify(canonicalize(payload))).digest("hex")
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalize(payload)))
+    .digest("hex")
 }
 
 export function actionInvocationPayloadHash(input: BeginActionInvocationInput) {
