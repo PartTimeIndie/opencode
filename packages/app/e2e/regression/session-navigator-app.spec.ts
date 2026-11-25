@@ -786,8 +786,11 @@ test.describe("session navigator app plugin", () => {
       },
     })
 
-    await page.setViewportSize({ width: 390, height: 844 })
+    // A genuine mobile root boot opens a fresh draft on purpose (session-route-identity.ts),
+    // so boot at desktop size to prove the restored session survives the mobile dock round trip.
     await page.goto("/")
+    await expectAppVisible(page.getByRole("heading", { name: "A Session 1" }))
+    await page.setViewportSize({ width: 390, height: 844 })
     const launcher = page.locator('[data-action="mobile-dock-launcher"]')
     await expectAppVisible(launcher)
     await launcher.click()
