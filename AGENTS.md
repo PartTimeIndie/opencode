@@ -3,14 +3,14 @@
 Complete the authorized change, relevant verification and final report. Read linked domain guidance when that domain is affected; a small documentation edit does not require deployment or a tour of the repository. Preserve explicit release and process-restart permissions.
 
 - To regenerate the JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
-- The active working branch is `fork-sync`, tracking the user's `origin/main` but retaining old local ancestry. The separately audited publication branch is `public-clean`. Use `origin/main` for tree comparisons, not as evidence that `fork-sync` is safe to push.
-- Local `main` may not exist. `dev` preserves the pre-migration history with unrelated roots; do not merge or push that old history into the cleaned fork.
+- Use local `main`, tracking the user's `origin/main`, for work and pulls in the primary checkout. The separate `public-clean` worktree is for audited tree transfers.
+- `fork-sync` and `dev` preserve local history from before the migration. Do not pull into these branches or merge or push their ancestry into the cleaned fork.
 
 ## Fork and sync target
 
 This repository is the user's independent fork. Do not fetch, pull, merge, rebase, push or sync with the official `anomalyco/opencode` repository unless the user explicitly changes this policy. A remote named `origin` is not proof that it belongs to the user.
 
-The user's repository is `https://github.com/PartTimeIndie/opencode.git`; `origin` must use it for both fetch and push. Its verified remote default branch is `main`. `C:/GitRepros/opencode` now works directly on `fork-sync`, tracking `origin/main`; `dev` retains the old, unrelated history. Never merge that old history into the cleaned fork.
+The user's repository is `https://github.com/PartTimeIndie/opencode.git`; `origin` must use it for both fetch and push. Its verified remote default branch is `main`. Use Pull in Git Workbench to update the local `main` from that fork. Sync can also attempt a push and is not a substitute for Pull.
 
 Before configuring or running sync, verify the remote's fetch/push URLs and branch tracking against this repository; do not substitute the official repository or publish anything without authorization.
 

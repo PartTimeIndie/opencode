@@ -5,6 +5,7 @@
   "license": "MIT",
   "scripts": {
     "dev": "bun run src/index.ts",
+    "test": "bun test",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {

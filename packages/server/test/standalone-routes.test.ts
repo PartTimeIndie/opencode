@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { mkdtemp, mkdir, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { Layer } from "effect"
+import { Context, Effect, Layer, Option } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 
 for (const enabled of [false, true]) test(`standalone routes bind activity and tools, not legacy orchestration (enabled=${enabled})`, async () => {
@@ -48,25 +48,31 @@ async function probe() {
   const { Credential } = await import("@opencode-ai/core/credential")
   const { LocationServiceMap } = await import("@opencode-ai/core/location-layer")
   const { PermissionSaved } = await import("@opencode-ai/core/permission/saved")
-  const { createRoutes } = await import("../src/routes")
-  // HttpRouter.serve exposes per-request requirements that a layer-only check misses.
+  const { createRoutes, serveRoutes } = await import("../src/routes")
+  const password = "fixture-password"
+  // Build the real serve layer with a transport that opens no socket.
+  const served = serveRoutes(password).pipe(
+    Layer.provide(HttpServer.layerServices),
+    Layer.provide(
+      Layer.succeed(HttpServer.HttpServer, HttpServer.make({
+        address: { _tag: "TcpAddress", hostname: "localhost", port: 0 },
+        serve: () => Effect.void,
+      })),
+    ),
+  )
+  const context = await Effect.runPromise(Effect.scoped(Layer.build(served)))
+  expect(Option.isSome(Context.getOption(context, LocationServiceMap))).toBe(true)
   const services = Layer.mergeAll(Credential.defaultLayer, LocationServiceMap.layer, PermissionSaved.defaultLayer)
-  const served: Layer.Layer<never, unknown, HttpServer.HttpServer> = HttpRouter.serve(
-    createRoutes("fixture-password"),
-  ).pipe(Layer.provide(services), Layer.provide(HttpServer.layerServices))
-  expect(served).toBeDefined()
   const server = HttpRouter.toWebHandler(
-    createRoutes("fixture-password").pipe(Layer.provideMerge(services), Layer.provide(HttpServer.layerServices)),
-    {
-      disableLogger: true,
-    },
+    createRoutes(password).pipe(Layer.provideMerge(services), Layer.provide(HttpServer.layerServices)),
+    { disableLogger: true },
   )
   const request = (url: string, method = "GET", body?: unknown, authenticated = true) =>
     server.handler(
       new Request(`http://localhost${url}`, {
         method,
         headers: {
-          ...(authenticated ? { authorization: `Basic ${btoa("opencode:fixture-password")}` } : {}),
+          ...(authenticated ? { authorization: `Basic ${btoa(`opencode:${password}`)}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),

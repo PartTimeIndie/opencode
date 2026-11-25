@@ -129,16 +129,16 @@ remaining refs. Remove an initial copied branch only after the intended branch i
 verified and made default, using the copied branch's exact SHA as a lease.
 
 The local `fork-sync` and `dev` ancestry is not a publication source. The audited
-`public-clean` branch tracks the user's `origin/main`; repository-local
+`public-clean` branch is used for audited transfers onto the user's `origin/main`; repository-local
 `push.default=nothing` requires an explicit push refspec and prevents an accidental
 bare push from the dirty development branch. An independent root has no shared
 ancestry with the upstream: do not turn a future update into an implicit merge,
 pull or rebase. Future transfers still require the same tree and history audits.
 
 If Git Workbench refuses a pull because the branches have no common commit,
-verify the remote and `git merge-base HEAD origin/main`. Pull in the separate
-`public-clean` worktree, not on `fork-sync`; keep local work on the old branch
-until it can be transferred as an audited tree without connecting the histories.
+verify the remote and `git merge-base HEAD origin/main`. Pull on local `main`
+in the primary checkout, not on `fork-sync` or `dev`. Transfer any work left on
+those branches as an audited tree without connecting the histories.
 The Workbench reports known pull refusals without exposing raw remote output.
 Sync stops if its pull fails; use Pull, not Sync, to bring in remote changes
 without attempting a push.

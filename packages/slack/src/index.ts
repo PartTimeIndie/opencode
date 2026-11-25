@@ -1,5 +1,6 @@
 import { App } from "@slack/bolt"
 import { createOpencode, type OpencodeClient, type SessionMessage } from "@opencode-ai/sdk/v2"
+import { isAllowedSender, senderUserId } from "./allow-list"
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -33,16 +34,17 @@ app.use(async ({ next, context }) => {
 })
 
 app.message(async ({ message, say }) => {
+  const userId = senderUserId(message)
   console.log(
     "📨 Message event:",
     message.channel,
     "user",
-    message.user,
+    userId,
     "length",
     "text" in message ? message.text?.length : 0,
   )
 
-  if (allowedUsers.length > 0 && (!message.user || !allowedUsers.includes(message.user))) {
+  if (!isAllowedSender(userId, allowedUsers)) {
     console.log("⏭️ Skipping message from non-allowlisted user")
     return
   }

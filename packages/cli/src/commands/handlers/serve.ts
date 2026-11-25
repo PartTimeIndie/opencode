@@ -1,11 +1,9 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { Credential } from "@opencode-ai/core/credential"
-import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { Context, Layer, Option } from "effect"
 import * as Effect from "effect/Effect"
-import { HttpRouter, HttpServer } from "effect/unstable/http"
+import { HttpServer } from "effect/unstable/http"
 import { createServer } from "node:http"
-import { createRoutes } from "@opencode-ai/server/routes"
+import { serveRoutes } from "@opencode-ai/server/routes"
 import { Commands } from "../commands"
 import { Runtime } from "../../framework/runtime"
 import { Daemon } from "../../services/daemon"
@@ -34,10 +32,8 @@ function listen(hostname: string, port: Option.Option<number>, password: string)
 
 function bind(hostname: string, port: number, password: string) {
   return Layer.build(
-    HttpRouter.serve(createRoutes(password), { disableListenLog: true, disableLogger: true }).pipe(
+    serveRoutes(password).pipe(
       Layer.provideMerge(NodeHttpServer.layer(() => createServer(), { port, host: hostname })),
-      Layer.provide(Credential.defaultLayer),
-      Layer.provide(PermissionSaved.defaultLayer),
     ),
   ).pipe(Effect.map((context) => Context.get(context, HttpServer.HttpServer).address))
 }
